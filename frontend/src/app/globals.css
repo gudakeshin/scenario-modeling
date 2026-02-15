@@ -1,0 +1,122 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/* ═══════════════════════════════════════════════════
+   Deloitte Brand Theme
+   Primary Green: #86BC25
+   Black: #000000 / Charcoal: #1D1D1B
+   White: #FFFFFF
+   Supporting: #0076A8 (blue), #43B02A (green-alt)
+   Grays: #53565A, #75787B, #97999B, #BBBCBC, #D0D0CE
+   ═══════════════════════════════════════════════════ */
+
+:root {
+  /* Core */
+  --background: #FFFFFF;
+  --foreground: #1D1D1B;
+
+  /* Sidebar — dark charcoal for brand presence */
+  --sidebar-bg: #1D1D1B;
+  --sidebar-border: #2E2E2C;
+  --sidebar-text: #FFFFFF;
+  --sidebar-text-muted: #97999B;
+  --sidebar-hover: rgba(134, 188, 37, 0.12);
+  --sidebar-active: rgba(134, 188, 37, 0.18);
+
+  /* Accent — Deloitte Green */
+  --accent: #86BC25;
+  --accent-hover: #6FA020;
+  --accent-light: rgba(134, 188, 37, 0.08);
+  --accent-muted: rgba(134, 188, 37, 0.15);
+
+  /* Message bubbles */
+  --message-user-bg: #86BC25;
+  --message-user-text: #FFFFFF;
+  --message-assistant-bg: #F4F4F2;
+  --message-assistant-text: #1D1D1B;
+
+  /* Input */
+  --input-bg: #F7F7F5;
+  --input-border: #D0D0CE;
+  --input-focus-border: #86BC25;
+
+  /* Panels & cards */
+  --panel-bg: #FAFAF8;
+  --panel-border: #E5E5E2;
+  --card-bg: #FFFFFF;
+  --card-border: #E5E5E2;
+
+  /* Borders */
+  --border: #D0D0CE;
+  --border-light: #E5E5E2;
+
+  /* Text hierarchy */
+  --text-primary: #1D1D1B;
+  --text-secondary: #53565A;
+  --text-muted: #75787B;
+  --text-faint: #97999B;
+
+  /* Status colors (Deloitte-aligned) */
+  --success: #43B02A;
+  --success-bg: rgba(67, 176, 42, 0.08);
+  --warning: #DA8B00;
+  --warning-bg: rgba(218, 139, 0, 0.08);
+  --danger: #DA291C;
+  --danger-bg: rgba(218, 41, 28, 0.08);
+  --info: #0076A8;
+  --info-bg: rgba(0, 118, 168, 0.08);
+
+  /* Scrollbar */
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #BBBCBC;
+}
+
+body {
+  color: var(--foreground);
+  background: var(--background);
+  font-family: Arial, Helvetica, sans-serif;
+}
+
+/* Scrollbar styling */
+.chat-scroll::-webkit-scrollbar {
+  width: 6px;
+}
+.chat-scroll::-webkit-scrollbar-track {
+  background: var(--scrollbar-track);
+}
+.chat-scroll::-webkit-scrollbar-thumb {
+  background: var(--scrollbar-thumb);
+  border-radius: 3px;
+}
+.chat-scroll::-webkit-scrollbar-thumb:hover {
+  background: #97999B;
+}
+
+/* Selection color */
+::selection {
+  background: rgba(134, 188, 37, 0.25);
+  color: #1D1D1B;
+}
+
+/* Focus visible for accessibility */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+@layer utilities {
+  .text-balance {
+    text-wrap: balance;
+  }
+}
+
+/* Deloitte green gradient for special elements */
+.deloitte-gradient {
+  background: linear-gradient(135deg, #86BC25 0%, #43B02A 100%);
+}
+
+/* Subtle panel gradient */
+.panel-gradient {
+  background: linear-gradient(180deg, var(--panel-bg) 0%, var(--background) 100%);
+}

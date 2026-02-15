@@ -1,0 +1,38 @@
+{
+  "name": "scenario-modeling-api",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "db:migrate": "tsx src/db/migrate.ts",
+    "test": "npm run build && node --test dist/services/parser.test.js",
+    "test:e2e": "npm run build && NODE_ENV=test node --test dist/tests/e2e.test.js",
+    "test:all": "npm run build && NODE_ENV=test node --test dist/services/parser.test.js dist/tests/e2e.test.js"
+  },
+  "dependencies": {
+    "@anthropic-ai/sdk": "^0.74.0",
+    "@qdrant/js-client-rest": "^1.16.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
+    "express": "^4.21.0",
+    "multer": "^2.0.2",
+    "openai": "^4.52.0",
+    "pdf-parse": "^2.4.5",
+    "pg": "^8.12.0",
+    "pptxgenjs": "^4.0.1"
+  },
+  "devDependencies": {
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/node": "^20.11.0",
+    "@types/pg": "^8.11.6",
+    "@types/supertest": "^6.0.3",
+    "supertest": "^7.2.2",
+    "tsx": "^4.7.0",
+    "typescript": "^5.3.3"
+  }
+}
