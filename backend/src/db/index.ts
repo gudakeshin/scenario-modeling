@@ -15,14 +15,14 @@ export async function getDefaultUserId(): Promise<string> {
     [DEFAULT_USER_EMAIL]
   );
   if (r.rows[0]) return r.rows[0].user_id;
-  // Also check for legacy dev@local users and migrate them
-  const legacy = await pool.query("SELECT user_id FROM users WHERE email = 'dev@local' LIMIT 1");
-  if (legacy.rows[0]) return legacy.rows[0].user_id;
   const ins = await pool.query(
-    "INSERT INTO users (email, name, role) VALUES ($1, $2, $3) RETURNING user_id",
+    "INSERT INTO users (email, name, role) VALUES ($1, $2, $3) ON CONFLICT (email) DO NOTHING RETURNING user_id",
     [DEFAULT_USER_EMAIL, DEFAULT_USER_NAME, DEFAULT_USER_ROLE]
   );
-  return ins.rows[0].user_id;
+  if (ins.rows[0]) return ins.rows[0].user_id;
+  // If ON CONFLICT hit, re-query
+  const r2 = await pool.query("SELECT user_id FROM users WHERE email = $1 LIMIT 1", [DEFAULT_USER_EMAIL]);
+  return r2.rows[0].user_id;
 }
 
 /**

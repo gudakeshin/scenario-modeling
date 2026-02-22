@@ -118,11 +118,11 @@ export function ThinkingBlock({ data }: ThinkingBlockProps) {
 
         {/* Collapsible content */}
         <div
-          className={`overflow-hidden transition-all duration-300 ease-in-out ${
-            isExpanded ? "max-h-[500px] opacity-100 mt-2" : "max-h-0 opacity-0"
+          className={`transition-all duration-300 ease-in-out ${
+            isExpanded ? "max-h-[60vh] opacity-100 mt-2" : "max-h-0 opacity-0 overflow-hidden"
           }`}
         >
-          <div className="rounded-xl border border-[var(--border-light)] bg-[var(--panel-bg)]/60 backdrop-blur-sm px-4 py-3 text-[13px] leading-relaxed text-[var(--text-secondary)]">
+          <div className="rounded-xl border border-[var(--border-light)] bg-[var(--panel-bg)]/60 backdrop-blur-sm px-4 py-3 text-[13px] leading-relaxed text-[var(--text-secondary)] max-h-[55vh] overflow-y-auto">
             {/* Main thinking text with streaming cursor */}
             <div className="whitespace-pre-wrap">
               {displayedText || data.thinking}

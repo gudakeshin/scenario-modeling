@@ -1,5 +1,6 @@
-// eslint-disable-next-line @typescript-eslint/no-require-imports
-import PptxGenJS from "pptxgenjs";
+import PptxGenJSModule from "pptxgenjs";
+// Handle ESM/CJS interop: tsx may wrap the module
+const PptxGenJS = (PptxGenJSModule as unknown as { default?: typeof PptxGenJSModule }).default ?? PptxGenJSModule;
 type PptxTableRow = Array<{ text: string; options?: Record<string, unknown> }>;
 type PptxTableCell = { text: string; options?: Record<string, unknown> };
 import { pool } from "../db/index.js";
@@ -51,14 +52,17 @@ export async function exportToPptx(scenarioId: string): Promise<Buffer> {
   );
   const params = pRes.rows;
 
-  const baseValues = await computeBaseCase();
-  const model = await getModelDefinition();
+  const sModelRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
+  const modelHash = sModelRef.rows[0]?.model_version_hash;
+  const model = await getModelDefinition(modelHash);
+  if (!model) throw new Error("No model found for this scenario");
+  const baseValues = await computeBaseCase(model);
   const plMetrics = getPLMetrics(model);
   const periodCount = periods.length || 1;
 
   // Create presentation
-  // @ts-expect-error PptxGenJS constructor typing
-  const pptx = new PptxGenJS();
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  const pptx = new (PptxGenJS as any)();
   pptx.author = "Scenario Modeling | Deloitte";
   pptx.company = "Deloitte";
   pptx.title = scenario.name || "Scenario Analysis";

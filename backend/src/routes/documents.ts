@@ -56,7 +56,7 @@ documentsRouter.post("/upload", (req, res, next) => {
       userId
     );
 
-    return res.status(201).json(doc);
+    return res.status(201).json({ ...doc, context_hint: "Document uploaded. Click 'Build Context' to analyze all documents and create/update your company model." });
   } catch (e) {
     console.error("Document upload failed:", e);
     const msg = (e as Error).message;

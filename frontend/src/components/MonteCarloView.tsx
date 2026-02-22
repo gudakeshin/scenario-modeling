@@ -3,7 +3,7 @@
 import { useState, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { runMonteCarlo, type MonteCarloResult, type PercentileResult } from "@/lib/api";
-import { METRIC_LABELS } from "@/lib/metrics";
+import { METRIC_LABELS, fmtCurrency } from "@/lib/metrics";
 
 interface MonteCarloViewProps {
   scenarioId: string;
@@ -12,7 +12,7 @@ interface MonteCarloViewProps {
 }
 
 function fmt(n: number) {
-  return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  return n < 0 ? `-${fmtCurrency(n)}` : fmtCurrency(n);
 }
 
 function DistributionBar({ metric, data }: { metric: string; data: PercentileResult }) {

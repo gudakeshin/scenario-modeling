@@ -1,0 +1,306 @@
+================================================================================
+                    BIRLASOFT LIMITED — CONSOLIDATED FINANCIAL STATEMENTS
+                         Profit & Loss Statement for FY 2024-25
+                              (All figures in INR Million)
+================================================================================
+
+Company Overview
+----------------
+Birlasoft Limited (NSE: BSOFT, BSE: 532400) is a global IT services company
+headquartered in Noida, India. A CK Birla Group company, Birlasoft provides
+digital transformation, enterprise solutions, and cloud services to clients
+across manufacturing, BFSI, energy & utilities, and life sciences verticals.
+The company operates across 12 countries with 13,000+ employees.
+
+Industry: Information Technology Services & Consulting
+Sub-sector: Mid-cap IT Services
+Peer Group: NIIT Technologies, Persistent Systems, Mphasis, Coforge, L&T Technology Services
+
+
+REVENUE FROM OPERATIONS
+================================================================================
+                                           FY 2024-25      FY 2023-24    YoY Growth
+                                           ----------      ----------    ----------
+Software Services Revenue                    50,120          48,950        2.4%
+  - Fixed Price Projects                     22,554          21,538        4.7%
+  - Time & Material Projects                 27,566          27,412        0.6%
+
+Products & Licenses Revenue                   1,830           1,720        6.4%
+
+Other Operating Revenue                       1,802           1,690        6.6%
+  - Support & Maintenance                     1,250           1,180        5.9%
+  - Training & Consulting                       552             510        8.2%
+
+--------------------------------------------------------------------------------
+TOTAL REVENUE FROM OPERATIONS (A)            53,752          52,360        2.7%
+================================================================================
+
+
+COST OF REVENUE (DIRECT COSTS)
+================================================================================
+Employee Benefits Expense (Delivery)         28,808          27,620        4.3%
+  - Salaries & Wages (Delivery Staff)        24,100          23,100        4.3%
+  - Contribution to PF & Other Funds          2,108           2,020        4.4%
+  - Staff Welfare & Benefits                  1,400           1,350        3.7%
+  - Share-Based Compensation (Delivery)       1,200           1,150        4.3%
+
+Subcontracting / Outsourced Costs             4,250           3,980        6.8%
+
+Travel Costs (Delivery)                         920             850        8.2%
+
+Software Licenses & Tools (Project)             680             650        4.6%
+
+Hosting & Cloud Infrastructure                1,350           1,200       12.5%
+
+--------------------------------------------------------------------------------
+TOTAL COST OF REVENUE (B)                    36,008          34,300        5.0%
+================================================================================
+
+
+GROSS PROFIT (C = A - B)                     17,744          18,060       -1.7%
+GROSS MARGIN (%)                              33.0%           34.5%
+
+
+OPERATING EXPENSES (SG&A)
+================================================================================
+Employee Benefits Expense (SG&A)              3,200           3,080        3.9%
+  - Salaries & Wages (Corp/Sales/Admin)       2,650           2,550        3.9%
+  - PF & Benefits (Corp)                        350             330        6.1%
+  - Share-Based Compensation (SGA)               200             200        0.0%
+
+Sales & Marketing Expenses                    1,450           1,380        5.1%
+  - Brand & Advertising                         420             400        5.0%
+  - Travel (Sales)                               580             540        7.4%
+  - Events & Conferences                         250             240        4.2%
+  - Commissions & Incentives                     200             200        0.0%
+
+General & Administrative Expenses             2,350           2,250        4.4%
+  - Rent & Facility Costs                        850             820        3.7%
+  - Legal & Professional Fees                    520             500        4.0%
+  - Insurance                                    180             170        5.9%
+  - Communication & IT (Internal)                380             360        5.6%
+  - Repairs & Maintenance                        220             210        4.8%
+  - Miscellaneous Admin                          200             190        5.3%
+
+Research & Development Expenses                 980             920        6.5%
+
+Depreciation & Amortization                   2,250           2,150        4.7%
+  - Depreciation on PPE                        1,200           1,150        4.3%
+  - Amortization of Intangibles                  650             620        4.8%
+  - Right-of-Use Asset Depreciation              400             380        5.3%
+
+Provision for Doubtful Debts                    280             260        7.7%
+
+Foreign Exchange Loss / (Gain)                  118            (150)         —
+
+--------------------------------------------------------------------------------
+TOTAL OPERATING EXPENSES (D)                 10,628          9,890         7.5%
+================================================================================
+
+
+EBITDA (E = C - D + Dep&Amort)                9,366           10,320      -9.2%
+EBITDA MARGIN (%)                             17.4%           19.7%
+
+OPERATING PROFIT / EBIT (F = C - D)           7,116           8,170      -12.9%
+OPERATING MARGIN (%)                          13.2%           15.6%
+
+
+OTHER INCOME
+================================================================================
+Interest Income                                 696             640        8.8%
+  - Interest on Bank Deposits                    480             440        9.1%
+  - Interest on Tax Refunds                      120             110        9.1%
+  - Other Interest Income                         96              90        6.7%
+
+Dividend Income                                  45              40       12.5%
+
+Fair Value Gain on Investments                   220             280      -21.4%
+
+Profit on Sale of Investments                    150             180      -16.7%
+
+Other Non-Operating Income                        88              75       17.3%
+  - Insurance Claims Received                     50              40       25.0%
+  - Miscellaneous Income                          38              35        8.6%
+
+--------------------------------------------------------------------------------
+TOTAL OTHER INCOME (G)                         1,199           1,215       -1.3%
+================================================================================
+
+
+PROFIT BEFORE INTEREST & TAX (H = F + G)       8,315           9,385     -11.4%
+
+
+FINANCE COSTS
+================================================================================
+Interest on Borrowings                           380             350        8.6%
+Interest on Lease Liabilities                    180             170        5.9%
+Bank Charges & Other Finance Costs                90              85        5.9%
+
+--------------------------------------------------------------------------------
+TOTAL FINANCE COSTS (I)                          650             605        7.4%
+================================================================================
+
+
+PROFIT BEFORE EXCEPTIONAL ITEMS (J = H - I)    7,665           8,780     -12.7%
+
+
+EXCEPTIONAL ITEMS
+================================================================================
+Restructuring Charges                            (120)             —         —
+Gain on Sale of Subsidiary                          —             350        —
+
+--------------------------------------------------------------------------------
+NET EXCEPTIONAL ITEMS (K)                        (120)            350        —
+================================================================================
+
+
+PROFIT BEFORE TAX (L = J + K)                  7,545           9,130     -17.4%
+PBT MARGIN (%)                                 14.0%           17.4%
+
+
+TAX EXPENSE
+================================================================================
+Current Tax                                    2,100           2,480      -15.3%
+Deferred Tax (Credit) / Charge                  (215)           (180)      19.4%
+
+--------------------------------------------------------------------------------
+TOTAL TAX EXPENSE (M)                          1,885           2,300      -18.0%
+EFFECTIVE TAX RATE (%)                         25.0%           25.2%
+================================================================================
+
+
+PROFIT AFTER TAX / NET INCOME (N = L - M)      5,660           6,830     -17.1%
+NET INCOME MARGIN (%)                          10.5%           13.0%
+
+
+OTHER COMPREHENSIVE INCOME
+================================================================================
+Foreign Currency Translation Reserve              320             280       14.3%
+Remeasurement of Defined Benefit Plans            (45)            (38)      18.4%
+Fair Value Changes on Hedging Instruments          85             (65)        —
+
+--------------------------------------------------------------------------------
+TOTAL OTHER COMPREHENSIVE INCOME (O)             360             177      103.4%
+================================================================================
+
+
+TOTAL COMPREHENSIVE INCOME (N + O)             6,020           7,007      -14.1%
+
+
+EARNINGS PER SHARE
+================================================================================
+Weighted Average Shares (Million)                278             278        0.0%
+Basic EPS (INR)                                20.36           24.57      -17.1%
+Diluted EPS (INR)                              20.18           24.35      -17.1%
+
+
+================================================================================
+                         KEY FINANCIAL RATIOS & METRICS
+================================================================================
+
+Profitability Ratios
+--------------------
+Gross Margin:                         33.0%   (Prior Year: 34.5%)
+EBITDA Margin:                        17.4%   (Prior Year: 19.7%)
+Operating (EBIT) Margin:              13.2%   (Prior Year: 15.6%)
+PBT Margin:                           14.0%   (Prior Year: 17.4%)
+Net Income Margin:                    10.5%   (Prior Year: 13.0%)
+Return on Equity (ROE):               18.2%   (Prior Year: 21.5%)
+Return on Capital Employed (ROCE):    22.8%   (Prior Year: 26.1%)
+
+Efficiency Ratios
+-----------------
+Revenue per Employee (INR Mn):         4.13    (Prior Year: 4.19)
+Employee Cost as % of Revenue:        59.5%   (Prior Year: 58.6%)
+SGA as % of Revenue:                  15.6%   (Prior Year: 14.7%)
+Subcontracting as % of Revenue:        7.9%   (Prior Year: 7.6%)
+
+Growth Metrics
+--------------
+Revenue Growth (YoY):                  2.7%
+EBITDA Growth (YoY):                  -9.2%
+Net Income Growth (YoY):             -17.1%
+EPS Growth (YoY):                    -17.1%
+
+Liquidity & Balance Sheet (Snapshot)
+-------------------------------------
+Cash & Cash Equivalents:             8,450
+Total Debt:                          3,200
+Net Cash Position:                   5,250
+Debt-to-Equity Ratio:                0.10
+Current Ratio:                       2.15
+
+Revenue by Vertical
+--------------------
+Manufacturing:                       35%  (INR 18,813 Mn)
+BFSI:                                25%  (INR 13,438 Mn)
+Energy & Utilities:                  20%  (INR 10,750 Mn)
+Life Sciences:                       12%  (INR  6,450 Mn)
+Others:                               8%  (INR  4,300 Mn)
+
+Revenue by Geography
+---------------------
+Americas:                            60%  (INR 32,251 Mn)
+Europe:                              22%  (INR 11,825 Mn)
+India:                               12%  (INR  6,450 Mn)
+Rest of World:                        6%  (INR  3,225 Mn)
+
+Top Client Concentration
+-------------------------
+Top 1 Client:                         8.2% of Revenue
+Top 5 Clients:                       28.5% of Revenue
+Top 10 Clients:                      42.0% of Revenue
+Top 20 Clients:                      58.0% of Revenue
+
+Headcount & Utilization
+------------------------
+Total Employees:                    13,012
+  - Delivery / Technical:           10,950  (84.2%)
+  - Sales & Marketing:                 980  ( 7.5%)
+  - General & Administration:        1,082  ( 8.3%)
+Utilization Rate (Delivery):         78.5%  (Prior Year: 80.2%)
+Voluntary Attrition (LTM):          15.8%  (Prior Year: 17.2%)
+
+Industry Benchmarks (Mid-cap IT Services, India)
+-------------------------------------------------
+Median Revenue Growth:                8-12%
+Median EBITDA Margin:               18-22%
+Median Net Income Margin:           12-16%
+Median Utilization:                 80-84%
+Median Attrition:                   14-18%
+Median Employee Cost Ratio:         55-62%
+
+
+================================================================================
+                              SEGMENT INFORMATION
+================================================================================
+
+The company reports as a single operating segment (IT Services) as per Ind AS 108.
+Geographic revenue breakdown is provided above for analytical purposes.
+
+
+================================================================================
+                        NOTES & ACCOUNTING POLICIES
+================================================================================
+
+1. Revenue Recognition: Ind AS 115 — Fixed-price contracts recognized on
+   percentage-of-completion basis; T&M contracts recognized as services rendered.
+
+2. Foreign Currency: Functional currency is INR. Foreign currency transactions
+   translated at spot rate; monetary assets/liabilities restated at closing rate.
+   Forward contracts designated as cash flow hedges under Ind AS 109.
+
+3. Employee Benefits: Gratuity and leave encashment as per actuarial valuation.
+   ESOP expense recognized at fair value on grant date (Black-Scholes model).
+
+4. Depreciation: PPE on straight-line basis over useful life per Schedule II.
+   Intangibles (acquired software, customer relationships) amortized over 3-7 years.
+
+5. The company has operating lease commitments of INR 2,800 Mn over next 5 years.
+
+6. Related party transactions during FY25 include management remuneration of
+   INR 180 Mn and transactions with CK Birla Group entities of INR 450 Mn.
+
+================================================================================
+                              END OF P&L STATEMENT
+================================================================================

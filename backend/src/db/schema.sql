@@ -108,6 +108,31 @@ CREATE TABLE IF NOT EXISTS parameter_override_history (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Company context (extracted understanding from uploaded documents)
+CREATE TABLE IF NOT EXISTS company_context (
+    context_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_by UUID REFERENCES users(user_id),
+    company_name TEXT,
+    industry TEXT,
+    context_data JSONB NOT NULL,
+    source_document_ids UUID[],
+    status TEXT DEFAULT 'active',
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- User-defined models (replaces hardcoded DEFAULT_MODEL)
+CREATE TABLE IF NOT EXISTS user_models (
+    model_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    created_by UUID REFERENCES users(user_id),
+    name TEXT NOT NULL,
+    model_definition JSONB NOT NULL,
+    source_context_id UUID REFERENCES company_context(context_id),
+    is_active BOOLEAN DEFAULT TRUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
 -- Documents (for RAG / talk-to-document feature)
 CREATE TABLE IF NOT EXISTS documents (
     document_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -133,9 +158,11 @@ CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_trail(timestamp);
 CREATE INDEX IF NOT EXISTS idx_mappings_term ON model_mappings(business_term);
 CREATE INDEX IF NOT EXISTS idx_mappings_variable ON model_mappings(model_variable_id);
 
--- Seed default user for local dev (id used when creator_id is required)
+-- Seed default user for local dev / testing only.
+-- In production, users should be created via the application or SSO.
+-- This seed is safe as ON CONFLICT prevents duplicates.
 INSERT INTO users (email, name, role) VALUES ('dev@local', 'Dev User', 'admin')
-ON CONFLICT (email) DO UPDATE SET role = 'admin';
+ON CONFLICT (email) DO NOTHING;
 
 -- Seed default mappings so parser output maps to model variables
 INSERT INTO model_mappings (business_term, model_variable_id, synonyms) VALUES

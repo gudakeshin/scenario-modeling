@@ -3,7 +3,7 @@
 import { useState } from "react";
 import type { PeriodResult } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
-import { METRIC_LABELS } from "@/lib/metrics";
+import { METRIC_LABELS, fmtCurrency } from "@/lib/metrics";
 
 interface PeriodBreakdownViewProps {
   periods: PeriodResult[];
@@ -13,8 +13,8 @@ interface PeriodBreakdownViewProps {
   onMinimize?: () => void;
 }
 
-function fmtNum(n: number) {
-  return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+function fmt(n: number) {
+  return n < 0 ? `-${fmtCurrency(n)}` : fmtCurrency(n);
 }
 
 type ViewMode = "table" | "chart";
@@ -78,7 +78,7 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
             }`}
           >
             <p className="text-[9px] text-[var(--text-faint)] uppercase font-medium tracking-wider">{METRIC_LABELS[key] || key}</p>
-            <p className="text-sm font-semibold text-[var(--text-primary)] mt-0.5">${fmtNum(totalPl[key] || 0)}</p>
+            <p className="text-sm font-semibold text-[var(--text-primary)] mt-0.5">{fmt(totalPl[key] || 0)}</p>
           </button>
         ))}
       </div>
@@ -104,7 +104,7 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
                     style={{ width: `${width}%` }}
                   />
                   <span className="absolute inset-y-0 flex items-center px-2 text-[10px] font-medium text-[var(--text-primary)]">
-                    ${fmtNum(val)}
+                    {fmt(val)}
                   </span>
                 </div>
               </div>
@@ -137,12 +137,12 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
                       total += val;
                       return (
                         <td key={p.period} className="text-right py-2 px-2 text-[var(--text-secondary)] tabular-nums">
-                          ${fmtNum(val)}
+                          {fmt(val)}
                         </td>
                       );
                     })}
                     <td className="text-right py-2 px-3 font-semibold text-[var(--text-primary)] tabular-nums">
-                      ${fmtNum(Math.round(total * 100) / 100)}
+                      {fmt(Math.round(total * 100) / 100)}
                     </td>
                   </tr>
                 );

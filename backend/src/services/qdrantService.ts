@@ -125,6 +125,59 @@ export async function searchChunks(
 }
 
 /**
+ * Retrieve ALL chunks for given document IDs, ordered by chunk_index.
+ * Used by the context engine to reconstruct full document text.
+ */
+export async function getAllChunksForDocuments(documentIds: string[]): Promise<SearchResult[]> {
+  const c = getClient();
+  try {
+    await ensureCollection();
+  } catch {
+    return [];
+  }
+
+  const allResults: SearchResult[] = [];
+
+  for (const docId of documentIds) {
+    let offset: string | number | undefined = undefined;
+    const limit = 100;
+
+    // Paginate through all points for this document
+    while (true) {
+      const response = await c.scroll(COLLECTION_NAME, {
+        filter: { must: [{ key: "document_id", match: { value: docId } }] },
+        limit,
+        offset,
+        with_payload: true,
+        with_vector: false,
+      });
+
+      for (const point of response.points) {
+        allResults.push({
+          score: 1,
+          text: (point.payload?.text as string) || "",
+          document_id: (point.payload?.document_id as string) || "",
+          document_name: (point.payload?.document_name as string) || "",
+          chunk_index: (point.payload?.chunk_index as number) || 0,
+          page: point.payload?.page as number | undefined,
+        });
+      }
+
+      if (!response.next_page_offset) break;
+      offset = response.next_page_offset as string | number | undefined;
+    }
+  }
+
+  // Sort by document_id then chunk_index to reconstruct original order
+  allResults.sort((a, b) => {
+    if (a.document_id !== b.document_id) return a.document_id.localeCompare(b.document_id);
+    return a.chunk_index - b.chunk_index;
+  });
+
+  return allResults;
+}
+
+/**
  * Delete all chunks for a given document.
  */
 export async function deleteDocumentChunks(documentId: string): Promise<void> {

@@ -1,16 +1,19 @@
 /**
- * Model registry: definitions loaded from external API or default stub.
+ * Model registry: definitions loaded from user_models DB table or external API.
  *
  * All base values, metric lists, and variable classifications are
  * DERIVED from the model definition — never hardcoded elsewhere.
+ *
+ * Models are created dynamically by the Context Engine from uploaded documents.
  */
+
+import { pool } from "../db/index.js";
 
 export interface ModelVariable {
   id: string;
   name: string;
   formula: string;
   dependencies: string[];
-  /** Tags for classification: "input", "output", "pl_metric", etc. */
   tags?: string[];
 }
 
@@ -26,34 +29,57 @@ export interface ModelDefinition {
   time_horizon: TimeHorizon;
 }
 
-/** Default stub model for dev: simple P&L. */
-export const DEFAULT_MODEL: ModelDefinition = {
-  model_version: "v0",
-  time_horizon: { start: "2024-Q1", end: "2024-Q4", granularity: "quarterly" },
-  variables: [
-    { id: "revenue", name: "Revenue", formula: "units_sold * unit_price", dependencies: ["units_sold", "unit_price"], tags: ["pl_metric", "output"] },
-    { id: "units_sold", name: "Units Sold", formula: "1000", dependencies: [], tags: ["input", "percent_delta"] },
-    { id: "unit_price", name: "Unit Price", formula: "50", dependencies: [], tags: ["input", "percent_delta"] },
-    { id: "raw_material_cost", name: "Raw Material Cost", formula: "revenue * 0.25", dependencies: ["revenue"], tags: ["intermediate", "percent_delta"] },
-    { id: "cogs", name: "COGS", formula: "raw_material_cost", dependencies: ["raw_material_cost"], tags: ["pl_metric", "output"] },
-    { id: "gross_margin", name: "Gross Margin", formula: "revenue - cogs", dependencies: ["revenue", "cogs"], tags: ["pl_metric", "output"] },
-    { id: "opex", name: "OpEx", formula: "revenue * 0.15", dependencies: ["revenue"], tags: ["pl_metric", "percent_delta"] },
-    { id: "ebitda", name: "EBITDA", formula: "gross_margin - opex", dependencies: ["gross_margin", "opex"], tags: ["pl_metric", "output"] },
-    { id: "net_income", name: "Net Income", formula: "ebitda", dependencies: ["ebitda"], tags: ["pl_metric", "output"] },
-  ],
-};
+const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 
-export async function getModelDefinition(version?: string): Promise<ModelDefinition> {
+/**
+ * Get a model definition by model_id (UUID) or version string.
+ * Returns null if no model is found — callers should handle the onboarding case.
+ */
+export async function getModelDefinition(modelIdOrVersion?: string): Promise<ModelDefinition | null> {
+  // 1. If it's a UUID, look up in user_models by model_id
+  if (modelIdOrVersion && UUID_RE.test(modelIdOrVersion)) {
+    const r = await pool.query("SELECT model_definition FROM user_models WHERE model_id = $1", [modelIdOrVersion]);
+    if (r.rows.length > 0) return r.rows[0].model_definition as ModelDefinition;
+  }
+
+  // 2. Try external model registry API
   const envUrl = process.env.MODEL_REGISTRY_URL;
-  if (envUrl && version) {
+  if (envUrl && modelIdOrVersion) {
     try {
-      const res = await fetch(`${envUrl}/models/${version}`);
+      const res = await fetch(`${envUrl}/models/${modelIdOrVersion}`);
       if (res.ok) return (await res.json()) as ModelDefinition;
     } catch {
       // fallback
     }
   }
-  return DEFAULT_MODEL;
+
+  // 3. No model found — return null (triggers onboarding)
+  return null;
+}
+
+/**
+ * Get the active model for a specific user.
+ * This is the primary way to get a model at scenario creation time.
+ */
+export async function getUserModelDefinition(userId: string): Promise<ModelDefinition | null> {
+  const r = await pool.query(
+    "SELECT model_definition FROM user_models WHERE created_by = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
+    [userId]
+  );
+  if (r.rows.length > 0) return r.rows[0].model_definition as ModelDefinition;
+  return null;
+}
+
+/**
+ * Get the active model_id for a user (to store on scenarios).
+ */
+export async function getUserModelId(userId: string): Promise<string | null> {
+  const r = await pool.query(
+    "SELECT model_id FROM user_models WHERE created_by = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
+    [userId]
+  );
+  if (r.rows.length > 0) return r.rows[0].model_id;
+  return null;
 }
 
 // ── Derived helpers (single source of truth) ──
@@ -91,12 +117,17 @@ function evaluateFormula(formula: string, ctx: Record<string, number>): number {
 }
 
 /**
- * Compute the base case P&L from the model definition.
- * This is the SINGLE SOURCE OF TRUTH for base values —
- * no other file should hardcode base_pl.
+ * Compute the base case P&L from a model definition.
+ * Accepts a model directly, or looks it up by ID/version.
  */
-export async function computeBaseCase(version?: string): Promise<Record<string, number>> {
-  const model = await getModelDefinition(version);
+export async function computeBaseCase(modelOrVersion?: string | ModelDefinition): Promise<Record<string, number>> {
+  let model: ModelDefinition | null;
+  if (modelOrVersion && typeof modelOrVersion === "object") {
+    model = modelOrVersion;
+  } else {
+    model = await getModelDefinition(modelOrVersion as string | undefined);
+  }
+  if (!model) return {};
   const order = topologicalSort(model.variables);
   const ctx: Record<string, number> = {};
   for (const id of order) {

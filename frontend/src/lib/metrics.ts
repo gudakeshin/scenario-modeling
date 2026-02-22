@@ -44,3 +44,38 @@ export const METRIC_COLORS: Record<string, string> = {
 export function metricLabel(key: string): string {
   return METRIC_LABELS[key] ?? key.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
 }
+
+// ── Currency ──
+
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  USD: "$", EUR: "€", GBP: "£", INR: "₹", JPY: "¥", CNY: "¥",
+  AUD: "A$", CAD: "C$", CHF: "CHF ", SGD: "S$", HKD: "HK$",
+  KRW: "₩", BRL: "R$", ZAR: "R", MXN: "MX$", SEK: "kr",
+};
+
+let _currency = "USD";
+let _currencyUnit = "";
+
+export function setCurrency(code: string, unit?: string) {
+  _currency = code || "USD";
+  _currencyUnit = unit || "";
+}
+
+export function getCurrencySymbol(): string {
+  return CURRENCY_SYMBOLS[_currency] || _currency + " ";
+}
+
+export function getCurrencyLabel(): string {
+  const sym = getCurrencySymbol();
+  return _currencyUnit ? `${sym} ${_currencyUnit}` : sym;
+}
+
+export function fmtCurrency(n: number): string {
+  const sym = getCurrencySymbol();
+  return sym + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+}
+
+export function fmtCurrencySigned(n: number): string {
+  const prefix = n >= 0 ? "+" : "-";
+  return prefix + fmtCurrency(Math.abs(n));
+}

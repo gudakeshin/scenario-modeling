@@ -18,7 +18,9 @@ import { SharingPanel } from "./SharingPanel";
 import { RoleManagement } from "./RoleManagement";
 import { FollowUpQuestions } from "./FollowUpQuestions";
 import { DocumentPanel } from "./DocumentPanel";
+import { DocumentManager } from "./DocumentManager";
 import { AnalysisModal } from "./AnalysisModal";
+import { RoleSwitcher } from "./RoleSwitcher";
 import {
   parseScenario,
   refineScenario,
@@ -30,10 +32,13 @@ import {
   getBaseCase,
   initUserContext,
   listScenarios,
+  getOnboardingStatus,
   type BusinessInsight,
   type PeriodResult,
   type FollowUpQuestion,
+  type OnboardingStatus,
 } from "@/lib/api";
+import { setCurrency, getCurrencySymbol, getCurrencyLabel } from "@/lib/metrics";
 import type { Message, Conversation, ThinkingData } from "@/types/chat";
 
 function generateId() {
@@ -64,6 +69,10 @@ export function ChatWindow() {
   const [showSharing, setShowSharing] = useState(false);
   const [showRoles, setShowRoles] = useState(false);
   const [showDocuments, setShowDocuments] = useState(false);
+  const [showDocManager, setShowDocManager] = useState(false);
+
+  // Onboarding: check if the user has context + model
+  const [onboardingStatus, setOnboardingStatus] = useState<OnboardingStatus | null>(null);
 
   // Follow-up questions from the parser (interactive disambiguation)
   const [pendingQuestions, setPendingQuestions] = useState<FollowUpQuestion[] | null>(null);
@@ -77,8 +86,14 @@ export function ChatWindow() {
   // Session ID for conversational follow-up
   const [sessionId, setSessionId] = useState<string | null>(null);
 
-  // Initialize user context on mount (resolves cached user identity)
-  useEffect(() => { initUserContext().catch(() => {}); }, []);
+  // Initialize user context on mount (resolves cached user identity) + check onboarding
+  useEffect(() => {
+    initUserContext().catch(() => {});
+    getOnboardingStatus().then((s) => {
+      setOnboardingStatus(s);
+      if (s.currency) setCurrency(s.currency, s.currency_unit);
+    }).catch(() => {});
+  }, []);
 
   // Load existing scenarios from the database on mount so they persist across navigation
   useEffect(() => {
@@ -147,6 +162,7 @@ export function ChatWindow() {
     setShowSharing(false);
     setShowRoles(false);
     setShowDocuments(false);
+    setShowDocManager(false);
     setPendingQuestions(null);
     setExpandedPanel(null);
   }, []);
@@ -303,9 +319,24 @@ export function ChatWindow() {
             // session creation is optional
           }
         }
-      } catch {
-        assistantContent =
-          "I couldn't reach the scenario API. Make sure the backend is running (`cd backend && npm run dev`).";
+      } catch (e) {
+        const errorMsg = (e as Error).message || "";
+        if (errorMsg.includes("No model found") || errorMsg.includes("needs_onboarding") || errorMsg.includes("upload documents")) {
+          assistantContent =
+            "**Getting Started**\n\n" +
+            "Before creating scenarios, you need to set up your company context:\n\n" +
+            "1. Click **Document Manager** below\n" +
+            "2. Upload your financial documents (P&L, income statements, reports)\n" +
+            "3. Click **Build Context** to have AI extract your company profile and create a financial model\n" +
+            "4. Review and confirm the generated model\n" +
+            "5. Then describe your scenarios here!\n\n" +
+            "_The system will learn from your documents and create a custom model for your business._";
+          setShowDocManager(true);
+          setExpandedPanel("docManager");
+        } else {
+          assistantContent =
+            "Something went wrong. Please make sure the backend is running and try again.";
+        }
       }
 
       const assistantMessage: Message = { id: generateId(), role: "assistant", content: assistantContent, timestamp: new Date(), thinking: thinkingData };
@@ -337,11 +368,20 @@ export function ChatWindow() {
 
       // Aggregate P&L
       const plText =
-        `**P&L (scenario total${result.period_count ? ` \u2014 ${result.period_count} ${result.granularity || "periods"}` : ""}):**\n` +
+        `**P&L in ${getCurrencyLabel()} (scenario total${result.period_count ? ` \u2014 ${result.period_count} ${result.granularity || "periods"}` : ""}):**\n` +
         Object.entries(result.pl || {})
-          .map(([k, v]) => `- **${k}**: $${v.toLocaleString()}`)
+          .map(([k, v]) => `- **${k}**: ${getCurrencySymbol()}${v.toLocaleString()}`)
           .join("\n");
       addAssistantMessage(convId, plText);
+
+      // Surface absurdity warnings from simulation validation
+      if (result.absurdity_warnings && result.absurdity_warnings.length > 0) {
+        const warningText =
+          "**Validation Warnings:**\n" +
+          result.absurdity_warnings.map((w: string) => `- ${w}`).join("\n") +
+          "\n\n_The model detected potentially disproportionate results. Please review the parameters above._";
+        addAssistantMessage(convId, warningText);
+      }
 
       // Store period data for interactive view
       if (result.periods && result.periods.length > 1) {
@@ -370,22 +410,30 @@ export function ChatWindow() {
         // narrative is optional
       }
 
-      // Auto-trigger the Business Analyst Agent
-      addAssistantMessage(convId, "Running business analysis agent...");
+      // Auto-trigger the Business Analyst Agent + QA reflection loop
+      addAssistantMessage(convId, "Running business analysis agent with quality assurance loop...");
       try {
         const insight = await generateBusinessAnalysis(scenarioId);
         setPreloadedInsight(insight);
         setShowInsights(true);
         setExpandedPanel("insights");
-        // Also add the headline to chat for quick visibility
+
+        // Show QA loop result summary in chat
+        const qaStatus = insight.qa_report
+          ? insight.qa_report.passed
+            ? `Quality Assurance: **${insight.qa_report.overall_score}/10** (passed after ${insight.qa_report.iterations} ${insight.qa_report.iterations === 1 ? "review" : "reviews"})`
+            : `Quality Assurance: **${insight.qa_report.overall_score}/10** (did not pass — see warnings in the panel)`
+          : "";
+
         addAssistantMessage(
           convId,
           `**So What?**\n\n${insight.headline}\n\n` +
+            (qaStatus ? qaStatus + "\n\n" : "") +
             `**Top actions:**\n${insight.recommendations
               .slice(0, 3)
               .map((r, i) => `${i + 1}. **${r.action}** _(${r.priority})_${r.owner ? ` \u2192 ${r.owner}` : ""}`)
               .join("\n")}\n\n` +
-            "See the **Business Insights** panel below for full analysis, risks, and decision framework."
+            "See the **Business Insights** panel for full analysis, agent reflection log, and QA report."
         );
       } catch {
         addAssistantMessage(convId, "Business analysis could not be generated. Click **So What?** in the toolbar to retry.");
@@ -516,6 +564,7 @@ export function ChatWindow() {
     templates: "bg-[var(--info)]", roles: "bg-[var(--warning)]",
     insights: "bg-[var(--success)]", followUp: "bg-accent",
     documents: "bg-[var(--info)]",
+    docManager: "bg-accent",
   };
 
   const panelCards = useMemo(() => {
@@ -533,8 +582,9 @@ export function ChatWindow() {
     if (showInsights && active?.scenarioId) cards.push({ id: "insights", title: "Business Insights", close: () => { setShowInsights(false); setPreloadedInsight(null); } });
     if (pendingQuestions && pendingQuestions.length > 0 && active?.scenarioId) cards.push({ id: "followUp", title: "Refine Scenario", close: () => setPendingQuestions(null) });
     if (showDocuments) cards.push({ id: "documents", title: "Documents", close: () => setShowDocuments(false) });
+    if (showDocManager) cards.push({ id: "docManager", title: "Document Manager", close: () => setShowDocManager(false) });
     return cards;
-  }, [showReview, showComparison, showMonteCarlo, showTornado, showPeriods, showCharts, showSharing, showAudit, showTemplates, showRoles, showInsights, pendingQuestions, showDocuments, active?.scenarioId, periodData, chartData]);
+  }, [showReview, showComparison, showMonteCarlo, showTornado, showPeriods, showCharts, showSharing, showAudit, showTemplates, showRoles, showInsights, pendingQuestions, showDocuments, showDocManager, active?.scenarioId, periodData, chartData]);
 
   // Toggle helper: activate+expand or deactivate+collapse
   const tp = (id: string, show: boolean, setShow: (v: boolean) => void) => () => {
@@ -584,6 +634,8 @@ export function ChatWindow() {
         return pendingQuestions && pendingQuestions.length > 0 ? <FollowUpQuestions questions={pendingQuestions} onSubmit={handleFollowUpAnswers} isLoading={isLoading} /> : null;
       case "documents":
         return <DocumentPanel onClose={() => closePanel("documents", () => setShowDocuments(false))} onMinimize={collapseModal} />;
+      case "docManager":
+        return <DocumentManager onClose={() => closePanel("docManager", () => setShowDocManager(false))} onMinimize={collapseModal} onContextBuilt={() => { getOnboardingStatus().then((s) => { setOnboardingStatus(s); if (s.currency) setCurrency(s.currency, s.currency_unit); }).catch(() => {}); }} />;
       default:
         return null;
     }
@@ -601,6 +653,40 @@ export function ChatWindow() {
     <div className="flex h-screen overflow-hidden bg-background">
       <Sidebar conversations={conversations} activeId={activeId} onSelect={handleSelect} onNewChat={handleNewChat} />
       <div className="flex flex-col flex-1 min-w-0 relative">
+        {/* Top bar with role switcher */}
+        <div className="flex items-center justify-between px-4 py-2 border-b border-[var(--border)] bg-[var(--card-bg)]/80 backdrop-blur-sm shrink-0">
+          <h1 className="text-sm font-semibold text-[var(--text-primary)]">Scenario Modeling</h1>
+          <RoleSwitcher />
+        </div>
+
+        {/* Onboarding banner */}
+        {onboardingStatus && !onboardingStatus.ready && messages.length === 0 && !active?.scenarioId && (
+          <div className="mx-4 mt-4 rounded-xl border border-accent/20 bg-accent/5 p-5 space-y-3">
+            <h3 className="text-lg font-semibold text-[var(--text-primary)]">Welcome to Scenario Modeling</h3>
+            <p className="text-sm text-[var(--text-secondary)]">
+              Get started by uploading your financial documents. The AI will analyze them to understand your business and create a custom financial model.
+            </p>
+            <div className="flex items-center gap-3">
+              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${onboardingStatus.has_context ? "bg-[var(--success)] text-white" : "bg-[var(--border)] text-[var(--text-muted)]"}`}>1</div>
+              <span className="text-sm text-[var(--text-primary)]">Upload documents {onboardingStatus.has_context && <span className="text-[var(--success)]">(done)</span>}</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${onboardingStatus.has_context ? "bg-[var(--success)] text-white" : "bg-[var(--border)] text-[var(--text-muted)]"}`}>2</div>
+              <span className="text-sm text-[var(--text-primary)]">Build context {onboardingStatus.has_context && <span className="text-[var(--success)]">(done — {onboardingStatus.company_name})</span>}</span>
+            </div>
+            <div className="flex items-center gap-3">
+              <div className={`w-6 h-6 rounded-full flex items-center justify-center text-xs font-bold ${onboardingStatus.has_model ? "bg-[var(--success)] text-white" : "bg-[var(--border)] text-[var(--text-muted)]"}`}>3</div>
+              <span className="text-sm text-[var(--text-primary)]">Review model {onboardingStatus.has_model && <span className="text-[var(--success)]">(done — {onboardingStatus.model_name})</span>}</span>
+            </div>
+            <button
+              type="button"
+              onClick={() => { setShowDocManager(true); setExpandedPanel("docManager"); }}
+              className="mt-2 px-5 py-2.5 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent/90 transition-colors"
+            >
+              Open Document Manager
+            </button>
+          </div>
+        )}
         <MessageList messages={messages} isLoading={isLoading} />
 
         {/* ── Analysis card strip: compact cards for each active panel ── */}
@@ -676,6 +762,9 @@ export function ChatWindow() {
             <button type="button" onClick={tp("documents", showDocuments, setShowDocuments)} className={actionBtn(showDocuments)}>
               {showDocuments ? "Hide Docs" : "Documents"}
             </button>
+            <button type="button" onClick={tp("docManager", showDocManager, setShowDocManager)} className={actionBtn(showDocManager)}>
+              {showDocManager ? "Hide Manager" : "Manager"}
+            </button>
             <button
               type="button"
               onClick={() => {
@@ -700,9 +789,20 @@ export function ChatWindow() {
           </div>
         )}
 
-        {/* Template & Documents buttons when no scenario active */}
+        {/* Template, Documents & Manager buttons when no scenario active */}
         {!active?.scenarioId && (
           <div className="px-4 py-2.5 border-t border-[var(--border)] bg-[var(--panel-bg)] flex justify-center gap-2 shrink-0">
+            <button
+              type="button"
+              onClick={tp("docManager", showDocManager, setShowDocManager)}
+              className={`rounded-xl border px-4 py-2 text-sm font-medium transition-all ${
+                !onboardingStatus?.ready
+                  ? "bg-accent text-white border-accent hover:bg-accent/90"
+                  : "border-[var(--border)] text-[var(--text-secondary)] hover:bg-background hover:shadow-card"
+              }`}
+            >
+              {showDocManager ? "Hide Manager" : "Document Manager"}
+            </button>
             <button
               type="button"
               onClick={() => {
@@ -734,6 +834,8 @@ export function ChatWindow() {
           placeholder={
             sessionId
               ? "Type a follow-up adjustment (e.g. \"also increase marketing 10%\")\u2026"
+              : onboardingStatus && !onboardingStatus.ready
+              ? "Upload documents and build context first, then describe scenarios here\u2026"
               : "Describe your scenario in plain English\u2026"
           }
         />

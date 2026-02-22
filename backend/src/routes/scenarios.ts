@@ -4,10 +4,16 @@ import { resolveToModelVariable } from "../services/mappingService.js";
 import { runSimulation } from "../services/simulationService.js";
 import { compareScenarios } from "../services/comparisonService.js";
 import { generateNarrative } from "../services/narrativeService.js";
-import { generateBusinessAnalysis } from "../services/businessAnalysisAgent.js";
+import { generateBusinessAnalysis, regenerateWithFeedback } from "../services/businessAnalysisAgent.js";
+import {
+  evaluateAnalysis, buildScenarioContext, storeQAReport,
+  QA_THRESHOLD, MAX_QA_ITERATIONS,
+  type QAReport, type ReflectionStep,
+} from "../services/qaAgent.js";
 import { logAudit } from "../services/auditService.js";
 import { requireRole } from "../middleware/rbac.js";
-import { pool, getDefaultUserId } from "../db/index.js";
+import { pool, getDefaultUserId, resolveUserId } from "../db/index.js";
+import { getUserModelId, getUserModelDefinition } from "../models/registry.js";
 
 export const scenariosRouter = Router();
 
@@ -23,11 +29,15 @@ function validateLength(s: string, max: number, field: string): string | null {
 }
 
 // ── Base case (before /:id routes) ──
-scenariosRouter.get("/base-case", async (_req, res) => {
+scenariosRouter.get("/base-case", async (req, res) => {
   try {
-    const { computeBaseCase: compute, getModelDefinition: getModel, getPLMetrics: getMetrics } = await import("../models/registry.js");
-    const baseValues = await compute();
-    const model = await getModel();
+    const { computeBaseCase: compute, getPLMetrics: getMetrics } = await import("../models/registry.js");
+    const userId = await resolveUserId(req.headers["x-user-id"] as string | undefined);
+    const model = await getUserModelDefinition(userId);
+    if (!model) {
+      return res.json({ pl: {}, all_variables: {}, time_horizon: null, needs_onboarding: true });
+    }
+    const baseValues = await compute(model);
     const plMetrics = getMetrics(model);
     const pl: Record<string, number> = {};
     for (const id of plMetrics) {
@@ -64,7 +74,8 @@ scenariosRouter.post("/parse", async (req, res) => {
     const nl_input = sanitize(rawInput);
     const lenErr = validateLength(nl_input, MAX_INPUT_LENGTH, "nl_input");
     if (lenErr) return res.status(400).json({ error: lenErr });
-    const result = await parseScenario(nl_input.trim());
+    const userId = await resolveUserId(req.headers["x-user-id"] as string | undefined);
+    const result = await parseScenario(nl_input.trim(), userId);
     return res.json(result);
   } catch (e) {
     console.error(e);
@@ -78,15 +89,28 @@ scenariosRouter.post("/", async (req, res) => {
     if (typeof nl_input !== "string" || !nl_input.trim()) {
       return res.status(400).json({ error: "nl_input is required" });
     }
-    const creatorId = await getDefaultUserId();
+    const creatorId = await resolveUserId(req.headers["x-user-id"] as string | undefined);
+
+    // Look up the user's active model
+    const modelId = await getUserModelId(creatorId);
+    if (!modelId) {
+      return res.status(400).json({
+        error: "No model found. Please upload documents and build your company context first.",
+        needs_onboarding: true,
+      });
+    }
+
+    // Auto-generate a short name from the input if none provided
+    const autoName = name || nl_input.trim().split(/[.?!\n]/)[0].slice(0, 80).trim() || "Untitled Scenario";
+
     const r = await pool.query(
       `INSERT INTO scenarios (nl_input, name, status, creator_id, model_version_hash)
-       VALUES ($1, $2, 'draft', $3, 'v0')
+       VALUES ($1, $2, 'draft', $3, $4)
        RETURNING scenario_id, nl_input, name, status, created_at`,
-      [nl_input.trim(), name || null, creatorId]
+      [nl_input.trim(), autoName, creatorId, modelId]
     );
     const row = r.rows[0];
-    const parseResult = await parseScenario(nl_input.trim());
+    const parseResult = await parseScenario(nl_input.trim(), creatorId);
     const scenarioId = row.scenario_id;
     const paramsWithMapping: { name: string; mapped_variable_id: string; scenario_value: number; confidence: number }[] = [];
     for (const p of parseResult.parameters) {
@@ -173,7 +197,8 @@ scenariosRouter.post("/:id/refine", async (req, res) => {
     const enrichedInput = `${originalInput}\n\nAdditional context from user:\n${answerContext}`;
 
     // Re-parse with the enriched input
-    const parseResult = await parseScenario(enrichedInput);
+    const userId = await resolveUserId(req.headers["x-user-id"] as string | undefined);
+    const parseResult = await parseScenario(enrichedInput, userId);
 
     // Persist enriched input so downstream operations (narrative, analysis) have full context
     // Also reset status to 'draft' since parameters are being replaced
@@ -429,23 +454,115 @@ scenariosRouter.post("/:id/narrative", async (req, res) => {
   }
 });
 
-// ── Business Analysis Agent ("So What?") ──
+// ── Business Analysis Agent + QA Reflection Loop ──
 scenariosRouter.post("/:id/business-analysis", async (req, res) => {
   try {
     const sid = req.params.id;
     const sRes = await pool.query("SELECT status FROM scenarios WHERE scenario_id = $1", [sid]);
     if (sRes.rows.length === 0) return res.status(404).json({ error: "Scenario not found" });
 
-    const analysis = await generateBusinessAnalysis(sid);
-    await logAudit(sid, "business_analysis", { headline: analysis.headline.slice(0, 100) });
+    const skipQA = req.query.skip_qa === "true";
+    const reflectionLog: ReflectionStep[] = [];
 
-    // Store the analysis result
+    // ── Step 1: Business Analysis Agent generates initial analysis ──
+    const baStart = Date.now();
+    let currentAnalysis = await generateBusinessAnalysis(sid);
+    reflectionLog.push({
+      agent: "Business Analysis",
+      action: "Initial analysis generated",
+      detail: `Headline: "${currentAnalysis.headline.slice(0, 120)}". ${currentAnalysis.implications.length} implications, ${currentAnalysis.risks.length} risks, ${currentAnalysis.recommendations.length} recommendations.`,
+      duration_ms: Date.now() - baStart,
+    });
+    console.log(`[BA Agent] Initial analysis generated (${Date.now() - baStart}ms)`);
+
+    let qaReport: QAReport | null = null;
+
+    if (!skipQA) {
+      const scenarioContext = await buildScenarioContext(sid);
+      let iteration = 0;
+
+      while (iteration < MAX_QA_ITERATIONS) {
+        iteration++;
+
+        // ── QA Agent evaluates ──
+        const qaStart = Date.now();
+        const report = await evaluateAnalysis(currentAnalysis, scenarioContext);
+        report.iterations = iteration;
+        qaReport = report;
+
+        const dimSummary = report.dimensions
+          .map((d) => `${d.name}: ${d.score}/10`)
+          .join(", ");
+        reflectionLog.push({
+          agent: "Quality Assurance",
+          action: `Evaluation #${iteration} — Score: ${report.overall_score}/10`,
+          detail: report.passed
+            ? `PASSED. ${report.summary}`
+            : `FAILED (threshold: ${QA_THRESHOLD}/10). ${report.summary} [${dimSummary}]`,
+          score: report.overall_score,
+          passed: report.passed,
+          duration_ms: Date.now() - qaStart,
+        });
+        console.log(`[QA Agent] Iteration ${iteration}: ${report.overall_score}/10 (${report.passed ? "PASSED" : "FAILED"}) — ${Date.now() - qaStart}ms`);
+
+        // If passed or QA had an error (score 0 means error), stop the loop
+        if (report.passed || report.overall_score === 0) break;
+
+        // ── Business Analysis Agent regenerates with QA feedback ──
+        const refineStart = Date.now();
+        console.log(`[BA Agent] Regenerating with QA feedback (iteration ${iteration})...`);
+
+        const lowestDims = [...report.dimensions]
+          .sort((a, b) => a.score - b.score)
+          .slice(0, 3)
+          .map((d) => `${d.name} (${d.score}/10): ${d.feedback}`)
+          .join("; ");
+
+        currentAnalysis = await regenerateWithFeedback(sid, report, iteration);
+        reflectionLog.push({
+          agent: "Business Analysis",
+          action: `Refinement #${iteration} — addressing QA feedback`,
+          detail: `Regenerated analysis addressing: ${lowestDims}. New headline: "${currentAnalysis.headline.slice(0, 100)}".`,
+          duration_ms: Date.now() - refineStart,
+        });
+        console.log(`[BA Agent] Refinement ${iteration} complete (${Date.now() - refineStart}ms)`);
+      }
+
+      // If QA never passed after all iterations, mark it clearly
+      if (qaReport && !qaReport.passed && qaReport.overall_score > 0) {
+        qaReport.summary = `ANALYSIS QUALITY WARNING: After ${iteration} QA iterations, the analysis did not meet the quality threshold (${qaReport.overall_score}/${QA_THRESHOLD}). ${qaReport.summary}`;
+        reflectionLog.push({
+          agent: "Quality Assurance",
+          action: "Quality threshold not met",
+          detail: `After ${iteration} iterations, the analysis scored ${qaReport.overall_score}/10 (threshold: ${QA_THRESHOLD}). The analysis is returned with caveats. Key issues: ${qaReport.improvement_guidance.slice(0, 200)}`,
+          score: qaReport.overall_score,
+          passed: false,
+          duration_ms: 0,
+        });
+      }
+
+      if (qaReport) {
+        await storeQAReport(sid, qaReport);
+      }
+    }
+
+    await logAudit(sid, "business_analysis", {
+      headline: currentAnalysis.headline.slice(0, 100),
+      qa_score: qaReport?.overall_score,
+      qa_iterations: qaReport?.iterations,
+      qa_passed: qaReport?.passed,
+    });
+
     await pool.query(
       `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'business_analysis', $2)`,
-      [sid, JSON.stringify(analysis)]
+      [sid, JSON.stringify(currentAnalysis)]
     );
 
-    return res.json(analysis);
+    return res.json({
+      ...currentAnalysis,
+      qa_report: qaReport,
+      reflection_log: reflectionLog,
+    });
   } catch (e) {
     const msg = (e as Error).message;
     if (msg === "Scenario not found") return res.status(404).json({ error: msg });

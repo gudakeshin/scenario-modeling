@@ -13,7 +13,7 @@ import {
   ReferenceLine,
 } from "recharts";
 
-import { METRIC_ORDER, METRIC_LABELS } from "@/lib/metrics";
+import { METRIC_ORDER, METRIC_LABELS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
 
 interface WaterfallChartProps {
   pl: Record<string, number>;
@@ -36,10 +36,6 @@ interface WaterfallItem {
   end: number;
   fill: string;
   isTotal: boolean;
-}
-
-function fmt(n: number) {
-  return "$" + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
 }
 
 export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: WaterfallChartProps) {
@@ -119,7 +115,7 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
       <div className="bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg shadow-panel px-3 py-2">
         <p className="text-xs font-semibold text-[var(--text-primary)]">{item.name}</p>
         <p className="text-xs text-[var(--text-secondary)]">
-          {item.value >= 0 ? "+" : ""}{fmt(item.value)}
+          {item.value >= 0 ? "+" : ""}{fmtCurrency(item.value)}
         </p>
       </div>
     );
@@ -140,7 +136,7 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
             />
             <YAxis
               tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-              tickFormatter={(v: number) => `$${(v / 1000).toFixed(0)}k`}
+              tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
               axisLine={false}
               tickLine={false}
             />
@@ -174,12 +170,12 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
                 />
                 <YAxis
                   tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-                  tickFormatter={(v: number) => `$${(v / 1000).toFixed(0)}k`}
-                  axisLine={false}
-                  tickLine={false}
-                />
-                <Tooltip content={<CustomTooltip />} />
-                <ReferenceLine y={0} stroke="var(--border)" strokeWidth={1.5} />
+              tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
+              axisLine={false}
+              tickLine={false}
+            />
+            <Tooltip content={<CustomTooltip />} />
+            <ReferenceLine y={0} stroke="var(--border)" strokeWidth={1.5} />
                 <Bar dataKey="value" radius={[3, 3, 0, 0]}>
                   {deltaData.map((item, idx) => (
                     <Cell key={idx} fill={item.fill} />

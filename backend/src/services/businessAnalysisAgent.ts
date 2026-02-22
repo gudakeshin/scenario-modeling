@@ -18,6 +18,30 @@ import { getApiKey, callClaude } from "./llmClient.js";
 import { pool } from "../db/index.js";
 import { computeBaseCase } from "../models/registry.js";
 
+function repairJson(raw: string): string {
+  let text = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
+  try { JSON.parse(text); return text; } catch { /* needs repair */ }
+  text = text.replace(/,\s*"[^"]*":\s*"[^"]*$/, "");
+  text = text.replace(/,\s*"[^"]*":\s*$/, "");
+  text = text.replace(/,\s*$/, "");
+  const openBraces = (text.match(/{/g) || []).length;
+  const closeBraces = (text.match(/}/g) || []).length;
+  const openBrackets = (text.match(/\[/g) || []).length;
+  const closeBrackets = (text.match(/]/g) || []).length;
+  for (let i = 0; i < openBrackets - closeBrackets; i++) {
+    text = text.replace(/,\s*$/, "") + "]";
+  }
+  for (let i = 0; i < openBraces - closeBraces; i++) {
+    text = text.replace(/,\s*$/, "") + "}";
+  }
+  try { JSON.parse(text); return text; } catch { /* still broken */ }
+  const match = text.match(/\{[\s\S]*\}/);
+  if (match) {
+    try { JSON.parse(match[0]); return match[0]; } catch { /* give up */ }
+  }
+  return text;
+}
+
 // ── Types ──
 
 export interface BusinessInsight {
@@ -37,6 +61,30 @@ interface AnalysisContext {
   parameters: { name: string; variable_id: string; value: number; status: string }[];
   sensitivity?: { target_metric: string; bars: { variable_name: string; spread: number; low_delta: number; high_delta: number }[] } | null;
   monte_carlo?: { metrics: Record<string, { p10: number; p50: number; p90: number; mean: number; stddev: number }> } | null;
+  currency_symbol: string;
+  absurdity_warnings?: string[];
+  period_count?: number;
+}
+
+const CURRENCY_SYMBOLS: Record<string, string> = {
+  USD: "$", EUR: "€", GBP: "£", INR: "₹", JPY: "¥", CNY: "¥",
+  AUD: "A$", CAD: "C$", CHF: "CHF", SGD: "S$",
+};
+
+async function getCurrencyFromContext(scenarioId: string): Promise<string> {
+  try {
+    const r = await pool.query(
+      `SELECT cc.context_data FROM company_context cc
+       JOIN user_models um ON um.source_context_id = cc.context_id
+       JOIN scenarios s ON s.model_version_hash = um.model_id::text
+       WHERE s.scenario_id = $1 LIMIT 1`,
+      [scenarioId]
+    );
+    const code = (r.rows[0]?.context_data as Record<string, unknown>)?.currency as string;
+    return CURRENCY_SYMBOLS[code] || code || "$";
+  } catch {
+    return "$";
+  }
 }
 
 // ── Data loader ──
@@ -56,8 +104,14 @@ async function loadAnalysisContext(scenarioId: string): Promise<AnalysisContext>
     [scenarioId]
   );
   const rawPl = plRes.rows[0]?.output_data ?? {};
-  // Handle both multi-period format (has .aggregate) and legacy flat format
-  const pl = rawPl.aggregate ?? rawPl;
+  const absurdity_warnings: string[] = rawPl.absurdity_warnings ?? [];
+
+  // Use single-period P&L for analysis (avoids comparing 8-quarter aggregate against 1-quarter base)
+  const periods = rawPl.periods ?? [];
+  const pl: Record<string, number> = periods.length > 0
+    ? periods[0].pl
+    : (rawPl.aggregate ?? rawPl);
+  const periodCount = rawPl.period_count ?? 1;
 
   // Latest sensitivity output
   const sensRes = await pool.query(
@@ -73,18 +127,27 @@ async function loadAnalysisContext(scenarioId: string): Promise<AnalysisContext>
   );
   const monte_carlo = mcRes.rows[0]?.output_data ?? null;
 
-  // Compute base dynamically from the model — not hardcoded
-  const baseCtx = await computeBaseCase();
+  // Get model from scenario's model_version_hash
+  const modelRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
+  const modelHash = modelRef.rows[0]?.model_version_hash;
+  const { getModelDefinition: getModel } = await import("../models/registry.js");
+  const model = await getModel(modelHash);
+  const baseCtx = model ? await computeBaseCase(model) : {};
   const base_pl: Record<string, number> = {};
   for (const [k, v] of Object.entries(baseCtx)) {
     base_pl[k] = Math.round(v * 100) / 100;
   }
+
+  const currency_symbol = await getCurrencyFromContext(scenarioId);
 
   return {
     scenario_name: sRes.rows[0].name,
     nl_input: sRes.rows[0].nl_input,
     pl,
     base_pl,
+    currency_symbol,
+    absurdity_warnings: absurdity_warnings.length > 0 ? absurdity_warnings : undefined,
+    period_count: periodCount,
     parameters: pRes.rows.map((r: { extracted_name: string; mapped_variable_id: string; scenario_value: number; status: string }) => ({
       name: r.extracted_name,
       variable_id: r.mapped_variable_id,
@@ -99,6 +162,7 @@ async function loadAnalysisContext(scenarioId: string): Promise<AnalysisContext>
 // ── Heuristic fallback (no LLM) ──
 
 function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
+  const c = ctx.currency_symbol;
   const deltas: { metric: string; base: number; scenario: number; delta: number; pct: number }[] = [];
   for (const [metric, scenarioVal] of Object.entries(ctx.pl)) {
     const baseVal = ctx.base_pl[metric] ?? 0;
@@ -112,20 +176,18 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
   const netIncome = deltas.find((d) => d.metric === "net_income");
   const ebitda = deltas.find((d) => d.metric === "ebitda");
 
-  // Build headline
   const direction = (netIncome?.delta ?? 0) >= 0 ? "positive" : "negative";
   const headline = netIncome
-    ? `This scenario has a net ${direction} impact of $${Math.abs(netIncome.delta).toLocaleString()} (${netIncome.pct >= 0 ? "+" : ""}${netIncome.pct.toFixed(1)}%) on net income, driven primarily by changes in ${topMover?.metric?.replace(/_/g, " ") || "key drivers"}.`
+    ? `This scenario has a net ${direction} impact of ${c}${Math.abs(netIncome.delta).toLocaleString()} (${netIncome.pct >= 0 ? "+" : ""}${netIncome.pct.toFixed(1)}%) on net income, driven primarily by changes in ${topMover?.metric?.replace(/_/g, " ") || "key drivers"}.`
     : `Scenario "${ctx.nl_input}" has been analyzed. Review the implications below.`;
 
-  // Implications
   const implications: BusinessInsight["implications"] = [];
   for (const d of deltas.slice(0, 4)) {
     const sev: "positive" | "negative" | "neutral" = d.pct > 2 ? "positive" : d.pct < -2 ? "negative" : "neutral";
     const label = d.metric.replace(/_/g, " ");
     implications.push({
       title: `${label} ${d.delta >= 0 ? "increases" : "decreases"} by ${Math.abs(d.pct).toFixed(1)}%`,
-      detail: `${label} moves from $${d.base.toLocaleString()} to $${d.scenario.toLocaleString()} ($${d.delta >= 0 ? "+" : ""}${d.delta.toLocaleString()}).${
+      detail: `${label} moves from ${c}${d.base.toLocaleString()} to ${c}${d.scenario.toLocaleString()} (${d.delta >= 0 ? "+" : "-"}${c}${Math.abs(d.delta).toLocaleString()}).${
         Math.abs(d.pct) > 10 ? " This is a material change that warrants close attention." : ""
       }`,
       severity: sev,
@@ -146,7 +208,7 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
   if (ctx.sensitivity?.bars && ctx.sensitivity.bars.length > 0) {
     const topSensitive = ctx.sensitivity.bars[0];
     risks.push({
-      risk: `High sensitivity to ${topSensitive.variable_name} — a ±swing produces $${topSensitive.spread.toLocaleString()} variation`,
+      risk: `High sensitivity to ${topSensitive.variable_name} — a ±swing produces ${c}${topSensitive.spread.toLocaleString()} variation`,
       likelihood: "medium",
       mitigation: `Develop contingency plans for ${topSensitive.variable_name} volatility. Consider scenario planning for best/worst cases.`,
     });
@@ -159,7 +221,7 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
       const rangeAsPct = niMc.mean !== 0 ? (range / niMc.mean) * 100 : 0;
       if (rangeAsPct > 20) {
         risks.push({
-          risk: `Wide outcome uncertainty: P10-P90 range for net income is $${range.toLocaleString()} (${rangeAsPct.toFixed(0)}% of mean)`,
+          risk: `Wide outcome uncertainty: P10-P90 range for net income is ${c}${range.toLocaleString()} (${rangeAsPct.toFixed(0)}% of mean)`,
           likelihood: "medium",
           mitigation: "The wide confidence band suggests multiple outcomes are plausible. Consider phased investment or real-options approach.",
         });
@@ -182,14 +244,14 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
     recommendations.push({
       action: "Proceed with scenario — the expected impact is net positive",
       priority: "short-term",
-      rationale: `Net income improves by $${netIncome.delta.toLocaleString()}. Validate assumptions and develop an implementation timeline.`,
+      rationale: `Net income improves by ${c}${netIncome.delta.toLocaleString()}. Validate assumptions and develop an implementation timeline.`,
       owner: "FP&A / Strategy",
     });
   } else if (netIncome && netIncome.delta < 0) {
     recommendations.push({
       action: "Develop mitigation plan before proceeding",
       priority: "immediate",
-      rationale: `Net income declines by $${Math.abs(netIncome.delta).toLocaleString()}. Identify offsetting cost savings or revenue upside.`,
+      rationale: `Net income declines by ${c}${Math.abs(netIncome.delta).toLocaleString()}. Identify offsetting cost savings or revenue upside.`,
       owner: "FP&A / Operations",
     });
   }
@@ -274,34 +336,44 @@ Rules:
 - End confidence_note with: "AI-generated analysis — validate with domain experts."`;
 
 function buildUserPrompt(ctx: AnalysisContext): string {
+  const c = ctx.currency_symbol;
   const parts = [
     `## Scenario: "${ctx.nl_input}"`,
     `Name: ${ctx.scenario_name || "(unnamed)"}`,
+    ctx.period_count ? `Periods: ${ctx.period_count} quarters` : "",
     "",
     "## Assumptions Changed",
-    ...ctx.parameters.map((p) => `- ${p.name} (${p.variable_id}): ${p.value} [${p.status}]`),
+    ...ctx.parameters.map((p) => `- ${p.name} (${p.variable_id}): ${p.value}% [${p.status}]`),
     "",
-    "## P&L Impact (Base → Scenario)",
+    "## P&L Impact Per Period (Base → Scenario, single quarter)",
   ];
   for (const [metric, val] of Object.entries(ctx.pl)) {
     const base = ctx.base_pl[metric] ?? 0;
     const delta = val - base;
     const pct = base !== 0 ? ((delta / base) * 100).toFixed(1) : "n/a";
-    parts.push(`- ${metric}: $${base.toLocaleString()} → $${val.toLocaleString()} (${delta >= 0 ? "+" : ""}$${delta.toLocaleString()}, ${pct}%)`);
+    parts.push(`- ${metric}: ${c}${base.toLocaleString()} → ${c}${val.toLocaleString()} (${delta >= 0 ? "+" : "-"}${c}${Math.abs(delta).toLocaleString()}, ${pct}%)`);
   }
 
   if (ctx.sensitivity?.bars && ctx.sensitivity.bars.length > 0) {
     parts.push("", "## Sensitivity Analysis (highest-impact variables)");
     for (const bar of ctx.sensitivity.bars.slice(0, 5)) {
-      parts.push(`- ${bar.variable_name}: spread $${bar.spread.toLocaleString()} (low: ${bar.low_delta >= 0 ? "+" : ""}$${bar.low_delta.toLocaleString()}, high: +$${bar.high_delta.toLocaleString()})`);
+      parts.push(`- ${bar.variable_name}: spread ${c}${bar.spread.toLocaleString()} (low: ${bar.low_delta >= 0 ? "+" : "-"}${c}${Math.abs(bar.low_delta).toLocaleString()}, high: +${c}${bar.high_delta.toLocaleString()})`);
     }
   }
 
   if (ctx.monte_carlo?.metrics) {
     parts.push("", "## Monte Carlo Results (probabilistic)");
     for (const [metric, data] of Object.entries(ctx.monte_carlo.metrics)) {
-      parts.push(`- ${metric}: P10=$${data.p10.toLocaleString()} | P50=$${data.p50.toLocaleString()} | P90=$${data.p90.toLocaleString()} (stddev: $${data.stddev.toLocaleString()})`);
+      parts.push(`- ${metric}: P10=${c}${data.p10.toLocaleString()} | P50=${c}${data.p50.toLocaleString()} | P90=${c}${data.p90.toLocaleString()} (stddev: ${c}${data.stddev.toLocaleString()})`);
     }
+  }
+
+  if (ctx.absurdity_warnings && ctx.absurdity_warnings.length > 0) {
+    parts.push("", "## ⚠ ABSURDITY WARNINGS (from simulation validation)");
+    for (const w of ctx.absurdity_warnings) {
+      parts.push(`- ${w}`);
+    }
+    parts.push("", "NOTE: The simulation flagged potentially unrealistic results. Your analysis MUST acknowledge these warnings, explain possible causes (e.g. compounding effects, formula issues), and caveat any conclusions built on these numbers.");
   }
 
   parts.push("", "Produce your structured business analysis focusing on 'So what does this mean?' and 'What should we do next?'");
@@ -318,18 +390,16 @@ export async function generateBusinessAnalysis(scenarioId: string): Promise<Busi
   try {
     const rawText = await callClaude({
       system: SYSTEM_PROMPT,
-      userMessage: buildUserPrompt(ctx) + "\n\nReturn JSON only — no markdown, no code fences.",
-      maxTokens: 1500,
+      userMessage: buildUserPrompt(ctx) + "\n\nReturn JSON only — no markdown, no code fences. Keep each string value under 200 characters.",
+      maxTokens: 3000,
       temperature: 0.4,
     });
 
-    // Strip markdown code fences if present
-    const raw = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-    if (!raw) return generateFallbackAnalysis(ctx);
+    const repaired = repairJson(rawText);
+    if (!repaired) return generateFallbackAnalysis(ctx);
 
-    const parsed = JSON.parse(raw) as BusinessInsight;
+    const parsed = JSON.parse(repaired) as BusinessInsight;
 
-    // Validate structure minimally
     if (!parsed.headline || !Array.isArray(parsed.implications) || !Array.isArray(parsed.recommendations)) {
       return generateFallbackAnalysis(ctx);
     }
@@ -337,6 +407,61 @@ export async function generateBusinessAnalysis(scenarioId: string): Promise<Busi
     return parsed;
   } catch (e) {
     console.error("Business analysis LLM call failed, using fallback:", (e as Error).message);
+    return generateFallbackAnalysis(ctx);
+  }
+}
+
+/**
+ * Regenerate analysis incorporating QA feedback.
+ * This is the key method for the QA-BA reflection loop: the Business Analysis Agent
+ * receives specific QA criticism and produces a genuinely improved analysis.
+ */
+export async function regenerateWithFeedback(
+  scenarioId: string,
+  qaFeedback: { overall_score: number; dimensions: { name: string; score: number; feedback: string }[]; improvement_guidance: string },
+  iterationNumber: number,
+): Promise<BusinessInsight> {
+  const ctx = await loadAnalysisContext(scenarioId);
+
+  if (!getApiKey()) {
+    return generateFallbackAnalysis(ctx);
+  }
+
+  const feedbackSection = [
+    "",
+    `## QA FEEDBACK — Iteration ${iterationNumber} (Score: ${qaFeedback.overall_score}/10)`,
+    "The Quality Assurance Agent found the following issues with your previous analysis:",
+    "",
+    ...qaFeedback.dimensions.map((d) => `- **${d.name}** (${d.score}/10): ${d.feedback}`),
+    "",
+    "## MANDATORY IMPROVEMENT INSTRUCTIONS",
+    qaFeedback.improvement_guidance,
+    "",
+    "You MUST address EVERY point above. Do not just rephrase — genuinely fix the issues.",
+    "If the QA flagged inconsistency or absurdity, re-examine the numbers and correct your conclusions.",
+    "If specificity was low, add concrete metrics, timelines, and ownership.",
+  ].join("\n");
+
+  try {
+    const rawText = await callClaude({
+      system: SYSTEM_PROMPT + "\n\nIMPORTANT: You are in a refinement cycle. A QA analyst reviewed your previous output and found issues. You MUST address their feedback to produce a higher-quality analysis.",
+      userMessage: buildUserPrompt(ctx) + feedbackSection + "\n\nReturn JSON only — no markdown, no code fences. Keep each string value under 200 characters.",
+      maxTokens: 3000,
+      temperature: 0.3,
+    });
+
+    const repaired = repairJson(rawText);
+    if (!repaired) return generateFallbackAnalysis(ctx);
+
+    const parsed = JSON.parse(repaired) as BusinessInsight;
+
+    if (!parsed.headline || !Array.isArray(parsed.implications) || !Array.isArray(parsed.recommendations)) {
+      return generateFallbackAnalysis(ctx);
+    }
+
+    return parsed;
+  } catch (e) {
+    console.error(`[BA Agent] Refinement iteration ${iterationNumber} failed:`, (e as Error).message);
     return generateFallbackAnalysis(ctx);
   }
 }

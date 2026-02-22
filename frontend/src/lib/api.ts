@@ -58,15 +58,23 @@ export interface StoredParameter {
   status: string;
 }
 
+export interface ScenarioRef {
+  scenario_id: string;
+  name: string | null;
+  nl_input: string;
+  created_at: string;
+}
+
 export interface ComparisonRow {
   metric: string;
   base: number;
-  scenarios: { scenario_id: string; name: string | null; value: number; delta: number; delta_pct: number | null }[];
+  scenarios: (ScenarioRef & { value: number; delta: number; delta_pct: number | null })[];
 }
 
 export interface ComparisonResult {
+  scenarios: ScenarioRef[];
   metrics: ComparisonRow[];
-  assumption_diff: { parameter: string; base_value: string; scenarios: { scenario_id: string; name: string | null; value: string }[] }[];
+  assumption_diff: { parameter: string; base_value: string; scenarios: (ScenarioRef & { value: string })[] }[];
   key_callouts: { label: string; base: number; scenario: number; delta: number; delta_pct: number | null }[];
 }
 
@@ -145,6 +153,7 @@ export interface SimulationResult {
   periods?: PeriodResult[];
   period_count?: number;
   granularity?: "monthly" | "quarterly";
+  absurdity_warnings?: string[];
 }
 
 export async function getBaseCase(): Promise<{ pl: Record<string, number>; all_variables: Record<string, number> }> {
@@ -296,6 +305,16 @@ export async function updateUserRole(userId: string, role: string): Promise<User
     body: JSON.stringify({ role }),
   });
   if (!res.ok) throw new Error("Failed to update role");
+  return res.json();
+}
+
+export async function switchMyRole(role: string): Promise<UserProfile> {
+  const res = await fetch(`${API_BASE}/api/v1/users/me/role`, {
+    method: "PUT",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ role }),
+  });
+  if (!res.ok) throw new Error("Failed to switch role");
   return res.json();
 }
 
@@ -509,6 +528,30 @@ export interface BusinessRecommendation {
   owner?: string;
 }
 
+export interface QADimension {
+  name: string;
+  score: number;
+  feedback: string;
+}
+
+export interface QAReport {
+  overall_score: number;
+  passed: boolean;
+  dimensions: QADimension[];
+  improvement_guidance: string;
+  summary: string;
+  iterations: number;
+}
+
+export interface ReflectionStep {
+  agent: "Business Analysis" | "Quality Assurance";
+  action: string;
+  detail: string;
+  score?: number;
+  passed?: boolean;
+  duration_ms: number;
+}
+
 export interface BusinessInsight {
   headline: string;
   implications: BusinessImplication[];
@@ -516,6 +559,8 @@ export interface BusinessInsight {
   recommendations: BusinessRecommendation[];
   decision_context: string;
   confidence_note: string;
+  qa_report?: QAReport | null;
+  reflection_log?: ReflectionStep[];
 }
 
 export async function generateBusinessAnalysis(scenarioId: string): Promise<BusinessInsight> {
@@ -615,6 +660,122 @@ export async function deleteDocument(documentId: string): Promise<void> {
 export async function checkQdrantHealth(): Promise<{ qdrant: string; url: string }> {
   const res = await fetch(`${API_BASE}/api/v1/documents/health/qdrant`);
   if (!res.ok) throw new Error("Qdrant health check failed");
+  return res.json();
+}
+
+// ── Context Engine ──
+
+export interface CompanyContextData {
+  company_name: string;
+  industry: string;
+  currency?: string;
+  currency_unit?: string;
+  business_model: string;
+  revenue_streams: string[];
+  financial_metrics: {
+    name: string;
+    variable_id: string;
+    description: string;
+    typical_value?: number;
+    unit: string;
+    category: string;
+    is_input: boolean;
+    formula?: string;
+    dependencies?: string[];
+  }[];
+  competitive_landscape: string;
+  key_risks: string[];
+  benchmarks: Record<string, string>;
+}
+
+export interface CompanyContext {
+  context_id: string;
+  company_name: string | null;
+  industry: string | null;
+  context_data: CompanyContextData;
+  source_document_ids: string[];
+  status: string;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface UserModel {
+  model_id: string;
+  name: string;
+  model_definition: {
+    model_version: string;
+    variables: { id: string; name: string; formula: string; dependencies: string[]; tags?: string[] }[];
+    time_horizon: { start: string; end: string; granularity: string };
+  };
+  is_active: boolean;
+  created_at: string;
+}
+
+export interface OnboardingStatus {
+  has_context: boolean;
+  has_model: boolean;
+  company_name: string | null;
+  industry: string | null;
+  model_name: string | null;
+  currency: string;
+  currency_unit: string;
+  ready: boolean;
+}
+
+export async function getOnboardingStatus(): Promise<OnboardingStatus> {
+  const res = await fetch(`${API_BASE}/api/v1/context/status`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to check status");
+  return res.json();
+}
+
+export async function buildContext(): Promise<CompanyContext> {
+  const res = await fetch(`${API_BASE}/api/v1/context/build`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Context build failed");
+  }
+  return res.json();
+}
+
+export async function getCompanyContext(): Promise<{ context: CompanyContext | null; message?: string }> {
+  const res = await fetch(`${API_BASE}/api/v1/context`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to get context");
+  return res.json();
+}
+
+export async function updateCompanyContext(updates: Partial<CompanyContextData>): Promise<CompanyContext> {
+  const res = await fetch(`${API_BASE}/api/v1/context`, {
+    method: "PUT",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(updates),
+  });
+  if (!res.ok) throw new Error("Failed to update context");
+  return res.json();
+}
+
+export async function deleteCompanyContext(): Promise<void> {
+  await fetch(`${API_BASE}/api/v1/context`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+}
+
+export async function getActiveModel(): Promise<{ model: UserModel | null; message?: string }> {
+  const res = await fetch(`${API_BASE}/api/v1/context/model`, { headers: authHeaders() });
+  if (!res.ok) throw new Error("Failed to get model");
+  return res.json();
+}
+
+export async function updateActiveModel(modelDefinition: UserModel["model_definition"]): Promise<{ model: UserModel }> {
+  const res = await fetch(`${API_BASE}/api/v1/context/model`, {
+    method: "PUT",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify({ model_definition: modelDefinition }),
+  });
+  if (!res.ok) throw new Error("Failed to update model");
   return res.json();
 }
 

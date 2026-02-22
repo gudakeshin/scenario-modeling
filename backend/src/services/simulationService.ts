@@ -24,6 +24,7 @@ export interface SimulationOutput {
   /** Metadata */
   period_count: number;
   granularity: "monthly" | "quarterly";
+  absurdity_warnings?: string[];
 }
 
 function topologicalSort(variables: { id: string; dependencies: string[] }[]): string[] {
@@ -146,39 +147,26 @@ function evaluatePeriod(
     }
   }
 
-  // Apply overrides
+  // Apply overrides on top of base values.
+  // Each period applies the same delta to the ORIGINAL base — no compounding.
   const ctx: Record<string, number> = { ...baseCtx };
-
-  // If previous period context exists, allow growth compounding for input vars
-  if (prevCtx) {
-    for (const id of order) {
-      const v = model.variables.find((x) => x.id === id);
-      if (v && v.dependencies.length === 0 && prevCtx[id] != null) {
-        // Carry forward input values (for compounding growth scenarios)
-        ctx[id] = prevCtx[id];
-      }
-    }
-  }
 
   for (const [id, scenarioValue] of overrides) {
     if (!Number.isFinite(scenarioValue)) continue;
     if (percentDeltaVars.has(id) && scenarioValue >= 0 && scenarioValue <= 100 && baseCtx[id] != null) {
-      // For multi-period: apply % delta to the base for each period
-      // (not compounding — each period independently applies the same % change to its base)
-      const baseVal = prevCtx && prevCtx[id] != null ? prevCtx[id] : baseCtx[id];
-      ctx[id] = Math.round(baseVal * (1 + scenarioValue / 100) * 100) / 100;
+      // Apply % delta to the ORIGINAL base value — same adjustment each period, no compounding
+      ctx[id] = Math.round(baseCtx[id] * (1 + scenarioValue / 100) * 100) / 100;
     } else {
       ctx[id] = scenarioValue;
     }
   }
 
-  // Re-evaluate dependents
+  // Re-evaluate all dependent (calculated) variables using the adjusted input values
   for (const id of order) {
     if (overrides.has(id)) continue;
-    // Skip input vars that we carried forward
     const v = model.variables.find((x) => x.id === id);
     if (!v) continue;
-    if (v.dependencies.length === 0 && prevCtx && !overrides.has(id)) continue;
+    if (v.dependencies.length === 0) continue; // Input vars keep their overridden or base values
     try {
       const val = evaluateFormula(v.formula, ctx);
       ctx[id] = Number.isFinite(val) ? val : 0;
@@ -225,6 +213,7 @@ async function _runSimulation(scenarioId: string): Promise<SimulationOutput> {
   }
 
   const model = await getModelDefinition(modelVersion);
+  if (!model) throw new Error("No model found. Please build a model from your documents first.");
   const order = topologicalSort(model.variables);
   const percentDeltaVars = getPercentDeltaVars(model);
   const plMetricIds = getPLMetrics(model);
@@ -264,13 +253,38 @@ async function _runSimulation(scenarioId: string): Promise<SimulationOutput> {
   // Aggregate variables: use last period values (most representative for rates)
   const lastPeriodVars = periods.length > 0 ? periods[periods.length - 1].variables : {};
 
+  // ── Absurdity check: validate that results are reasonable ──
+  const baseCase = evaluatePeriod(model, order, new Map(), percentDeltaVars, 0, null);
+  const warnings: string[] = [];
+  const KEY_METRICS = ["revenue", "ebitda", "ebit", "net_income", "gross_profit", "profit_before_tax"];
+  const MAX_REASONABLE_CHANGE_PCT = 200;
+
+  for (const metric of KEY_METRICS) {
+    const singlePeriodVal = periods[0]?.pl[metric];
+    const baseVal = baseCase[metric];
+    if (baseVal != null && Math.abs(baseVal) > 0.01 && singlePeriodVal != null) {
+      const changePct = ((singlePeriodVal - baseVal) / Math.abs(baseVal)) * 100;
+      if (Math.abs(changePct) > MAX_REASONABLE_CHANGE_PCT) {
+        warnings.push(
+          `${metric} changed by ${changePct.toFixed(0)}% — this seems disproportionate to the scenario inputs. ` +
+          `Base: ${baseVal.toLocaleString()}, Scenario: ${singlePeriodVal.toLocaleString()}`
+        );
+        console.warn(`[Simulation] Absurdity warning: ${metric} changed by ${changePct.toFixed(0)}%`);
+      }
+    }
+  }
+
   // Store both aggregate and period breakdown
-  const outputData = {
+  const outputData: Record<string, unknown> = {
     aggregate: aggregatePl,
     periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
     granularity: model.time_horizon.granularity,
     period_count: periods.length,
   };
+  if (warnings.length > 0) {
+    outputData.absurdity_warnings = warnings;
+    console.warn(`[Simulation] ${warnings.length} absurdity warning(s) generated`);
+  }
 
   await pool.query(
     `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
@@ -287,5 +301,6 @@ async function _runSimulation(scenarioId: string): Promise<SimulationOutput> {
     periods,
     period_count: periods.length,
     granularity: model.time_horizon.granularity,
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
   };
 }

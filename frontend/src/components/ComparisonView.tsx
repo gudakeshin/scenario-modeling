@@ -1,9 +1,9 @@
 "use client";
 
-import { useEffect, useState, useMemo } from "react";
+import { useEffect, useState, useMemo, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { compareScenarios as compareApi, listScenarios, type ComparisonResult } from "@/lib/api";
-import { METRIC_LABELS } from "@/lib/metrics";
+import { METRIC_LABELS, fmtCurrency, fmtCurrencySigned } from "@/lib/metrics";
 
 interface ComparisonViewProps {
   currentScenarioId: string;
@@ -11,27 +11,43 @@ interface ComparisonViewProps {
   onMinimize?: () => void;
 }
 
-function fmtNum(n: number) {
-  return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
-}
-
-function fmtDelta(n: number) {
-  const sign = n >= 0 ? "+" : "";
-  return sign + fmtNum(n);
-}
-
 type SortKey = "metric" | "base" | "delta" | "delta_pct";
 type SortDir = "asc" | "desc";
 type FilterMode = "all" | "positive" | "negative";
 
+interface ScenarioListItem {
+  scenario_id: string;
+  name: string | null;
+  nl_input: string;
+  status: string;
+  created_at: string;
+}
+
+function scenarioLabel(s: { name: string | null; nl_input?: string; scenario_id: string }): string {
+  if (s.name) return s.name;
+  if (s.nl_input) {
+    const text = s.nl_input.split("\n")[0];
+    return text.length > 60 ? text.slice(0, 57) + "..." : text;
+  }
+  return s.scenario_id.slice(0, 8);
+}
+
+function formatDate(dateStr: string): string {
+  try {
+    const d = new Date(dateStr);
+    return d.toLocaleDateString(undefined, { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" });
+  } catch {
+    return "";
+  }
+}
+
 export function ComparisonView({ currentScenarioId, onClose, onMinimize }: ComparisonViewProps) {
   const [comparison, setComparison] = useState<ComparisonResult | null>(null);
-  const [allScenarios, setAllScenarios] = useState<{ scenario_id: string; name: string | null; status: string }[]>([]);
+  const [allScenarios, setAllScenarios] = useState<ScenarioListItem[]>([]);
   const [selectedIds, setSelectedIds] = useState<string[]>([currentScenarioId]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
-  // Sorting & filtering state
   const [sortKey, setSortKey] = useState<SortKey>("metric");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
@@ -40,7 +56,7 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
     listScenarios().then((s) => setAllScenarios(s.filter((x) => x.status === "completed"))).catch(() => {});
   }, []);
 
-  const handleCompare = async () => {
+  const handleCompare = useCallback(async () => {
     if (selectedIds.length === 0) return;
     setLoading(true);
     setError(null);
@@ -51,11 +67,12 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
       setError((e as Error).message);
     }
     setLoading(false);
-  };
+  }, [selectedIds]);
 
   useEffect(() => {
     if (selectedIds.length > 0) handleCompare();
-  }, []); // run on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const toggleScenario = (id: string) => {
     setSelectedIds((prev) =>
@@ -76,7 +93,6 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
     if (!comparison) return [];
     let rows = [...comparison.metrics];
 
-    // Filter
     if (filterMode !== "all") {
       rows = rows.filter((row) => {
         const firstDelta = row.scenarios[0]?.delta ?? 0;
@@ -84,7 +100,6 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
       });
     }
 
-    // Sort
     rows.sort((a, b) => {
       let cmp = 0;
       switch (sortKey) {
@@ -111,6 +126,14 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
     return sortDir === "asc" ? "\u2191" : "\u2193";
   };
 
+  const getScenarioLabel = (scenarioId: string): string => {
+    const fromComparison = comparison?.scenarios.find((s) => s.scenario_id === scenarioId);
+    if (fromComparison) return scenarioLabel(fromComparison);
+    const fromList = allScenarios.find((s) => s.scenario_id === scenarioId);
+    if (fromList) return scenarioLabel(fromList);
+    return scenarioId.slice(0, 8);
+  };
+
   return (
     <div className="border border-[var(--panel-border)] rounded-2xl bg-[var(--card-bg)] p-4 mx-4 mb-3 overflow-auto max-h-[60vh] shadow-panel">
       <PanelHeader
@@ -120,24 +143,66 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
         onMinimize={onMinimize || onClose}
         isMinimized={false}
       />
-      {allScenarios.length > 1 && (
-        <div className="mb-3 flex flex-wrap gap-1.5">
-          {allScenarios.map((s) => (
-            <button
-              key={s.scenario_id}
-              type="button"
-              onClick={() => toggleScenario(s.scenario_id)}
-              className={`text-xs px-2.5 py-1 rounded-full border transition-all ${
-                selectedIds.includes(s.scenario_id)
-                  ? "bg-accent text-white border-accent shadow-sm"
-                  : "border-[var(--border)] text-[var(--text-muted)] hover:bg-[var(--panel-bg)] hover:border-[var(--panel-border)]"
-              }`}
-            >
-              {s.name || s.scenario_id.slice(0, 8)}
-            </button>
-          ))}
-          <button type="button" onClick={handleCompare} disabled={loading} className="text-xs px-3 py-1 rounded-full bg-accent text-white disabled:opacity-40 shadow-sm transition-opacity">
-            {loading ? "..." : "Compare"}
+
+      {/* Scenario selector */}
+      {allScenarios.length > 0 && (
+        <div className="mb-4">
+          <p className="text-[10px] text-[var(--text-faint)] uppercase tracking-wider font-medium mb-2">
+            Select scenarios to compare (up to 4)
+          </p>
+          <div className="space-y-1.5 max-h-40 overflow-y-auto">
+            {allScenarios.map((s) => {
+              const isSelected = selectedIds.includes(s.scenario_id);
+              const isCurrent = s.scenario_id === currentScenarioId;
+              const label = scenarioLabel(s);
+              const date = formatDate(s.created_at);
+
+              return (
+                <button
+                  key={s.scenario_id}
+                  type="button"
+                  onClick={() => toggleScenario(s.scenario_id)}
+                  className={`w-full text-left flex items-start gap-2.5 px-3 py-2 rounded-xl border transition-all ${
+                    isSelected
+                      ? "bg-accent/8 border-accent/30 shadow-sm"
+                      : "border-[var(--border)] hover:bg-[var(--panel-bg)] hover:border-[var(--panel-border)]"
+                  }`}
+                >
+                  <div className={`mt-0.5 w-4 h-4 rounded border-2 flex items-center justify-center shrink-0 transition-colors ${
+                    isSelected ? "border-accent bg-accent" : "border-[var(--border)]"
+                  }`}>
+                    {isSelected && (
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="3">
+                        <polyline points="20 6 9 17 4 12" />
+                      </svg>
+                    )}
+                  </div>
+                  <div className="flex-1 min-w-0">
+                    <div className="flex items-center gap-2">
+                      <span className={`text-xs font-medium truncate ${isSelected ? "text-accent" : "text-[var(--text-primary)]"}`}>
+                        {label}
+                      </span>
+                      {isCurrent && (
+                        <span className="text-[9px] px-1.5 py-0.5 rounded-full bg-accent/10 text-accent font-semibold shrink-0">
+                          Current
+                        </span>
+                      )}
+                    </div>
+                    {date && (
+                      <span className="text-[10px] text-[var(--text-faint)]">{date}</span>
+                    )}
+                  </div>
+                </button>
+              );
+            })}
+          </div>
+          <button
+            type="button"
+            onClick={handleCompare}
+            disabled={loading || selectedIds.length === 0}
+            className="mt-2.5 w-full text-xs px-4 py-2 rounded-xl bg-accent text-white font-semibold disabled:opacity-40 shadow-sm hover:bg-accent-hover transition-all"
+          >
+            {loading ? "Comparing..." : `Compare ${selectedIds.length} Scenario${selectedIds.length !== 1 ? "s" : ""}`}
           </button>
         </div>
       )}
@@ -151,9 +216,9 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
             {comparison.key_callouts.map((c) => (
               <div key={c.label} className="rounded-xl border border-[var(--card-border)] bg-[var(--panel-bg)] p-3 text-center shadow-card hover:shadow-card-hover transition-shadow">
                 <p className="text-[10px] text-[var(--text-faint)] uppercase font-medium tracking-wider">{METRIC_LABELS[c.label] || c.label}</p>
-                <p className="text-lg font-semibold text-[var(--text-primary)] mt-1">${fmtNum(c.scenario)}</p>
+                <p className="text-lg font-semibold text-[var(--text-primary)] mt-1">{fmtCurrency(c.scenario)}</p>
                 <p className={`text-xs font-medium mt-0.5 ${c.delta >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
-                  {fmtDelta(c.delta)} {c.delta_pct != null && `(${c.delta >= 0 ? "+" : ""}${c.delta_pct}%)`}
+                  {fmtCurrencySigned(c.delta)} {c.delta_pct != null && `(${c.delta >= 0 ? "+" : ""}${c.delta_pct}%)`}
                 </p>
               </div>
             ))}
@@ -178,7 +243,7 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
             ))}
           </div>
 
-          {/* Comparison table with sortable columns */}
+          {/* Comparison table */}
           <div className="overflow-x-auto rounded-xl border border-[var(--card-border)]">
             <table className="w-full text-xs border-collapse">
               <thead>
@@ -197,43 +262,41 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
                   </th>
                   {comparison.metrics[0]?.scenarios.map((s) => (
                     <th key={s.scenario_id} className="text-right py-2.5 px-2 font-medium text-[var(--text-secondary)]" colSpan={2}>
-                      {s.name || s.scenario_id.slice(0, 8)}
+                      <div className="max-w-[140px] ml-auto" title={s.nl_input || s.name || s.scenario_id}>
+                        <div className="truncate text-[11px]">{getScenarioLabel(s.scenario_id)}</div>
+                      </div>
                     </th>
                   ))}
                 </tr>
                 <tr className="border-b border-[var(--border-light)] text-[var(--text-faint)]">
                   <th />
                   <th className="text-right py-1 px-2 font-normal">Value</th>
-                  {comparison.metrics[0]?.scenarios.map((s) => (
-                    <>
-                      <th key={s.scenario_id + "-v"} className="text-right py-1 px-2 font-normal">Value</th>
-                      <th
-                        key={s.scenario_id + "-d"}
-                        className="text-right py-1 px-2 font-normal cursor-pointer hover:text-[var(--text-primary)] select-none"
-                        onClick={() => handleSort("delta")}
-                      >
-                        Delta {sortIcon("delta")}
-                      </th>
-                    </>
-                  ))}
+                  {comparison.metrics[0]?.scenarios.map((s) => [
+                    <th key={s.scenario_id + "-v"} className="text-right py-1 px-2 font-normal">Value</th>,
+                    <th
+                      key={s.scenario_id + "-d"}
+                      className="text-right py-1 px-2 font-normal cursor-pointer hover:text-[var(--text-primary)] select-none"
+                      onClick={() => handleSort("delta")}
+                    >
+                      Delta {sortIcon("delta")}
+                    </th>,
+                  ])}
                 </tr>
               </thead>
               <tbody>
                 {sortedMetrics.map((row) => (
                   <tr key={row.metric} className="border-b border-[var(--border-light)] hover:bg-[var(--panel-bg)] transition-colors">
                     <td className="py-2 px-3 font-medium text-[var(--text-primary)]">{METRIC_LABELS[row.metric] || row.metric}</td>
-                    <td className="text-right py-2 px-2 text-[var(--text-secondary)]">${fmtNum(row.base)}</td>
-                    {row.scenarios.map((s) => (
-                      <>
-                        <td key={s.scenario_id + "-v"} className="text-right py-2 px-2 text-[var(--text-primary)]">${fmtNum(s.value)}</td>
-                        <td key={s.scenario_id + "-d"} className={`text-right py-2 px-2 font-medium ${s.delta >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
-                          {fmtDelta(s.delta)}
-                          {s.delta_pct != null && (
-                            <span className="text-[10px] ml-0.5 opacity-60">({s.delta >= 0 ? "+" : ""}{s.delta_pct}%)</span>
-                          )}
-                        </td>
-                      </>
-                    ))}
+                    <td className="text-right py-2 px-2 text-[var(--text-secondary)]">{fmtCurrency(row.base)}</td>
+                    {row.scenarios.map((s) => [
+                      <td key={s.scenario_id + "-v"} className="text-right py-2 px-2 text-[var(--text-primary)]">{fmtCurrency(s.value)}</td>,
+                      <td key={s.scenario_id + "-d"} className={`text-right py-2 px-2 font-medium ${s.delta >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
+                        {fmtCurrencySigned(s.delta)}
+                        {s.delta_pct != null && (
+                          <span className="text-[10px] ml-0.5 opacity-60">({s.delta >= 0 ? "+" : ""}{s.delta_pct}%)</span>
+                        )}
+                      </td>,
+                    ])}
                   </tr>
                 ))}
               </tbody>
@@ -250,7 +313,11 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
                     <tr className="bg-[var(--panel-bg)]">
                       <th className="text-left py-2 px-3 font-medium text-[var(--text-secondary)]">Parameter</th>
                       {comparison.assumption_diff[0]?.scenarios.map((s) => (
-                        <th key={s.scenario_id} className="text-right py-2 px-2 font-medium text-[var(--text-secondary)]">{s.name || s.scenario_id.slice(0, 8)}</th>
+                        <th key={s.scenario_id} className="text-right py-2 px-2 font-medium text-[var(--text-secondary)]">
+                          <div className="max-w-[120px] ml-auto truncate" title={s.nl_input || s.name || s.scenario_id}>
+                            {getScenarioLabel(s.scenario_id)}
+                          </div>
+                        </th>
                       ))}
                     </tr>
                   </thead>

@@ -9,8 +9,6 @@ interface RoleManagementProps {
   onMinimize?: () => void;
 }
 
-const ROLES = ["viewer", "analyst", "approver", "admin"] as const;
-
 const ROLE_COLORS: Record<string, string> = {
   admin: "border-[var(--danger)]/20 bg-[var(--danger-bg)] text-[var(--danger)]",
   approver: "border-[var(--warning)]/20 bg-[var(--warning-bg)] text-[var(--warning)]",
@@ -18,16 +16,26 @@ const ROLE_COLORS: Record<string, string> = {
   viewer: "border-[var(--info)]/20 bg-[var(--info-bg)] text-[var(--info)]",
 };
 
-const ROLE_DESCRIPTIONS: Record<string, string> = {
-  viewer: "Can view scenarios and reports",
-  analyst: "Can create, edit, and share scenarios",
-  approver: "Can approve scenarios for simulation",
-  admin: "Full access including user management",
-};
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
 
 export function RoleManagement({ onClose, onMinimize }: RoleManagementProps) {
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [loading, setLoading] = useState(true);
+  const [roles, setRoles] = useState<{ id: string; label: string; description: string }[]>([]);
+
+  useEffect(() => {
+    fetch(`${API_BASE}/api/v1/users/roles`)
+      .then((r) => r.json())
+      .then((d) => { if (d.roles) setRoles(d.roles); })
+      .catch(() => {
+        setRoles([
+          { id: "viewer", label: "Viewer", description: "Can view scenarios and reports" },
+          { id: "analyst", label: "Analyst", description: "Can create, edit, and share scenarios" },
+          { id: "approver", label: "Approver", description: "Can approve scenarios for simulation" },
+          { id: "admin", label: "Admin", description: "Full access including user management" },
+        ]);
+      });
+  }, []);
   const [error, setError] = useState<string | null>(null);
   const [editingUser, setEditingUser] = useState<string | null>(null);
   const [pendingRole, setPendingRole] = useState<string>("");
@@ -70,14 +78,14 @@ export function RoleManagement({ onClose, onMinimize }: RoleManagementProps) {
       />
       {/* Role legend */}
       <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-4">
-        {ROLES.map((role) => (
-          <div key={role} className="rounded-xl border border-[var(--border-light)] bg-[var(--panel-bg)] p-2.5">
+        {roles.map((role) => (
+          <div key={role.id} className="rounded-xl border border-[var(--border-light)] bg-[var(--panel-bg)] p-2.5">
             <div className="flex items-center gap-1.5 mb-1">
-              <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium ${ROLE_COLORS[role]}`}>
-                {role}
+              <span className={`text-[10px] px-2 py-0.5 rounded-full border font-medium ${ROLE_COLORS[role.id] || ""}`}>
+                {role.label}
               </span>
             </div>
-            <p className="text-[10px] text-[var(--text-faint)]">{ROLE_DESCRIPTIONS[role]}</p>
+            <p className="text-[10px] text-[var(--text-faint)]">{role.description}</p>
           </div>
         ))}
       </div>
@@ -119,8 +127,8 @@ export function RoleManagement({ onClose, onMinimize }: RoleManagementProps) {
                         onChange={(e) => setPendingRole(e.target.value)}
                         className="rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)] px-2 py-1 text-xs focus:outline-none focus:border-[var(--input-focus-border)]"
                       >
-                        {ROLES.map((r) => (
-                          <option key={r} value={r}>{r}</option>
+                        {roles.map((r) => (
+                          <option key={r.id} value={r.id}>{r.label}</option>
                         ))}
                       </select>
                     ) : (

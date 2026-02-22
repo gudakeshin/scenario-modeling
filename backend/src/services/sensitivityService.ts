@@ -89,6 +89,7 @@ export async function runSensitivity(
   if (scenarioRes.rows.length === 0) throw new Error("Scenario not found");
 
   const model = await getModelDefinition(scenarioRes.rows[0].model_version_hash);
+  if (!model) throw new Error("No model found. Please build a model from your documents first.");
   const order = topologicalSort(model.variables);
   const inputs = getModelInputVars(model);
 

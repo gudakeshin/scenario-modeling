@@ -10,6 +10,7 @@ import { analysisRouter } from "./routes/monteCarlo.js";
 import { templatesRouter } from "./routes/templates.js";
 import { sessionsRouter } from "./routes/sessions.js";
 import { documentsRouter } from "./routes/documents.js";
+import { contextRouter } from "./routes/context.js";
 import { requireRole } from "./middleware/rbac.js";
 
 const app = express();
@@ -51,6 +52,7 @@ app.use("/api/v1/scenarios", analysisRouter);
 app.use("/api/v1/templates", templatesRouter);
 app.use("/api/v1/sessions", sessionsRouter);
 app.use("/api/v1/documents", documentsRouter);
+app.use("/api/v1/context", contextRouter);
 
 // Export app for integration testing (supertest)
 export { app };

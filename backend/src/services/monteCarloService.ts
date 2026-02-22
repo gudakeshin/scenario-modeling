@@ -153,6 +153,7 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
   const scenarioRes = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [config.scenario_id]);
   if (scenarioRes.rows.length === 0) throw new Error("Scenario not found");
   const model = await getModelDefinition(scenarioRes.rows[0].model_version_hash);
+  if (!model) throw new Error("No model found. Please build a model from your documents first.");
   const order = topologicalSort(model.variables);
 
   // Derive from model — not hardcoded

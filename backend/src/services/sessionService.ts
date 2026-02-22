@@ -114,7 +114,10 @@ export async function addFollowUp(
   session.turns.push({ role: "user", content: nlInput, timestamp: new Date().toISOString() });
 
   const scenarioId = session.scenario_id;
-  const parseResult = await parseScenario(nlInput);
+  // Get the scenario's creator for model lookup
+  const creatorRes = await pool.query("SELECT creator_id FROM scenarios WHERE scenario_id = $1", [scenarioId]);
+  const creatorId = creatorRes.rows[0]?.creator_id;
+  const parseResult = await parseScenario(nlInput, creatorId);
 
   const added: { name: string; mapped_variable_id: string; scenario_value: number }[] = [];
 

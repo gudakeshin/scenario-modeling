@@ -2,26 +2,17 @@
  * Reflection Service — LLM-based "thinking" loop for scenario analysis.
  *
  * Before the parser extracts parameters, the reflection agent reasons
- * through the scenario in natural language:
- *   - What is the user really asking?
- *   - What business areas are affected?
- *   - What assumptions am I making?
- *   - What second-order effects should be considered?
- *   - What model variables are relevant?
- *
- * The reflection serves two purposes:
- *   1. Improves parse quality by providing structured reasoning as context
- *   2. Is shown to the user as visible "thinking" (like ChatGPT's reasoning)
+ * through the scenario in natural language, grounded in the user's
+ * company context and model definition.
  */
 
 import { getApiKey, callClaude } from "./llmClient.js";
-import { getModelDefinition, describeModelForLLM } from "../models/registry.js";
+import { getUserModelDefinition, describeModelForLLM } from "../models/registry.js";
+import { describeContextForLLM } from "./contextEngine.js";
 import type { SearchResult } from "./searchService.js";
 
 export interface ReflectionResult {
-  /** The full chain-of-thought reasoning text */
   thinking: string;
-  /** Structured summary for the parser to use */
   summary: {
     intent: string;
     affected_areas: string[];
@@ -29,7 +20,6 @@ export interface ReflectionResult {
     second_order_effects: string[];
     suggested_variables: string[];
   };
-  /** Time taken for reflection (ms) */
   duration_ms: number;
 }
 
@@ -39,19 +29,27 @@ export interface ReflectionResult {
  */
 export async function reflect(
   nlInput: string,
-  searchContext?: SearchResult | null
+  searchContext?: SearchResult | null,
+  userId?: string
 ): Promise<ReflectionResult | null> {
   if (!getApiKey()) return null;
 
   const startTime = Date.now();
 
   try {
-    const model = await getModelDefinition();
+    // Load user's model and company context
+    const model = userId ? await getUserModelDefinition(userId) : null;
+    if (!model) return null; // No model = can't reflect meaningfully
+
     const modelDesc = describeModelForLLM(model);
+    const contextDesc = await describeContextForLLM(userId);
 
     let contextBlock = "";
+    if (contextDesc) {
+      contextBlock += `\n\n${contextDesc}`;
+    }
     if (searchContext?.summary) {
-      contextBlock = `\n\nREAL-TIME RESEARCH:\n${searchContext.summary}`;
+      contextBlock += `\n\nREAL-TIME RESEARCH:\n${searchContext.summary}`;
       if (searchContext.data_points.length > 0) {
         contextBlock += `\n\nKey data:\n${searchContext.data_points.slice(0, 6).map((d) => `• ${d}`).join("\n")}`;
       }
@@ -62,7 +60,7 @@ export async function reflect(
 Your job is to REASON STEP BY STEP about what the user is asking, before any parameters are extracted. Think out loud like a consultant analyzing a client request.
 
 AVAILABLE MODEL:
-${modelDesc}
+${modelDesc}${contextBlock}
 
 OUTPUT FORMAT — return ONLY valid JSON (no markdown, no code fences):
 {
@@ -80,12 +78,11 @@ Be analytical, specific, and concise. Use the model variable IDs when referring 
 
     const text = await callClaude({
       system: systemPrompt,
-      userMessage: `Scenario: "${nlInput}"${contextBlock}\n\nThink through this scenario step by step. Return JSON only.`,
+      userMessage: `Scenario: "${nlInput}"\n\nThink through this scenario step by step. Return JSON only.`,
       maxTokens: 800,
       temperature: 0.3,
     });
 
-    // Strip markdown code fences if present
     const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
     const parsed = JSON.parse(cleaned);
     const duration = Date.now() - startTime;

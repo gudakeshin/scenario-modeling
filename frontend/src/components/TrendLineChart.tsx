@@ -14,7 +14,7 @@ import {
   AreaChart,
 } from "recharts";
 import type { PeriodResult } from "@/lib/api";
-import { METRIC_LABELS, METRIC_COLORS } from "@/lib/metrics";
+import { METRIC_LABELS, METRIC_COLORS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
 
 interface TrendLineChartProps {
   periods: PeriodResult[];
@@ -22,7 +22,7 @@ interface TrendLineChartProps {
 }
 
 function fmt(n: number) {
-  return "$" + n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+  return fmtCurrency(n);
 }
 
 type ChartMode = "line" | "area";
@@ -128,7 +128,7 @@ export function TrendLineChart({ periods, granularity: _granularity }: TrendLine
               />
               <YAxis
                 tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-                tickFormatter={(v: number) => `$${(v / 1000).toFixed(0)}k`}
+                tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
                 axisLine={false}
                 tickLine={false}
               />
@@ -163,7 +163,7 @@ export function TrendLineChart({ periods, granularity: _granularity }: TrendLine
               />
               <YAxis
                 tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-                tickFormatter={(v: number) => `$${(v / 1000).toFixed(0)}k`}
+                tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
                 axisLine={false}
                 tickLine={false}
               />

@@ -53,8 +53,11 @@ export async function exportToExcel(scenarioId: string): Promise<Buffer> {
   wb.creator = "Scenario Modeling | Deloitte";
   wb.created = new Date();
 
-  const baseValues = await computeBaseCase();
-  const model = await getModelDefinition();
+  const sRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
+  const modelHash = sRef.rows[0]?.model_version_hash;
+  const model = await getModelDefinition(modelHash);
+  if (!model) throw new Error("No model found for this scenario");
+  const baseValues = await computeBaseCase(model);
   const plMetrics = getPLMetrics(model);
 
   // Deloitte-style header formatting
@@ -160,8 +163,11 @@ export async function exportToExcel(scenarioId: string): Promise<Buffer> {
 
 export async function exportToCsv(scenarioId: string): Promise<string> {
   const data = await loadExportData(scenarioId);
-  const baseValues = await computeBaseCase();
-  const model = await getModelDefinition();
+  const sRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
+  const modelHash = sRef.rows[0]?.model_version_hash;
+  const model = await getModelDefinition(modelHash);
+  if (!model) throw new Error("No model found for this scenario");
+  const baseValues = await computeBaseCase(model);
   const plMetrics = getPLMetrics(model);
 
   const sections: string[] = [];
