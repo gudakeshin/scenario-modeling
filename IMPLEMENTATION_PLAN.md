@@ -2,8 +2,8 @@
 
 **Based on:** PRD.md (UC 07)  
 **Created:** February 2026  
-**Last Updated:** February 14, 2026  
-**Status:** Phase 5 In Progress — Weeks 21-24 Complete + Search Agent, Competitor Triggers, Follow-Up Questions, Reflection Loop
+**Last Updated:** February 22, 2026  
+**Status:** Phase 5 Complete — Dynamic Context Engine, QA-BA Reflection Loop, Simulation Accuracy, UX Overhaul
 
 ---
 
@@ -35,6 +35,7 @@ This plan outlines the implementation of a Scenario Modeling & Sensitivity Analy
 │  - Scenario Input via chat; Parameter Review & Override     │
 │  - Comparison Views, Charts (Recharts)                      │
 │  - Export (Excel, CSV, PPTX, PNG), Sharing, Roles           │
+│  - Document Manager, QA-BA Reflection Log                   │
 └────────────────────┬────────────────────────────────────────┘
                      │
 ┌────────────────────▼────────────────────────────────────────┐
@@ -47,24 +48,32 @@ This plan outlines the implementation of a Scenario Modeling & Sensitivity Analy
 ┌───▼────┐ ┌▼──────────┐ ┌───▼────┐  ┌──────▼──────┐
 │ NL     │ │ Perplexity │ │ Param  │  │ Simulation  │
 │ Parser │ │ Search     │ │ Mapper │  │ Engine      │
-│(LLM)  │◄│ Agent      │ │        │  │ (Multi-Prd) │
+│(Claude)│◄│ Agent      │ │        │  │ (Multi-Prd) │
 └───┬────┘ └────────────┘ └───┬────┘  └──────┬──────┘
     │                          │              │
 ┌───▼────────────┐             │              │
 │ Reflection     │             │              │
-│ Agent (LLM)    │             │              │
-│ (pre-parse     │             │              │
-│  thinking)     │             │              │
+│ Agent (Claude) │             │              │
 └───┬────────────┘             │              │
     │                          │              │
 ┌───▼──────────────────────────▼──────────────▼──────┐
-│   Model Registry │ Business Analysis Agent (LLM)   │
-└───────────────────────────┬────────────────────────┘
-                            │
-┌───────────────────────────▼────────────────────────┐
-│      Data Layer (PostgreSQL): Scenarios, Params,    │
-│      Outputs, Audit Trail, Users, Templates         │
-└────────────────────────────────────────────────────┘
+│   Business Analysis Agent (Claude)                  │
+│   ◄──── QA Agent (Claude) ────►                     │
+│   (Iterative QA-BA reflection loop, up to 3 rounds) │
+└───────────────────────┬────────────────────────────┘
+                        │
+┌───────────────────────▼────────────────────────────┐
+│   Context Engine │ Model Registry │ Narrative Gen   │
+│   (Qdrant RAG + Claude document extraction)         │
+└───────────────────────┬────────────────────────────┘
+                        │
+┌───────────────────────▼────────────────────────────┐
+│  Data Layer                                         │
+│  - PostgreSQL: scenarios, params, outputs, audit,   │
+│    users, templates, sharing, documents,            │
+│    company_context, user_models                     │
+│  - Qdrant Cloud: document chunk vectors             │
+└─────────────────────────────────────────────────────┘
 ```
 
 ### 1.2 Technology Stack Recommendations
@@ -872,6 +881,61 @@ Response:
 - [x] E2E: Refine endpoint includes reflection when available
 - [x] **Total: 46 tests (8 unit + 38 E2E), 100% pass rate**
 
+#### Dynamic Context Engine, QA-BA Reflection Loop & Simulation Accuracy ✅ COMPLETED
+
+**Dynamic Context Engine (`contextEngine.ts`):**
+- [x] Builds company context + financial model from uploaded documents via Claude + Qdrant RAG
+- [x] Full document text reconstruction from ordered Qdrant chunks (replaces fragmented semantic search)
+- [x] LLM prompt enforces exact P&L value extraction, currency/unit detection, avoids summary tables
+- [x] `KNOWN_CALCULATED_FORMULAS` for cost_of_revenue, ebit, ebitda, gross_profit, net_income, profit_before_tax
+- [x] Auto-repair: converts input-tagged calculated variables (cost_of_revenue, ebit) to proper output formulas
+- [x] Missing dependency injection: scans formulas for unresolved variables and auto-creates them
+- [x] Context API routes (`/context/build`, `/context/status`, CRUD operations)
+- [x] `DocumentManager.tsx`: shows extracted metrics, currency badge, company context
+
+**Quality Assurance Agent (`qaAgent.ts`):**
+- [x] Evaluates business analysis across 6 dimensions: completeness, specificity, actionability, consistency, business_relevance, risk_coverage
+- [x] Absurdity check (CRITICAL): flags P&L changes >±200% as inconsistent, scores consistency 1/10
+- [x] `evaluateAnalysis()` — evaluation-only function with robust JSON repair
+- [x] `buildScenarioContext()` — constructs scenario summary using single-period P&L for accurate comparison
+- [x] `storeQAReport()` — persists QA report to scenario_outputs
+
+**QA-BA Reflection Loop (scenarios route orchestration):**
+- [x] `regenerateWithFeedback()` in businessAnalysisAgent: BA agent receives specific QA criticism injected into its prompt alongside full scenario data
+- [x] Orchestration loop: BA generates → QA evaluates → if fails → BA regenerates with feedback → QA re-evaluates (up to `MAX_QA_ITERATIONS = 3`)
+- [x] `ReflectionStep` type tracks each agent action with duration, score, pass/fail
+- [x] Failed QA after max iterations: analysis clearly marked with quality warning in summary
+- [x] QA score 0 (LLM error) breaks the loop immediately to avoid wasting API calls
+
+**Simulation Accuracy Fixes:**
+- [x] Parser prompt updated: "ONLY map to INPUT variables, NEVER create parameters for calculated/output variables"
+- [x] Post-processing filter: strips parameters targeting output-tagged variables (gross_profit, ebitda, ebit, net_income, profit_before_tax)
+- [x] Multi-period: percent_delta applied to ORIGINAL base value each period (removed compounding bug where prevCtx was used)
+- [x] Removed previous-period carry-forward for input vars (was causing silent compounding)
+- [x] Post-simulation absurdity check: validates key metrics (revenue, ebitda, ebit, net_income, gross_profit, profit_before_tax) for >±200% changes
+- [x] Absurdity warnings stored in simulation output and surfaced in chat + business analysis prompt
+- [x] Business Analysis Agent uses first period's P&L (not 8-quarter aggregate) for comparison with single-period base case
+
+**LLM Robustness:**
+- [x] Increased maxTokens: QA agent 1500→2500, business analysis 1500→3000, refinement 2000→3000
+- [x] `repairJson()` utility: handles truncated strings, unbalanced brackets/braces, trailing commas
+- [x] Added to both `qaAgent.ts` and `businessAnalysisAgent.ts`
+
+**Currency & UX:**
+- [x] Centralized `fmtCurrency()`, `getCurrencySymbol()`, `getCurrencyLabel()` in `frontend/src/lib/metrics.ts`
+- [x] `setCurrency()` initialized from onboarding status (context engine's currency detection)
+- [x] All components updated: TornadoChart, ComparisonView, PeriodBreakdownView, WaterfallChart, DocumentManager, ChatWindow
+- [x] Removed hardcoded company branding from ChatWindow header
+- [x] Self-service role switching via `RoleSwitcher.tsx`
+- [x] Scrollable ThinkingBlock in chat
+
+**Scenario Comparison Overhaul:**
+- [x] `ComparisonView.tsx` redesigned: checkbox-based scenario selector with descriptions, dates, "Current" badge
+- [x] `comparisonService.ts` updated: returns `nl_input`, `created_at`, and `ScenarioRef` for all scenarios
+- [x] Frontend `scenarioLabel()` helper: shows description or name, truncated to 60 chars
+- [x] Auto-generated scenario names from `nl_input` (first sentence, up to 80 chars) in scenario creation route
+- [x] Backfilled 473 existing nameless scenarios with auto-generated names
+
 #### Week 25: Infrastructure & Performance
 - [ ] Set up CI/CD pipeline (GitHub Actions)
 - [ ] Implement caching strategy (Redis for session, parsed results)
@@ -896,6 +960,13 @@ Response:
 - Interactive follow-up questions with refinement pipeline
 - LLM Reflection / Thinking Loop with visible reasoning (ChatGPT-style)
 - Hardcoded data cleanup (shared constants, configurable env vars, dynamic user context)
+- Dynamic Context Engine (Qdrant RAG + Claude document extraction, auto-repair formulas)
+- QA Agent with 6-dimension evaluation and absurdity detection
+- QA-BA Reflection Loop (iterative quality improvement, up to 3 rounds)
+- Simulation accuracy fixes (compounding bug, output variable filtering, absurdity checks)
+- Currency detection and centralized formatting across all components
+- Scenario Comparison overhaul (checkbox selector, auto-generated names, descriptions)
+- Self-service role switching, scrollable ThinkingBlock, DocumentManager
 - CI/CD pipeline
 - Production-ready deployment
 
@@ -1145,6 +1216,6 @@ Output format:
 
 ---
 
-**Document Version:** 7.0  
-**Last Updated:** February 14, 2026  
+**Document Version:** 8.0  
+**Last Updated:** February 22, 2026  
 **Next Review:** After Week 25-26 completion

@@ -4,7 +4,7 @@
 
 **Status:** Engineering-Ready Spec — Active Development
 **Owner:** FP&A Product Team
-**Last Updated:** February 15, 2026
+**Last Updated:** February 22, 2026
 **Stack:** Next.js (frontend), Node.js/Express (backend), PostgreSQL, Qdrant (vector DB), Anthropic Claude (LLM), Perplexity (web search)
 
 ---
@@ -250,7 +250,7 @@ Execute scenario parameters against the registered financial model and produce P
 - [x] Model version is locked per simulation (immutable snapshot)
 - [x] Handles edge cases: division by zero, negative values where not expected
 
-**Technical Implementation:** Driver-based simulation engine with multi-period support (monthly/quarterly), period-over-period carry-forward, compute timeout enforcement.
+**Technical Implementation:** Driver-based simulation engine with multi-period support (monthly/quarterly), non-compounding percent deltas (each period applies same change to original base), post-simulation absurdity validation (flags >200% metric changes), compute timeout enforcement.
 
 ---
 
@@ -263,6 +263,8 @@ Present base case vs. 1–3 scenarios with delta analysis, assumption diffs, and
 - [x] Key metric callout cards: Revenue, EBITDA, Net Income, Operating Cash Flow
 - [x] Export to Excel (.xlsx), CSV, and PowerPoint (.pptx) in Deloitte-branded format
 - [x] Sorting: by delta magnitude, by line item, by custom order
+- [x] Scenario selector shows descriptions and dates (not UUIDs)
+- [x] Auto-generated scenario names from input text
 
 ---
 
@@ -389,7 +391,7 @@ LLM-powered agent that analyzes scenario results and provides actionable busines
 - [x] Decision framework context
 - [x] Confidence note on analysis quality
 
-**Implementation Status:** ✅ Complete — Auto-triggered after simulation, displayed in BusinessInsights panel.
+**Implementation Status:** ✅ Complete — Auto-triggered after simulation, QA-BA reflection loop with up to 3 iterations, per-period P&L analysis (not aggregate), displayed in BusinessInsights panel with visible reflection log.
 
 ---
 
@@ -461,6 +463,38 @@ Upload documents, vectorize with Qdrant, and chat with document content via RAG.
 - [x] Graceful error handling (empty files, unsupported types, Qdrant disconnected)
 
 **Implementation Status:** ✅ Complete — `embeddingService.ts`, `qdrantService.ts`, `documentService.ts`, `ragService.ts`, DocumentPanel UI.
+
+---
+
+#### P1-11: Quality Assurance Agent with QA-BA Reflection Loop
+LLM-powered QA agent that evaluates business analysis quality and drives iterative refinement.
+
+**Acceptance Criteria:**
+- [x] QA Agent evaluates analysis across 6 dimensions: completeness, specificity, actionability, consistency, business relevance, risk coverage
+- [x] Absurdity detection: flags P&L changes exceeding ±200% as inconsistent
+- [x] QA-BA reflection loop: QA feedback sent directly to Business Analysis Agent for regeneration (up to 3 iterations)
+- [x] Full reflection log visible to user showing each agent's thinking, scores, and actions
+- [x] Analysis clearly marked as unreliable if QA threshold not met after max iterations
+- [x] Robust JSON repair prevents truncation errors in LLM responses
+
+**Implementation Status:** ✅ Complete — `qaAgent.ts` (evaluation-only), `regenerateWithFeedback()` in businessAnalysisAgent, orchestration in scenarios route, ReflectionLogSection in BusinessInsights UI.
+
+---
+
+#### P1-12: Dynamic Context Engine & Document-Driven Model Building
+Automatically builds financial models from uploaded documents using RAG and LLM extraction.
+
+**Acceptance Criteria:**
+- [x] Extracts company context (name, industry, business model, revenue streams) from uploaded documents
+- [x] Extracts financial metrics with exact values from P&L statements
+- [x] Detects and respects document currency (INR, USD, etc.) and unit (Million, Crore, etc.)
+- [x] Builds model with proper input/output variable classification and formula relationships
+- [x] Auto-repairs broken formulas using KNOWN_CALCULATED_FORMULAS lookup
+- [x] cost_of_revenue properly calculated from sub-items (employee_benefits + subcontracting + etc.)
+- [x] Full document text reconstruction from Qdrant chunks for accurate LLM extraction
+- [x] Document Manager UI showing extracted metrics, currency, and context
+
+**Implementation Status:** ✅ Complete — `contextEngine.ts`, context routes, DocumentManager component, centralized currency utilities.
 
 ---
 
@@ -568,7 +602,7 @@ These are out of scope for V1 but should inform architectural decisions now.
 - Deloitte brand theming
 - **Milestone:** Enhanced feature set live; measure adoption lift vs. P0-only baseline
 
-### Phase 5: Intelligence & Documents (Weeks 21–26) ✅ COMPLETE
+### Phase 5: Intelligence, Documents & Quality (Weeks 21–28) ✅ COMPLETE
 - E2E testing and quality (Weeks 21–22)
 - Multi-period simulation (Week 23)
 - Frontend enhancements — charts, sharing, roles, PPTX export (Week 24)
@@ -578,7 +612,46 @@ These are out of scope for V1 but should inform architectural decisions now.
 - Claude migration (replaced OpenAI with Anthropic Claude)
 - Card-strip + modal overlay UI refactor
 - Document RAG — Qdrant vector search integration (P1-10)
-- **Milestone:** Full intelligence layer with document understanding, web research, and visible AI reasoning
+
+#### Dynamic Context Engine, QA Agent & Simulation Accuracy ✅ COMPLETED
+
+**Dynamic Context Engine:**
+- [x] `contextEngine.ts`: Builds company context + financial model from uploaded documents via Claude + Qdrant RAG
+- [x] Full document text reconstruction from ordered Qdrant chunks (not fragmented semantic search)
+- [x] LLM prompt enforces exact P&L value extraction, respects currency unit, avoids summary tables
+- [x] KNOWN_CALCULATED_FORMULAS for cost_of_revenue, ebit, ebitda, gross_profit, net_income, etc.
+- [x] Auto-repair: converts input-tagged calculated variables to proper output formulas
+- [x] Context API routes (`/context/build`, `/context/status`, CRUD)
+- [x] DocumentManager component showing extracted metrics with currency badge
+
+**Quality Assurance Agent:**
+- [x] `qaAgent.ts`: Evaluates business analysis across 6 quality dimensions with absurdity check
+- [x] `regenerateWithFeedback()` in businessAnalysisAgent: BA agent regenerates with QA criticism
+- [x] Orchestration loop in scenarios route: BA → QA → if fails → BA regenerates → QA re-evaluates (up to 3 iterations)
+- [x] `ReflectionLogSection` in BusinessInsights: timeline visualization of QA-BA back-and-forth
+- [x] Failed QA clearly marked with warnings; analysis blocked from being presented as reliable
+
+**Simulation Accuracy Fixes:**
+- [x] Parser filters out parameters targeting calculated/output variables (only INPUT overrides allowed)
+- [x] Multi-period simulation: percent_delta applied to ORIGINAL base each period (no compounding)
+- [x] Post-simulation absurdity check: flags key metrics changing by >±200%
+- [x] Business Analysis Agent uses single-period P&L (not 8-quarter aggregate) for accurate comparison
+- [x] Increased LLM maxTokens (1500→2500-3000) with robust JSON repair to prevent truncation
+
+**Currency & UX:**
+- [x] Centralized currency formatting (`fmtCurrency`, `getCurrencySymbol`, `getCurrencyLabel`) across all components
+- [x] Dynamic currency detection from company context (INR, USD, EUR, etc.)
+- [x] Removed hardcoded company branding from header
+- [x] Self-service role switching (RoleSwitcher component)
+- [x] Scrollable thinking block in chat
+
+**Scenario Comparison Overhaul:**
+- [x] Scenarios display descriptions and dates instead of UUIDs
+- [x] Checkbox-based selector with "Current" badge and date labels
+- [x] Auto-generated scenario names from nl_input text
+- [x] Comparison API returns `nl_input` and `created_at` alongside `name`
+
+- **Milestone:** Full intelligence layer with document understanding, web research, visible AI reasoning, quality assurance, and dynamic model building
 
 ### Phase 6: Production Readiness (Upcoming)
 - SSO / enterprise authentication integration
@@ -623,17 +696,17 @@ These are out of scope for V1 but should inform architectural decisions now.
 │  - Input validation, compute timeout enforcement                │
 └────────────────────┬───────────────────────────────────────────┘
                      │
-    ┌────────┬───────┼────────┬──────────┬──────────┐
-    │        │       │        │          │          │
-┌───▼────┐┌──▼──────────┐┌───▼────┐┌────▼─────┐┌──▼──────────┐
-│Reflect ││ Perplexity   ││ NL     ││Simulation││ Document    │
-│Agent   ││ Search Agent ││ Parser ││ Engine   ││ RAG Service │
-│(Claude)││ (Sonar API)  ││(Claude)││(Multi-P) ││(Qdrant+LLM)│
-└───┬────┘└──────────────┘└───┬────┘└────┬─────┘└──────┬──────┘
-    │                          │          │             │
-┌───▼──────────────────────────▼──────────▼─────────────┘
-│   Business Analysis Agent (Claude) │ Narrative Gen     │
-└───────────────────────┬────────────────────────────────┘
+    ┌────────┬───────┼────────┬──────────┬──────────┬───────────┐
+    │        │       │        │          │          │           │
+┌───▼────┐┌──▼──────────┐┌───▼────┐┌────▼─────┐┌──▼──────────┐┌──▼──────────┐
+│Reflect ││ Perplexity   ││ NL     ││Simulation││ Document    ││ Context     │
+│Agent   ││ Search Agent ││ Parser ││ Engine   ││ RAG Service ││ Engine      │
+│(Claude)││ (Sonar API)  ││(Claude)││(Multi-P) ││(Qdrant+LLM)││(Qdrant+LLM) │
+└───┬────┘└──────────────┘└───┬────┘└────┬─────┘└──────┬──────┘└──────┬──────┘
+    │                          │          │             │              │
+┌───▼──────────────────────────▼──────────▼─────────────┘──────────────┘
+│   Business Analysis Agent (Claude) │ QA Agent (Claude)  │ Narrative Gen │
+└───────────────────────┬──────────────────────────────────────────────┘
                         │
 ┌───────────────────────▼────────────────────────────────┐
 │  Data Layer                                             │
@@ -654,6 +727,8 @@ These are out of scope for V1 but should inform architectural decisions now.
 | Frontend | Next.js 14, React, Tailwind CSS, Recharts | Modern SSR, component architecture, rich data visualization |
 | Backend | Node.js, Express, TypeScript | Type-safe, fast development, good LLM SDK support |
 | Database | PostgreSQL | ACID compliance, JSONB for flexible data, UUID support |
+| Context Engine | contextEngine.ts + Qdrant RAG | Document-driven model building with LLM extraction and formula repair |
+| QA Agent | qaAgent.ts + Claude | Quality assurance with multi-dimensional scoring and absurdity detection |
 
 ### Key Design Decisions
 
