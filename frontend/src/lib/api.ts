@@ -2,10 +2,23 @@ const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
 
 const ACCESS_KEY = "sm_access_token";
 const REFRESH_KEY = "sm_refresh_token";
+const WORKSPACE_KEY = "sm_workspace_id";
 
 function storage(): Storage | null {
   if (typeof window === "undefined") return null;
   return window.localStorage;
+}
+
+/** Active workspace id (persisted). Read here — not from the store — so api.ts has no store import. */
+export function getActiveWorkspaceId(): string | null {
+  return storage()?.getItem(WORKSPACE_KEY) ?? null;
+}
+
+export function setActiveWorkspaceId(id: string | null): void {
+  const s = storage();
+  if (!s) return;
+  if (id) s.setItem(WORKSPACE_KEY, id);
+  else s.removeItem(WORKSPACE_KEY);
 }
 
 export function getAccessToken(): string | null {
@@ -101,30 +114,41 @@ async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: num
   }
 }
 
-/** Authenticated fetch: Bearer token, timeout, 401 → refresh → retry → login redirect. */
-export async function apiFetch(input: string, init: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Response> {
+function buildAuthHeaders(init: RequestInit): Headers {
   const headers = new Headers(init.headers || {});
   const token = getAccessToken();
   if (token) headers.set("Authorization", `Bearer ${token}`);
+  const workspaceId = getActiveWorkspaceId();
+  if (workspaceId) headers.set("X-Workspace-Id", workspaceId);
   if (init.body && !headers.has("Content-Type") && !(init.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
   }
+  return headers;
+}
 
-  let res = await fetchWithTimeout(input, { ...init, headers }, timeoutMs);
+/** Authenticated fetch: Bearer token + workspace header, timeout, 401 → refresh → retry → login redirect. */
+export async function apiFetch(input: string, init: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Response> {
+  let res = await fetchWithTimeout(input, { ...init, headers: buildAuthHeaders(init) }, timeoutMs);
   if (res.status === 401 && !input.includes("/api/v1/auth/")) {
     const ok = await tryRefresh();
     if (ok) {
-      const retryHeaders = new Headers(init.headers || {});
-      const access = getAccessToken();
-      if (access) retryHeaders.set("Authorization", `Bearer ${access}`);
-      if (init.body && !retryHeaders.has("Content-Type") && !(init.body instanceof FormData)) {
-        retryHeaders.set("Content-Type", "application/json");
-      }
-      res = await fetchWithTimeout(input, { ...init, headers: retryHeaders }, timeoutMs);
+      res = await fetchWithTimeout(input, { ...init, headers: buildAuthHeaders(init) }, timeoutMs);
     }
     if (res.status === 401) {
       clearTokens();
       redirectToLogin();
+    }
+  }
+  // Stale workspace (deleted in another tab): drop it and retry on the default workspace.
+  if (res.status === 403 && getActiveWorkspaceId()) {
+    try {
+      const body = await res.clone().json();
+      if (body?.code === "WORKSPACE_NOT_FOUND") {
+        setActiveWorkspaceId(null);
+        res = await fetchWithTimeout(input, { ...init, headers: buildAuthHeaders(init) }, timeoutMs);
+      }
+    } catch {
+      // Non-JSON 403 — leave as-is.
     }
   }
   return res;
@@ -443,7 +467,55 @@ function authHeaders(extra?: Record<string, string>): Record<string, string> {
   const headers: Record<string, string> = { ...(extra || {}) };
   const token = getAccessToken();
   if (token) headers["Authorization"] = `Bearer ${token}`;
+  const workspaceId = getActiveWorkspaceId();
+  if (workspaceId) headers["X-Workspace-Id"] = workspaceId;
   return headers;
+}
+
+// ── Workspaces ──
+
+export interface Workspace {
+  workspace_id: string;
+  name: string;
+  is_default: boolean;
+  document_count?: number;
+  scenario_count?: number;
+  created_at: string;
+}
+
+export async function listWorkspaces(): Promise<Workspace[]> {
+  const res = await apiFetch(`${API_BASE}/api/v1/workspaces`);
+  if (!res.ok) throw new Error("Failed to list workspaces");
+  const data = await res.json();
+  return data.workspaces ?? [];
+}
+
+export async function createWorkspace(name: string): Promise<Workspace> {
+  const res = await apiFetch(`${API_BASE}/api/v1/workspaces`, {
+    method: "POST",
+    body: JSON.stringify({ name }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Failed to create workspace");
+  return data;
+}
+
+export async function renameWorkspace(id: string, name: string): Promise<Workspace> {
+  const res = await apiFetch(`${API_BASE}/api/v1/workspaces/${id}`, {
+    method: "PUT",
+    body: JSON.stringify({ name }),
+  });
+  const data = await res.json();
+  if (!res.ok) throw new Error(data.error || "Failed to rename workspace");
+  return data;
+}
+
+export async function deleteWorkspace(id: string): Promise<void> {
+  const res = await apiFetch(`${API_BASE}/api/v1/workspaces/${id}`, { method: "DELETE" });
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({}));
+    throw new Error(data.error || "Failed to delete workspace");
+  }
 }
 
 // ── Users ──

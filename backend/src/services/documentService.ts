@@ -149,7 +149,7 @@ function chunkText(text: string): Chunk[] {
 const DOCUMENT_COLUMNS =
   "document_id, name, original_filename, file_type, document_kind, validation_status, " +
   "file_size_bytes, chunk_count, status, model_schema, workbook_graph, qdrant_collection, " +
-  "created_by, created_at, updated_at";
+  "created_by, workspace_id, created_at, updated_at";
 
 export interface DocumentRecord {
   document_id: string;
@@ -171,7 +171,8 @@ export async function processDocument(
   buffer: Buffer,
   originalFilename: string,
   fileType: string,
-  userId: string
+  userId: string,
+  workspaceId: string
 ): Promise<DocumentRecord> {
   const docName = originalFilename.replace(/\.[^.]+$/, "");
   const docId = randomUUID();
@@ -185,9 +186,9 @@ export async function processDocument(
   // Original bytes are persisted so spreadsheet models can be re-processed
   // (cell-level simulation needs the full workbook, not just extracted text).
   await pool.query(
-    `INSERT INTO documents (document_id, name, original_filename, file_type, file_size_bytes, status, created_by, document_kind, validation_status, file_bytes)
-     VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8, $9)`,
-    [docId, docName, originalFilename, normalizedFileType, buffer.length, userId, documentKind, "processing", buffer]
+    `INSERT INTO documents (document_id, name, original_filename, file_type, file_size_bytes, status, created_by, workspace_id, document_kind, validation_status, file_bytes)
+     VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8, $9, $10)`,
+    [docId, docName, originalFilename, normalizedFileType, buffer.length, userId, workspaceId, documentKind, "processing", buffer]
   );
 
   try {
@@ -265,6 +266,7 @@ export async function getDocumentChunksFromDb(documentIds: string[]): Promise<{
  */
 export async function searchDocumentChunksInDb(
   question: string,
+  workspaceId: string,
   topK = 6,
   documentId?: string
 ): Promise<{
@@ -281,11 +283,13 @@ export async function searchDocumentChunksInDb(
     .slice(0, 8);
   if (terms.length === 0) return [];
 
-  const params: unknown[] = [];
-  let where = "TRUE";
+  // Always scope retrieval to the workspace — previously the all-documents
+  // branch had no filter at all and searched every user's chunks.
+  const params: unknown[] = [workspaceId];
+  let where = "d.workspace_id = $1";
   if (documentId) {
     params.push(documentId);
-    where = `c.document_id = $${params.length}`;
+    where += ` AND c.document_id = $${params.length}`;
   }
 
   const r = await pool.query(
@@ -312,12 +316,14 @@ export async function searchDocumentChunksInDb(
 }
 
 /**
- * List all documents.
+ * List documents in the active workspace.
+ * Workspaces are single-owner, so the workspace filter also enforces
+ * ownership; admins browsing other users' documents go through explicit ids.
  */
-export async function listDocuments(userId: string, role: Role): Promise<DocumentRecord[]> {
+export async function listDocuments(userId: string, role: Role, workspaceId: string): Promise<DocumentRecord[]> {
   const r = await pool.query(
-    `SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE ($1::text = 'admin' OR created_by = $2) ORDER BY created_at DESC`,
-    [role, userId]
+    `SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE workspace_id = $1 ORDER BY created_at DESC`,
+    [workspaceId]
   );
   return r.rows;
 }

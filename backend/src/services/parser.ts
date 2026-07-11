@@ -16,8 +16,9 @@
 
 import { z } from "zod";
 import { getApiKey, callClaudeStructured } from "./llmClient.js";
-import { getUserModelDefinition, describeModelForLLM, type ModelDefinition } from "../models/registry.js";
+import { getWorkspaceModelDefinition, describeModelForLLM, type ModelDefinition } from "../models/registry.js";
 import { describeContextForLLM } from "./contextEngine.js";
+import type { Scope } from "../middleware/workspace.js";
 import { needsExternalSearch, searchPerplexity, type SearchResult } from "./searchService.js";
 import { reflect, type ReflectionResult } from "./reflectionService.js";
 import { logger } from "../logger.js";
@@ -162,18 +163,18 @@ FOLLOW-UP QUESTIONS:
 
 async function llmParse(
   nlInput: string,
-  userId: string | undefined,
+  scope: Scope | undefined,
   searchContext?: SearchResult | null,
   reflectionResult?: ReflectionResult | null
 ): Promise<ParseResult> {
   if (!getApiKey()) throw new Error("No API key");
-  if (!userId) throw new Error("No user — authentication required");
+  if (!scope) throw new Error("No user — authentication required");
 
-  const model = await getUserModelDefinition(userId);
+  const model = await getWorkspaceModelDefinition(scope.workspaceId);
   if (!model) throw new Error("No model — onboarding needed");
 
   const modelDesc = describeModelForLLM(model);
-  const contextDesc = await describeContextForLLM(userId);
+  const contextDesc = await describeContextForLLM(scope);
   const systemPrompt = buildSystemPrompt(modelDesc, contextDesc);
 
   let userContent = `Scenario input: "${nlInput}"`;
@@ -335,16 +336,16 @@ function heuristicParse(nlInput: string, model: ModelDefinition | null): ParseRe
 
 // ── Main entry point ──
 
-export async function parseScenario(nlInput: string, userId?: string): Promise<ParseResult> {
+export async function parseScenario(nlInput: string, scope?: Scope): Promise<ParseResult> {
   const apiKey = getApiKey();
   const trimmed = nlInput.trim();
   const notices: { type: "warning" | "info"; message: string }[] = [];
 
-  // Load user's model for context (skip when no authenticated user id)
+  // Load the workspace's model for context (skip when no authenticated scope)
   let userModel: ModelDefinition | null = null;
-  if (userId) {
+  if (scope) {
     try {
-      userModel = await getUserModelDefinition(userId);
+      userModel = await getWorkspaceModelDefinition(scope.workspaceId);
     } catch {
       // If model lookup fails, continue — heuristic will guide user
     }
@@ -392,7 +393,7 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
   if (apiKey && trimmed.length >= 5) {
     try {
       logger.info("[Parser] Running reflection loop...");
-      reflectionResult = await reflect(trimmed, searchContext, userId);
+      reflectionResult = await reflect(trimmed, searchContext, scope);
       if (reflectionResult) {
         llmAvailable = true;
         logger.info(`[Parser] Reflection complete (${reflectionResult.duration_ms}ms)`);
@@ -417,7 +418,7 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
   // Step 3: LLM parse (enriched with reflection + search context)
   if (apiKey && trimmed.length >= 5) {
     try {
-      const result = await llmParse(trimmed, userId, searchContext, reflectionResult);
+      const result = await llmParse(trimmed, scope, searchContext, reflectionResult);
       llmAvailable = true;
 
       if (reflectionResult) {

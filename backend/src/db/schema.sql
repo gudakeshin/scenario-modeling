@@ -10,6 +10,17 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Workspaces: per-user containers isolating documents, context/model, scenarios
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | deleted
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS scenarios (
     scenario_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255),
@@ -17,6 +28,7 @@ CREATE TABLE IF NOT EXISTS scenarios (
     nl_input TEXT NOT NULL,
     status VARCHAR(50) NOT NULL,
     creator_id UUID NOT NULL REFERENCES users(user_id),
+    workspace_id UUID REFERENCES workspaces(workspace_id),
     model_version_hash VARCHAR(64) NOT NULL DEFAULT 'v0',
     base_case_id UUID REFERENCES scenarios(scenario_id),
     created_at TIMESTAMP DEFAULT NOW(),
@@ -113,6 +125,7 @@ CREATE TABLE IF NOT EXISTS parameter_override_history (
 CREATE TABLE IF NOT EXISTS company_context (
     context_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_by UUID REFERENCES users(user_id),
+    workspace_id UUID REFERENCES workspaces(workspace_id),
     company_name TEXT,
     industry TEXT,
     context_data JSONB NOT NULL,
@@ -126,6 +139,7 @@ CREATE TABLE IF NOT EXISTS company_context (
 CREATE TABLE IF NOT EXISTS user_models (
     model_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_by UUID REFERENCES users(user_id),
+    workspace_id UUID REFERENCES workspaces(workspace_id),
     name TEXT NOT NULL,
     model_definition JSONB NOT NULL,
     source_context_id UUID REFERENCES company_context(context_id),
@@ -149,6 +163,7 @@ CREATE TABLE IF NOT EXISTS documents (
     model_schema JSONB,
     qdrant_collection VARCHAR(255),
     created_by UUID REFERENCES users(user_id),
+    workspace_id UUID REFERENCES workspaces(workspace_id),
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
@@ -184,6 +199,18 @@ ALTER TABLE documents
 ALTER TABLE sessions
   ADD COLUMN IF NOT EXISTS scenario_context JSONB;
 
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
+
+ALTER TABLE company_context
+  ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
+
+ALTER TABLE user_models
+  ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
+
+ALTER TABLE scenarios
+  ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
+
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_scenarios_creator ON scenarios(creator_id);
 CREATE INDEX IF NOT EXISTS idx_scenarios_status ON scenarios(status);
@@ -196,6 +223,23 @@ CREATE INDEX IF NOT EXISTS idx_mappings_variable ON model_mappings(model_variabl
 CREATE INDEX IF NOT EXISTS idx_documents_kind ON documents(document_kind);
 CREATE INDEX IF NOT EXISTS idx_documents_validation_status ON documents(validation_status);
 CREATE INDEX IF NOT EXISTS idx_sessions_scenario ON sessions(scenario_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_workspaces_owner_default
+    ON workspaces(owner_id) WHERE is_default AND status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_workspaces_owner_name
+    ON workspaces(owner_id, lower(name)) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_company_context_active_ws
+    ON company_context(workspace_id) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_models_active_ws
+    ON user_models(workspace_id) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_documents_workspace
+    ON documents(workspace_id, status, document_kind, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scenarios_workspace
+    ON scenarios(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_company_context_workspace
+    ON company_context(workspace_id, status);
+CREATE INDEX IF NOT EXISTS idx_user_models_workspace
+    ON user_models(workspace_id, is_active);
 
 -- Seed default user for local dev / testing only.
 -- In production, users should be created via the application or SSO.

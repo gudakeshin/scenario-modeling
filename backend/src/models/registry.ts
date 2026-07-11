@@ -58,25 +58,25 @@ export async function getModelDefinition(modelIdOrVersion?: string): Promise<Mod
 }
 
 /**
- * Get the active model for a specific user.
+ * Get the active model for a workspace.
  * This is the primary way to get a model at scenario creation time.
  */
-export async function getUserModelDefinition(userId: string): Promise<ModelDefinition | null> {
+export async function getWorkspaceModelDefinition(workspaceId: string): Promise<ModelDefinition | null> {
   const r = await pool.query(
-    "SELECT model_definition FROM user_models WHERE created_by = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
-    [userId]
+    "SELECT model_definition FROM user_models WHERE workspace_id = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
+    [workspaceId]
   );
   if (r.rows.length > 0) return r.rows[0].model_definition as ModelDefinition;
   return null;
 }
 
 /**
- * Get the active model_id for a user (to store on scenarios).
+ * Get the active model_id for a workspace (to store on scenarios).
  */
-export async function getUserModelId(userId: string): Promise<string | null> {
+export async function getWorkspaceModelId(workspaceId: string): Promise<string | null> {
   const r = await pool.query(
-    "SELECT model_id FROM user_models WHERE created_by = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
-    [userId]
+    "SELECT model_id FROM user_models WHERE workspace_id = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
+    [workspaceId]
   );
   if (r.rows.length > 0) return r.rows[0].model_id;
   return null;

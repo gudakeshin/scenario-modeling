@@ -103,17 +103,39 @@ export async function deleteTemplate(templateId: string): Promise<boolean> {
 
 // ── Clone template → new scenario ──
 
-export async function cloneTemplateToScenario(templateId: string, userId: string, nlInput?: string): Promise<string> {
+export async function cloneTemplateToScenario(
+  templateId: string,
+  userId: string,
+  workspaceId: string,
+  nlInput?: string
+): Promise<string> {
   const tpl = await getTemplate(templateId);
   if (!tpl) throw new Error("Template not found");
 
   const name = `${tpl.name} (clone)`;
   const input = nlInput || `Cloned from template: ${tpl.name}`;
 
+  // Templates are user-global but scenarios are workspace-scoped: only keep
+  // the template's pinned model if it belongs to this workspace, otherwise
+  // re-resolve to the workspace's active model so a clone never evaluates
+  // against another workspace's model.
+  let modelVersionHash = tpl.model_version_hash || "v0";
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (UUID_RE.test(modelVersionHash)) {
+    const modelWs = await pool.query(
+      "SELECT workspace_id FROM user_models WHERE model_id = $1",
+      [modelVersionHash]
+    );
+    if (modelWs.rows[0]?.workspace_id !== workspaceId) {
+      const { getWorkspaceModelId } = await import("../models/registry.js");
+      modelVersionHash = (await getWorkspaceModelId(workspaceId)) || "v0";
+    }
+  }
+
   const sRes = await pool.query(
-    `INSERT INTO scenarios (name, nl_input, status, creator_id, model_version_hash)
-     VALUES ($1, $2, 'draft', $3, $4) RETURNING scenario_id`,
-    [name, input, userId, tpl.model_version_hash || "v0"]
+    `INSERT INTO scenarios (name, nl_input, status, creator_id, workspace_id, model_version_hash)
+     VALUES ($1, $2, 'draft', $3, $4, $5) RETURNING scenario_id`,
+    [name, input, userId, workspaceId, modelVersionHash]
   );
   const scenarioId = sRes.rows[0].scenario_id;
 

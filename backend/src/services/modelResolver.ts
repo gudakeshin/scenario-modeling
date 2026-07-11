@@ -36,30 +36,40 @@ interface SpreadsheetDocRow {
   validation_status: string | null;
 }
 
-async function findSpreadsheetModelDoc(creatorId: string): Promise<SpreadsheetDocRow | null> {
+async function findSpreadsheetModelDoc(workspaceId: string): Promise<SpreadsheetDocRow | null> {
   const r = await pool.query(
     `SELECT document_id, updated_at, model_schema, workbook_graph, validation_status
      FROM documents
-     WHERE created_by = $1
+     WHERE workspace_id = $1
        AND status = 'ready'
        AND document_kind = 'spreadsheet_model'
        AND model_schema IS NOT NULL
      ORDER BY created_at DESC
      LIMIT 1`,
-    [creatorId],
+    [workspaceId],
   );
   return (r.rows[0] as SpreadsheetDocRow | undefined) ?? null;
 }
 
 export async function getEvaluableModelForScenario(scenarioId: string): Promise<ResolvedModel> {
   const scenarioRes = await pool.query(
-    "SELECT creator_id, model_version_hash FROM scenarios WHERE scenario_id = $1",
+    "SELECT creator_id, workspace_id, model_version_hash FROM scenarios WHERE scenario_id = $1",
     [scenarioId],
   );
   if (scenarioRes.rows.length === 0) throw new ModelResolutionError("Scenario not found", 404);
-  const { creator_id: creatorId, model_version_hash: modelVersion } = scenarioRes.rows[0];
+  const { creator_id: creatorId, workspace_id: workspaceIdRaw, model_version_hash: modelVersion } = scenarioRes.rows[0];
 
-  const doc = await findSpreadsheetModelDoc(creatorId);
+  // Resolve against the scenario's own workspace — never the caller's active
+  // one — so shared scenarios and multi-workspace users always evaluate on
+  // the document set the scenario was created from. Legacy rows (pre-backfill
+  // NULL) fall back to the creator's default workspace.
+  let workspaceId: string | null = workspaceIdRaw;
+  if (!workspaceId) {
+    const { ensureDefaultWorkspace } = await import("./workspaceService.js");
+    workspaceId = await ensureDefaultWorkspace(creatorId);
+  }
+
+  const doc = await findSpreadsheetModelDoc(workspaceId);
   if (doc) {
     if (doc.validation_status !== "ready") {
       throw new ModelResolutionError(

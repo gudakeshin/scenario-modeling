@@ -3,6 +3,7 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import type { Conversation } from "@/types/chat";
 import { ThemeToggle } from "./ThemeToggle";
+import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 import { strings } from "@/lib/strings";
 
 interface SidebarProps {
@@ -225,6 +226,9 @@ function SidebarContent({
           </button>
         )}
       </div>
+
+      {/* Workspace selector — isolated documents/model/scenarios per workspace */}
+      <WorkspaceSwitcher />
 
       {/* New scenario button */}
       <button

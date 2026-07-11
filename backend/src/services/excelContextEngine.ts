@@ -4,6 +4,7 @@ import { callClaudeStructured, getApiKey } from "./llmClient.js";
 import type { ModelDefinition } from "../models/registry.js";
 import type { WorkbookGraph } from "./excelExtractor.js";
 import type { CompanyContext } from "./contextEngine.js";
+import type { Scope } from "../middleware/workspace.js";
 
 const modelSchemaZ = z.object({
   company: z.string().default(""),
@@ -455,17 +456,18 @@ Rules:
   return normalizeModelSchema(parsed, docName, graph);
 }
 
-export async function buildExcelContext(userIdentifier: string): Promise<CompanyContext> {
-  const userId = await resolveUserId(userIdentifier);
+export async function buildExcelContext(scope: Scope): Promise<CompanyContext> {
+  const userId = await resolveUserId(scope.userId);
+  const { workspaceId } = scope;
   const docsRes = await pool.query(
     `SELECT document_id, name, workbook_graph
      FROM documents
-     WHERE created_by = $1
+     WHERE workspace_id = $1
        AND status = 'ready'
        AND document_kind = 'spreadsheet_model'
      ORDER BY created_at DESC
      LIMIT 1`,
-    [userId],
+    [workspaceId],
   );
   if (docsRes.rows.length === 0) {
     throw new Error("No processed XLSX model found. Upload an XLSX model first.");
@@ -532,20 +534,20 @@ export async function buildExcelContext(userIdentifier: string): Promise<Company
     validation_status: "needs_validation",
   };
 
-  await pool.query("UPDATE company_context SET status = 'superseded' WHERE created_by = $1 AND status = 'active'", [userId]);
+  await pool.query("UPDATE company_context SET status = 'superseded' WHERE workspace_id = $1 AND status = 'active'", [workspaceId]);
   const ctxInsert = await pool.query(
-    `INSERT INTO company_context (created_by, company_name, industry, context_data, source_document_ids, status)
-     VALUES ($1, $2, $3, $4, $5, 'active')
+    `INSERT INTO company_context (created_by, workspace_id, company_name, industry, context_data, source_document_ids, status)
+     VALUES ($1, $2, $3, $4, $5, $6, 'active')
      RETURNING *`,
-    [userId, modelSchema.company, modelSchema.industry, JSON.stringify(contextData), [doc.document_id]],
+    [userId, workspaceId, modelSchema.company, modelSchema.industry, JSON.stringify(contextData), [doc.document_id]],
   );
 
-  await pool.query("UPDATE user_models SET is_active = false WHERE created_by = $1 AND is_active = true", [userId]);
+  await pool.query("UPDATE user_models SET is_active = false WHERE workspace_id = $1 AND is_active = true", [workspaceId]);
   const modelDef = toModelDefinition(modelSchema);
   await pool.query(
-    `INSERT INTO user_models (created_by, name, model_definition, source_context_id, is_active)
-     VALUES ($1, $2, $3, $4, true)`,
-    [userId, `${modelSchema.company} XLSX Model`, JSON.stringify(modelDef), ctxInsert.rows[0].context_id],
+    `INSERT INTO user_models (created_by, workspace_id, name, model_definition, source_context_id, is_active)
+     VALUES ($1, $2, $3, $4, $5, true)`,
+    [userId, workspaceId, `${modelSchema.company} XLSX Model`, JSON.stringify(modelDef), ctxInsert.rows[0].context_id],
   );
 
   const row = ctxInsert.rows[0];

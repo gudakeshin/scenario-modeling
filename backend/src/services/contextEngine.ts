@@ -14,6 +14,7 @@ import { config } from "../config.js";
 import { pool, resolveUserId } from "../db/index.js";
 import { callClaudeStructured, getApiKey } from "./llmClient.js";
 import type { ModelDefinition } from "../models/registry.js";
+import type { Scope } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
 
 const financialMetricSchema = z.object({
@@ -105,17 +106,18 @@ interface DenominationHints {
 // ── Context Building ──
 
 /**
- * Build company context from all uploaded documents for a user.
+ * Build company context from all uploaded documents in a workspace.
  * Retrieves representative chunks, sends to Claude for extraction,
  * and stores the structured result.
  */
-export async function buildContext(userIdentifier: string): Promise<CompanyContext> {
-  const userId = await resolveUserId(userIdentifier);
+export async function buildContext(scope: Scope): Promise<CompanyContext> {
+  const userId = await resolveUserId(scope.userId);
+  const { workspaceId } = scope;
 
-  // 1. Get all ready documents for this user
+  // 1. Get all ready documents in this workspace
   const docResult = await pool.query(
-    "SELECT document_id, name, file_type, created_at FROM documents WHERE created_by = $1 AND status = 'ready' ORDER BY created_at",
-    [userId]
+    "SELECT document_id, name, file_type, created_at FROM documents WHERE workspace_id = $1 AND status = 'ready' ORDER BY created_at",
+    [workspaceId]
   );
   const docs = docResult.rows;
   if (docs.length === 0) {
@@ -258,15 +260,15 @@ Rules for financial_metrics:
   applyDenominationFallback(contextData, denomHints);
   normalizeMetricSemantics(contextData);
 
-  // 4. Store in company_context (upsert — one active context per user)
+  // 4. Store in company_context (upsert — one active context per workspace)
   // Deactivate any existing context
-  await pool.query("UPDATE company_context SET status = 'superseded' WHERE created_by = $1 AND status = 'active'", [userId]);
+  await pool.query("UPDATE company_context SET status = 'superseded' WHERE workspace_id = $1 AND status = 'active'", [workspaceId]);
 
   const ctxResult = await pool.query(
-    `INSERT INTO company_context (created_by, company_name, industry, context_data, source_document_ids, status)
-     VALUES ($1, $2, $3, $4, $5, 'active')
+    `INSERT INTO company_context (created_by, workspace_id, company_name, industry, context_data, source_document_ids, status)
+     VALUES ($1, $2, $3, $4, $5, $6, 'active')
      RETURNING *`,
-    [userId, contextData.company_name, contextData.industry, JSON.stringify(contextData), docIds]
+    [userId, workspaceId, contextData.company_name, contextData.industry, JSON.stringify(contextData), docIds]
   );
   const ctx = ctxResult.rows[0];
 
@@ -274,12 +276,12 @@ Rules for financial_metrics:
   const modelDef = buildModelFromContext(contextData);
 
   // Deactivate existing models
-  await pool.query("UPDATE user_models SET is_active = false WHERE created_by = $1 AND is_active = true", [userId]);
+  await pool.query("UPDATE user_models SET is_active = false WHERE workspace_id = $1 AND is_active = true", [workspaceId]);
 
   await pool.query(
-    `INSERT INTO user_models (created_by, name, model_definition, source_context_id, is_active)
-     VALUES ($1, $2, $3, $4, true)`,
-    [userId, `${contextData.company_name || "Company"} P&L Model`, JSON.stringify(modelDef), ctx.context_id]
+    `INSERT INTO user_models (created_by, workspace_id, name, model_definition, source_context_id, is_active)
+     VALUES ($1, $2, $3, $4, $5, true)`,
+    [userId, workspaceId, `${contextData.company_name || "Company"} P&L Model`, JSON.stringify(modelDef), ctx.context_id]
   );
 
   return {
@@ -828,21 +830,19 @@ function detectDenominationHints(text: string): DenominationHints {
 
 // ── Context Retrieval ──
 
-export async function getActiveContext(userIdentifier: string): Promise<CompanyContext | null> {
-  const userId = await resolveUserId(userIdentifier);
+export async function getActiveContext(scope: Scope): Promise<CompanyContext | null> {
   const r = await pool.query(
-    "SELECT * FROM company_context WHERE created_by = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1",
-    [userId]
+    "SELECT * FROM company_context WHERE workspace_id = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1",
+    [scope.workspaceId]
   );
   if (r.rows.length === 0) return null;
   return r.rows[0];
 }
 
-export async function getActiveModel(userIdentifier: string): Promise<{ model_id: string; name: string; model_definition: ModelDefinition; is_active: boolean } | null> {
-  const userId = await resolveUserId(userIdentifier);
+export async function getActiveModel(scope: Scope): Promise<{ model_id: string; name: string; model_definition: ModelDefinition; is_active: boolean } | null> {
   const r = await pool.query(
-    "SELECT * FROM user_models WHERE created_by = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
-    [userId]
+    "SELECT * FROM user_models WHERE workspace_id = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
+    [scope.workspaceId]
   );
   if (r.rows.length === 0) return null;
   return r.rows[0];
@@ -867,17 +867,16 @@ export async function updateModel(modelId: string, modelDefinition: ModelDefinit
   );
 }
 
-export async function deleteContext(userIdentifier: string): Promise<void> {
-  const userId = await resolveUserId(userIdentifier);
-  await pool.query("UPDATE company_context SET status = 'deleted' WHERE created_by = $1 AND status = 'active'", [userId]);
-  await pool.query("UPDATE user_models SET is_active = false WHERE created_by = $1 AND is_active = true", [userId]);
+export async function deleteContext(scope: Scope): Promise<void> {
+  await pool.query("UPDATE company_context SET status = 'deleted' WHERE workspace_id = $1 AND status = 'active'", [scope.workspaceId]);
+  await pool.query("UPDATE user_models SET is_active = false WHERE workspace_id = $1 AND is_active = true", [scope.workspaceId]);
 }
 
 /**
  * Build a text description of the company context for injection into LLM prompts.
  */
-export async function describeContextForLLM(userIdentifier: string): Promise<string | null> {
-  const ctx = await getActiveContext(userIdentifier);
+export async function describeContextForLLM(scope: Scope): Promise<string | null> {
+  const ctx = await getActiveContext(scope);
   if (!ctx) return null;
   const d = ctx.context_data as ContextData;
   const lines = [

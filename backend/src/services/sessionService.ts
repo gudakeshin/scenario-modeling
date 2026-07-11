@@ -122,10 +122,22 @@ export async function addFollowUp(
 
   const scenarioId = session.scenario_id;
   await hydrateScenarioContext(scenarioId);
-  // Get the scenario's creator for model lookup
-  const creatorRes = await pool.query("SELECT creator_id FROM scenarios WHERE scenario_id = $1", [scenarioId]);
+  // Parse against the scenario's own workspace (not the caller's active
+  // one) so follow-ups always resolve the model the scenario was built on.
+  const creatorRes = await pool.query(
+    "SELECT creator_id, workspace_id FROM scenarios WHERE scenario_id = $1",
+    [scenarioId]
+  );
   const creatorId = creatorRes.rows[0]?.creator_id;
-  const parseResult = await parseScenario(nlInput, creatorId);
+  let scenarioWorkspaceId: string | undefined = creatorRes.rows[0]?.workspace_id ?? undefined;
+  if (creatorId && !scenarioWorkspaceId) {
+    const { ensureDefaultWorkspace } = await import("./workspaceService.js");
+    scenarioWorkspaceId = await ensureDefaultWorkspace(creatorId);
+  }
+  const parseResult = await parseScenario(
+    nlInput,
+    creatorId && scenarioWorkspaceId ? { userId: creatorId, workspaceId: scenarioWorkspaceId } : undefined
+  );
 
   const added: { name: string; mapped_variable_id: string; scenario_value: number }[] = [];
 

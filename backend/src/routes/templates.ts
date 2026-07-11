@@ -78,7 +78,12 @@ templatesRouter.delete("/:id", requireRole("analyst"), async (req, res) => {
 templatesRouter.post("/:id/clone", requireRole("analyst"), async (req, res) => {
   try {
     const nlInput = req.body.nl_input as string | undefined;
-    const scenarioId = await cloneTemplateToScenario(req.params.id, req.user!.userId, nlInput);
+    const scenarioId = await cloneTemplateToScenario(
+      req.params.id,
+      req.user!.userId,
+      req.workspace!.workspaceId,
+      nlInput
+    );
     return res.status(201).json({ scenario_id: scenarioId });
   } catch (e) {
     const msg = (e as Error).message;

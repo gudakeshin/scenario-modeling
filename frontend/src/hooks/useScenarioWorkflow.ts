@@ -19,6 +19,7 @@ import type { Message, ThinkingData } from "@/types/chat";
 import { useChatStore } from "@/stores/chatStore";
 import { useUiStore } from "@/stores/uiStore";
 import { useSessionStore } from "@/stores/sessionStore";
+import { useWorkspaceStore } from "@/stores/workspaceStore";
 
 function generateId() {
   return Math.random().toString(36).slice(2) + Date.now().toString(36);
@@ -52,16 +53,27 @@ export function useScenarioWorkflow() {
   const setSession = useSessionStore((s) => s.setSession);
   const clearSession = useSessionStore((s) => s.clearSession);
 
-  // Initialize user context on mount (resolves cached user identity) + check onboarding
+  const activeWorkspaceId = useWorkspaceStore((s) => s.activeWorkspaceId);
+  const workspacesLoaded = useWorkspaceStore((s) => s.loaded);
+  const loadWorkspaces = useWorkspaceStore((s) => s.loadWorkspaces);
+
+  // Resolve the workspace list once so the persisted active id is validated
+  // before workspace-scoped fetches run.
+  useEffect(() => {
+    if (!workspacesLoaded) loadWorkspaces().catch(() => {});
+  }, [workspacesLoaded, loadWorkspaces]);
+
+  // Initialize user context + check onboarding; re-runs on workspace switch
+  // (onboarding status, model, and currency are all workspace-scoped).
   useEffect(() => {
     initUserContext().catch(() => {});
     getOnboardingStatus().then((s) => {
       setOnboardingStatus(s);
       if (s.currency) setCurrency(s.currency, s.currency_unit);
     }).catch(() => {});
-  }, [setOnboardingStatus]);
+  }, [setOnboardingStatus, activeWorkspaceId]);
 
-  // Load existing scenarios from the database on mount so they persist across navigation
+  // Load the workspace's scenarios; re-runs on workspace switch
   useEffect(() => {
     listScenarios()
       .then((scenarios) => {
@@ -91,7 +103,7 @@ export function useScenarioWorkflow() {
       .catch(() => {
         // If API is not reachable, silently continue with empty state
       });
-  }, [setConversations]);
+  }, [setConversations, activeWorkspaceId]);
 
   const active = activeId ? conversations.find((c) => c.id === activeId) : null;
   const messages = active?.messages ?? [];

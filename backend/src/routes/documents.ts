@@ -9,6 +9,7 @@ import { queryDocument } from "../services/ragService.js";
 import { isLlamaParseConfigured, testLlamaParseConnection } from "../services/llamaParseService.js";
 import { requireRole } from "../middleware/rbac.js";
 import { assertCanReadDocument } from "../services/authzService.js";
+import { scopeOf } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
 
 export const documentsRouter = Router();
@@ -54,13 +55,14 @@ documentsRouter.post("/upload", requireRole("analyst"), (req, res, next) => {
       return res.status(400).json({ error: "No file uploaded" });
     }
 
-    const userId = req.user!.userId;
+    const scope = scopeOf(req);
 
     const doc = await processDocument(
       req.file.buffer,
       req.file.originalname,
       req.file.mimetype || req.file.originalname.split(".").pop() || "unknown",
-      userId
+      scope.userId,
+      scope.workspaceId
     );
 
     return res.status(201).json({ ...doc, context_hint: "Document uploaded. Click 'Build Context' to analyze all documents and create/update your company model." });
@@ -75,7 +77,7 @@ documentsRouter.post("/upload", requireRole("analyst"), (req, res, next) => {
 // ── List documents ──
 documentsRouter.get("/", async (req, res) => {
   try {
-    const docs = await listDocuments(req.user!.userId, req.user!.role);
+    const docs = await listDocuments(req.user!.userId, req.user!.role, req.workspace!.workspaceId);
     return res.json({ documents: docs });
   } catch (e) {
     logger.error({ err: e }, "Request failed");
@@ -109,11 +111,15 @@ documentsRouter.post("/:id/query", async (req, res) => {
     await assertCanReadDocument(req.user!.userId, req.user!.role, req.params.id);
     const doc = await getDocument(req.params.id);
     if (!doc) return res.status(404).json({ error: "Document not found" });
+    // Strict isolation: documents are only queryable from their own workspace.
+    if ((doc as { workspace_id?: string }).workspace_id !== req.workspace!.workspaceId) {
+      return res.status(404).json({ error: "Document not found" });
+    }
     if (doc.status !== "ready") {
       return res.status(400).json({ error: `Document is still ${doc.status}. Please wait.` });
     }
 
-    const result = await queryDocument(question, req.params.id);
+    const result = await queryDocument(question, req.workspace!.workspaceId, req.params.id);
     return res.json(result);
   } catch (e) {
     const status = authzError(e);
@@ -131,7 +137,7 @@ documentsRouter.post("/query", async (req, res) => {
       return res.status(400).json({ error: "question is required" });
     }
 
-    const result = await queryDocument(question);
+    const result = await queryDocument(question, req.workspace!.workspaceId);
     return res.json(result);
   } catch (e) {
     logger.error({ err: e }, "Request failed");

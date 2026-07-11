@@ -13,6 +13,7 @@ import {
 import { buildContextForUser } from "../services/contextEngineFactory.js";
 import { pool } from "../db/index.js";
 import { requireRole } from "../middleware/rbac.js";
+import { scopeOf } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
 
 export const contextRouter = Router();
@@ -20,8 +21,7 @@ export const contextRouter = Router();
 // ── Build context from uploaded documents ──
 contextRouter.post("/build", requireRole("analyst"), async (req, res) => {
   try {
-    const userId = req.user!.userId;
-    const ctx = await buildContextForUser(userId);
+    const ctx = await buildContextForUser(scopeOf(req));
     return res.status(201).json(ctx);
   } catch (e) {
     logger.error({ err: e }, "[Context] Build failed:");
@@ -35,18 +35,18 @@ contextRouter.post("/build", requireRole("analyst"), async (req, res) => {
 // ── Get current context ──
 contextRouter.get("/", async (req, res) => {
   try {
-    const userId = req.user!.userId;
-    const ctx = await getActiveContext(userId);
+    const scope = scopeOf(req);
+    const ctx = await getActiveContext(scope);
     if (!ctx) return res.json({ context: null, message: "No context found. Upload documents and build context." });
     const docRes = await pool.query(
       `SELECT document_id, validation_status
        FROM documents
-       WHERE created_by = $1
+       WHERE workspace_id = $1
          AND status = 'ready'
          AND document_kind = 'spreadsheet_model'
        ORDER BY created_at DESC
        LIMIT 1`,
-      [userId],
+      [scope.workspaceId],
     );
     return res.json({
       context: ctx,
@@ -66,8 +66,7 @@ contextRouter.get("/", async (req, res) => {
 // ── Update context data ──
 contextRouter.put("/", requireRole("analyst"), async (req, res) => {
   try {
-    const userId = req.user!.userId;
-    const existing = await getActiveContext(userId);
+    const existing = await getActiveContext(scopeOf(req));
     if (!existing) return res.status(404).json({ error: "No active context to update" });
     const updated = await updateContext(existing.context_id, req.body);
     return res.json(updated);
@@ -80,8 +79,7 @@ contextRouter.put("/", requireRole("analyst"), async (req, res) => {
 // ── Delete context (reset) ──
 contextRouter.delete("/", requireRole("analyst"), async (req, res) => {
   try {
-    const userId = req.user!.userId;
-    await deleteContext(userId);
+    await deleteContext(scopeOf(req));
     return res.json({ deleted: true });
   } catch (e) {
     logger.error({ err: e }, "Request failed");
@@ -92,8 +90,7 @@ contextRouter.delete("/", requireRole("analyst"), async (req, res) => {
 // ── Get active model ──
 contextRouter.get("/model", async (req, res) => {
   try {
-    const userId = req.user!.userId;
-    const model = await getActiveModel(userId);
+    const model = await getActiveModel(scopeOf(req));
     if (!model) return res.json({ model: null, message: "No model found. Build context from documents first." });
     return res.json({ model });
   } catch (e) {
@@ -105,12 +102,12 @@ contextRouter.get("/model", async (req, res) => {
 // ── Update model definition ──
 contextRouter.put("/model", requireRole("analyst"), async (req, res) => {
   try {
-    const userId = req.user!.userId;
-    const model = await getActiveModel(userId);
+    const scope = scopeOf(req);
+    const model = await getActiveModel(scope);
     if (!model) return res.status(404).json({ error: "No active model to update" });
     if (!req.body.model_definition) return res.status(400).json({ error: "model_definition is required" });
     await updateModel(model.model_id, req.body.model_definition);
-    const updated = await getActiveModel(userId);
+    const updated = await getActiveModel(scope);
     return res.json({ model: updated });
   } catch (e) {
     logger.error({ err: e }, "Request failed");
@@ -121,19 +118,19 @@ contextRouter.put("/model", requireRole("analyst"), async (req, res) => {
 // ── Check onboarding status (context + model existence) ──
 contextRouter.get("/status", async (req, res) => {
   try {
-    const userId = req.user!.userId;
-    const ctx = await getActiveContext(userId);
-    const model = await getActiveModel(userId);
+    const scope = scopeOf(req);
+    const ctx = await getActiveContext(scope);
+    const model = await getActiveModel(scope);
     const ctxData = ctx?.context_data as Record<string, unknown> | undefined;
     const latestSpreadsheet = await pool.query(
       `SELECT validation_status
        FROM documents
-       WHERE created_by = $1
+       WHERE workspace_id = $1
          AND status = 'ready'
          AND document_kind = 'spreadsheet_model'
        ORDER BY created_at DESC
        LIMIT 1`,
-      [userId],
+      [scope.workspaceId],
     );
     return res.json({
       has_context: !!ctx,
@@ -155,21 +152,21 @@ contextRouter.get("/status", async (req, res) => {
 // ── Validate latest spreadsheet model schema (analyst gate) ──
 contextRouter.post("/model/validate", requireRole("analyst"), async (req, res) => {
   try {
-    const userId = req.user!.userId;
+    const scope = scopeOf(req);
     const targetDocId = req.body?.document_id as string | undefined;
 
     const docRes = targetDocId
       ? await pool.query(
           `SELECT document_id FROM documents
-           WHERE document_id = $1 AND created_by = $2 AND document_kind = 'spreadsheet_model'`,
-          [targetDocId, userId],
+           WHERE document_id = $1 AND workspace_id = $2 AND document_kind = 'spreadsheet_model'`,
+          [targetDocId, scope.workspaceId],
         )
       : await pool.query(
           `SELECT document_id FROM documents
-           WHERE created_by = $1 AND document_kind = 'spreadsheet_model' AND model_schema IS NOT NULL
+           WHERE workspace_id = $1 AND document_kind = 'spreadsheet_model' AND model_schema IS NOT NULL
            ORDER BY created_at DESC
            LIMIT 1`,
-          [userId],
+          [scope.workspaceId],
         );
     if (docRes.rows.length === 0) {
       return res.status(404).json({ error: "No spreadsheet model found for validation" });
@@ -183,7 +180,7 @@ contextRouter.post("/model/validate", requireRole("analyst"), async (req, res) =
       [documentId],
     );
 
-    const existing = await getActiveContext(userId);
+    const existing = await getActiveContext(scope);
     if (existing) {
       await updateContext(existing.context_id, { validation_status: "ready" } as never);
     }

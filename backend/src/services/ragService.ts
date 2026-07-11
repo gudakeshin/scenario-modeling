@@ -22,9 +22,10 @@ export interface RAGResponse {
 
 export async function queryDocument(
   question: string,
+  workspaceId: string,
   documentId?: string
 ): Promise<RAGResponse> {
-  const results = await searchDocumentChunksInDb(question, TOP_K, documentId);
+  const results = await searchDocumentChunksInDb(question, workspaceId, TOP_K, documentId);
 
   if (results.length === 0) {
     return {

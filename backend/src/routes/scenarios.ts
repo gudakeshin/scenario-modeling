@@ -20,7 +20,8 @@ import {
   assertCanWriteScenario,
   scenarioVisibilityClause,
 } from "../services/authzService.js";
-import { getUserModelId, getUserModelDefinition } from "../models/registry.js";
+import { getWorkspaceModelId, getWorkspaceModelDefinition } from "../models/registry.js";
+import { scopeOf } from "../middleware/workspace.js";
 import {
   ensureScenarioContext,
   mergeTouchedLevers,
@@ -56,8 +57,7 @@ function sanitize(s: string): string {
 scenariosRouter.get("/base-case", async (req, res) => {
   try {
     const { computeBaseCase: compute, getPLMetrics: getMetrics } = await import("../models/registry.js");
-    const userId = req.user!.userId;
-    const model = await getUserModelDefinition(userId);
+    const model = await getWorkspaceModelDefinition(req.workspace!.workspaceId);
     if (!model) {
       return res.json({ pl: {}, all_variables: {}, time_horizon: null, needs_onboarding: true });
     }
@@ -95,8 +95,7 @@ scenariosRouter.post("/parse", requireRole("analyst"), validateBody(parseScenari
   try {
     const nl_input = sanitize(req.body.nl_input).slice(0, config.MAX_INPUT_LENGTH);
     if (!nl_input) return res.status(400).json({ error: "nl_input is required" });
-    const userId = req.user!.userId;
-    const result = await parseScenario(nl_input, userId);
+    const result = await parseScenario(nl_input, scopeOf(req));
     return res.json(result);
   } catch (e) {
     logger.error({ err: e }, "Request failed");
@@ -109,10 +108,11 @@ scenariosRouter.post("/", requireRole("analyst"), validateBody(createScenarioSch
     const { nl_input: rawInput, name } = req.body;
     const nl_input = sanitize(rawInput).slice(0, config.MAX_INPUT_LENGTH);
     if (!nl_input) return res.status(400).json({ error: "nl_input is required" });
-    const creatorId = req.user!.userId;
+    const scope = scopeOf(req);
+    const creatorId = scope.userId;
 
-    // Look up the user's active model
-    const modelId = await getUserModelId(creatorId);
+    // Look up the workspace's active model
+    const modelId = await getWorkspaceModelId(scope.workspaceId);
     if (!modelId) {
       return res.status(400).json({
         error: "No model found. Please upload documents and build your company context first.",
@@ -124,13 +124,13 @@ scenariosRouter.post("/", requireRole("analyst"), validateBody(createScenarioSch
     const autoName = name || nl_input.trim().split(/[.?!\n]/)[0].slice(0, 80).trim() || "Untitled Scenario";
 
     const r = await pool.query(
-      `INSERT INTO scenarios (nl_input, name, status, creator_id, model_version_hash)
-       VALUES ($1, $2, 'draft', $3, $4)
+      `INSERT INTO scenarios (nl_input, name, status, creator_id, workspace_id, model_version_hash)
+       VALUES ($1, $2, 'draft', $3, $4, $5)
        RETURNING scenario_id, nl_input, name, status, created_at`,
-      [nl_input.trim(), autoName, creatorId, modelId]
+      [nl_input.trim(), autoName, creatorId, scope.workspaceId, modelId]
     );
     const row = r.rows[0];
-    const parseResult = await parseScenario(nl_input.trim(), creatorId);
+    const parseResult = await parseScenario(nl_input.trim(), scope);
     const scenarioId = row.scenario_id;
     ensureScenarioContext(scenarioId);
     const paramsWithMapping: { name: string; mapped_variable_id: string; scenario_value: number; confidence: number }[] = [];
@@ -218,9 +218,18 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
       return res.status(400).json({ error: "answers array is required" });
     }
 
-    // Get original scenario input
-    const sRes = await pool.query("SELECT nl_input FROM scenarios WHERE scenario_id = $1", [sid]);
+    // Get original scenario input plus its workspace — refinement must parse
+    // against the scenario's own workspace, not the caller's active one.
+    const sRes = await pool.query(
+      "SELECT nl_input, creator_id, workspace_id FROM scenarios WHERE scenario_id = $1",
+      [sid]
+    );
     if (sRes.rows.length === 0) return res.status(404).json({ error: "Scenario not found" });
+    let scenarioWorkspaceId: string | null = sRes.rows[0].workspace_id;
+    if (!scenarioWorkspaceId) {
+      const { ensureDefaultWorkspace } = await import("../services/workspaceService.js");
+      scenarioWorkspaceId = await ensureDefaultWorkspace(sRes.rows[0].creator_id);
+    }
 
     // Build an enriched input that combines the original query with the user's answers
     const originalInput = sRes.rows[0].nl_input;
@@ -231,7 +240,10 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
 
     // Re-parse with the enriched input
     await hydrateScenarioContext(sid);
-    const parseResult = await parseScenario(enrichedInput, userId);
+    const parseResult = await parseScenario(enrichedInput, {
+      userId: sRes.rows[0].creator_id,
+      workspaceId: scenarioWorkspaceId,
+    });
 
     // Persist enriched input so downstream operations (narrative, analysis) have full context
     // Also reset status to 'draft' since parameters are being replaced
@@ -297,9 +309,10 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
 
 scenariosRouter.get("/", async (req, res) => {
   try {
-    const vis = scenarioVisibilityClause(req.user!.userId, req.user!.role);
+    const vis = scenarioVisibilityClause(req.user!.userId, req.user!.role, req.workspace!.workspaceId);
     const r = await pool.query(
-      `SELECT s.scenario_id, s.name, s.nl_input, s.status, s.created_at, s.updated_at
+      `SELECT s.scenario_id, s.name, s.nl_input, s.status, s.created_at, s.updated_at,
+              (s.creator_id <> $1) AS is_shared_with_me
        FROM scenarios s WHERE ${vis.sql} ORDER BY s.created_at DESC LIMIT 100`,
       vis.params
     );

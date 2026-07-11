@@ -20,6 +20,8 @@ import { contextRouter } from "./routes/context.js";
 import { authRouter } from "./routes/auth.js";
 import { authenticate } from "./auth/middleware.js";
 import { requireRole } from "./middleware/rbac.js";
+import { resolveWorkspace } from "./middleware/workspace.js";
+import { workspacesRouter } from "./routes/workspaces.js";
 import { startServer } from "./server.js";
 
 const app = express();
@@ -103,9 +105,10 @@ app.get("/metrics", async (_req, res) => {
 
 app.use("/api/v1/auth", authLimiter, authRouter);
 
-// All other API routes require authentication
-app.use("/api/v1", authenticate, apiLimiter);
+// All other API routes require authentication and an active workspace scope
+app.use("/api/v1", authenticate, resolveWorkspace, apiLimiter);
 
+app.use("/api/v1/workspaces", workspacesRouter);
 app.use("/api/v1/scenarios", scenariosRouter);
 app.use("/api/v1/scenarios", exportsRouter);
 app.use("/api/v1/mappings", requireRole("analyst"), mappingsRouter);

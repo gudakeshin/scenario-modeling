@@ -8,9 +8,10 @@
 
 import { z } from "zod";
 import { getApiKey, callClaudeStructured } from "./llmClient.js";
-import { getUserModelDefinition, describeModelForLLM } from "../models/registry.js";
+import { getWorkspaceModelDefinition, describeModelForLLM } from "../models/registry.js";
 import { describeContextForLLM } from "./contextEngine.js";
 import type { SearchResult } from "./searchService.js";
+import type { Scope } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
 
 const reflectionSchema = z.object({
@@ -43,20 +44,20 @@ export interface ReflectionResult {
 export async function reflect(
   nlInput: string,
   searchContext?: SearchResult | null,
-  userId?: string
+  scope?: Scope
 ): Promise<ReflectionResult | null> {
   if (!getApiKey()) return null;
 
   const startTime = Date.now();
 
   try {
-    // Load user's model and company context
-    if (!userId) return null;
-    const model = await getUserModelDefinition(userId);
+    // Load the workspace's model and company context
+    if (!scope) return null;
+    const model = await getWorkspaceModelDefinition(scope.workspaceId);
     if (!model) return null; // No model = can't reflect meaningfully
 
     const modelDesc = describeModelForLLM(model);
-    const contextDesc = await describeContextForLLM(userId);
+    const contextDesc = await describeContextForLLM(scope);
 
     let contextBlock = "";
     if (contextDesc) {

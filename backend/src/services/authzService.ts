@@ -92,21 +92,25 @@ export async function assertCanWriteScenario(
   }
 }
 
-/** SQL fragment + params for listing scenarios visible to the user. */
+/**
+ * SQL fragment + params for listing scenarios visible to the user.
+ * Own scenarios are filtered to the active workspace; scenarios shared with
+ * the user stay visible regardless of their active workspace (they live in
+ * another user's workspace, which the viewer can never select). Applies to
+ * admins too — row-level admin access via explicit id is unchanged.
+ */
 export function scenarioVisibilityClause(
   userId: string,
   role: Role,
+  workspaceId: string,
   alias = "s"
 ): { sql: string; params: unknown[] } {
-  if (role === "admin") {
-    return { sql: "TRUE", params: [] };
-  }
   return {
-    sql: `(${alias}.creator_id = $1 OR EXISTS (
+    sql: `((${alias}.creator_id = $1 AND ${alias}.workspace_id = $2) OR EXISTS (
       SELECT 1 FROM scenario_sharing ss
       WHERE ss.scenario_id = ${alias}.scenario_id AND ss.shared_with = $1
     ))`,
-    params: [userId],
+    params: [userId, workspaceId],
   };
 }
 
