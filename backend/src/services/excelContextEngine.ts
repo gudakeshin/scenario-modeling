@@ -1,0 +1,562 @@
+import { z } from "zod";
+import { pool, resolveUserId } from "../db/index.js";
+import { callClaudeStructured, getApiKey } from "./llmClient.js";
+import type { ModelDefinition } from "../models/registry.js";
+import type { WorkbookGraph } from "./excelExtractor.js";
+import type { CompanyContext } from "./contextEngine.js";
+
+const modelSchemaZ = z.object({
+  company: z.string().default(""),
+  industry: z.string().default(""),
+  currency: z.string().default(""),
+  unit: z.string().default(""),
+  fiscalYear: z.string().default(""),
+  scenarioLevers: z.array(z.object({
+    id: z.string(),
+    label: z.string(),
+    type: z.string().default("input_driver"),
+    category: z.string().default("assumption"),
+    scenarios: z.object({
+      base: z.number().optional(),
+      bull: z.number().optional(),
+      bear: z.number().optional(),
+    }).default({}),
+    affectsSheets: z.array(z.string()).default([]),
+    unit: z.string().default("value"),
+  })).default([]),
+  outputMetrics: z.array(z.object({
+    id: z.string(),
+    label: z.string(),
+    sheet: z.string().default(""),
+    row: z.number().default(0),
+    isKPI: z.boolean().default(false),
+  })).default([]),
+  timeDimension: z.object({
+    granularity: z.enum(["monthly", "quarterly"]).default("quarterly"),
+    periods: z.number().default(4),
+    columns: z.array(z.string()).default([]),
+  }).default({}),
+  baseValues: z.record(z.number()).default({}),
+});
+
+interface ModelSchemaLever {
+  id: string;
+  label: string;
+  type: string;
+  category: string;
+  scenarios?: { base?: number; bull?: number; bear?: number };
+  affectsSheets: string[];
+  unit: string;
+}
+
+interface ModelSchemaOutput {
+  id: string;
+  label: string;
+  sheet: string;
+  row: number;
+  isKPI: boolean;
+}
+
+export interface ModelSchema {
+  company: string;
+  industry: string;
+  currency: string;
+  unit: string;
+  fiscalYear: string;
+  scenarioLevers: ModelSchemaLever[];
+  outputMetrics: ModelSchemaOutput[];
+  timeDimension: { granularity: "monthly" | "quarterly"; periods: number; columns: string[] };
+  baseValues: Record<string, number>;
+}
+
+interface ExtractionQualityReport {
+  iteration: number;
+  leverCoverage: { nonZero: number; total: number; pct: number };
+  metricCoverage: { nonZero: number; total: number; pct: number };
+  candidateAlignment: { leverMatches: number; leverTotal: number; metricMatches: number; metricTotal: number };
+  passes: boolean;
+  issues: string[];
+}
+
+function toId(label: string): string {
+  return label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function safeNumber(value: unknown, fallback = 0): number {
+  const n = Number(value);
+  return Number.isFinite(n) ? n : fallback;
+}
+
+function normalizeModelSchema(schema: ModelSchema, docName: string, graph: WorkbookGraph): ModelSchema {
+  const inputCandidateById = new Map(
+    (graph.inputCandidates || []).map((c) => [toId(c.id || c.label || "input"), safeNumber(c.value, 0)]),
+  );
+  const outputCandidateById = new Map(
+    (graph.outputCandidates || []).map((c) => [toId(c.id || c.label || "metric"), safeNumber(c.value, 0)]),
+  );
+
+  const parsedLevers: ModelSchemaLever[] = (schema.scenarioLevers || [])
+    .filter((l): l is ModelSchemaLever => !!l && typeof l === "object")
+    .map((l) => ({
+      id: toId(l.id || l.label || "lever"),
+      label: l.label || l.id || "Lever",
+      type: l.type || "input_driver",
+      category: l.category || "driver",
+      scenarios: {
+        base: (() => {
+          const parsedBase = safeNumber(l.scenarios?.base, 0);
+          if (Math.abs(parsedBase) > 0) return parsedBase;
+          return inputCandidateById.get(toId(l.id || l.label || "lever")) ?? parsedBase;
+        })(),
+        bull: safeNumber(l.scenarios?.bull, safeNumber(l.scenarios?.base, 0)),
+        bear: safeNumber(l.scenarios?.bear, safeNumber(l.scenarios?.base, 0)),
+      },
+      affectsSheets: Array.isArray(l.affectsSheets) ? l.affectsSheets : [],
+      unit: l.unit || "value",
+    }));
+  const fallbackLevers: ModelSchemaLever[] = (graph.inputCandidates || []).slice(0, 25).map((c) => ({
+    id: toId(c.id || c.label || "input"),
+    label: c.label || c.id,
+    type: "input_driver",
+    category: "assumption",
+    scenarios: {
+      base: safeNumber(c.value, 0),
+      bull: safeNumber(c.value, 0) * 1.1,
+      bear: safeNumber(c.value, 0) * 0.9,
+    },
+    affectsSheets: [c.sheet],
+    unit: "value",
+  }));
+  const normalizedLevers = parsedLevers.length > 0 ? parsedLevers : fallbackLevers;
+
+  const parsedOutputs: ModelSchemaOutput[] = (schema.outputMetrics || [])
+    .filter((m): m is ModelSchemaOutput => !!m && typeof m === "object")
+    .map((m, idx) => ({
+      id: toId(m.id || m.label || `metric_${idx + 1}`),
+      label: m.label || m.id || `Metric ${idx + 1}`,
+      sheet: m.sheet || Object.keys(graph.sheets)[0] || "Sheet1",
+      row: Number(m.row || idx + 1),
+      isKPI: Boolean(m.isKPI),
+    }));
+  const fallbackOutputs: ModelSchemaOutput[] = (graph.outputCandidates || []).slice(0, 20).map((c) => ({
+    id: toId(c.id || c.label || "metric"),
+    label: c.label || c.id,
+    sheet: c.sheet,
+    row: c.row,
+    isKPI: true,
+  }));
+  const normalizedOutputs = parsedOutputs.length > 0 ? parsedOutputs : fallbackOutputs;
+  const fallbackBaseValues: Record<string, number> = {};
+  for (const c of graph.outputCandidates || []) {
+    fallbackBaseValues[toId(c.id || c.label || "metric")] = safeNumber(c.value, 0);
+  }
+  const parsedBaseValues = schema.baseValues || {};
+  const normalizedBaseValues: Record<string, number> = { ...fallbackBaseValues };
+  for (const [k, v] of Object.entries(parsedBaseValues)) {
+    const parsed = safeNumber(v, 0);
+    if (Math.abs(parsed) > 0) {
+      normalizedBaseValues[k] = parsed;
+    } else if (outputCandidateById.has(k)) {
+      normalizedBaseValues[k] = outputCandidateById.get(k) || 0;
+    } else {
+      normalizedBaseValues[k] = parsed;
+    }
+  }
+
+  return {
+    company: schema.company || docName,
+    industry: schema.industry || "Unknown",
+    currency: schema.currency || graph.currency || "USD",
+    unit: schema.unit || graph.unit || "Million",
+    fiscalYear: schema.fiscalYear || "FY-Current",
+    scenarioLevers: normalizedLevers,
+    outputMetrics: normalizedOutputs,
+    timeDimension: {
+      granularity: schema.timeDimension?.granularity === "monthly" ? "monthly" : "quarterly",
+      periods: Number(schema.timeDimension?.periods || graph.timeAxis?.columns?.length || 4),
+      columns: Array.isArray(schema.timeDimension?.columns)
+        ? schema.timeDimension.columns
+        : (graph.timeAxis?.columns || []),
+    },
+    baseValues: normalizedBaseValues,
+  };
+}
+
+function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelSchema {
+  const leverById = new Map(schema.scenarioLevers.map((l) => [toId(l.id), l]));
+  const outputById = new Map(schema.outputMetrics.map((m) => [toId(m.id), m]));
+
+  // Fill and add levers from candidates.
+  for (const c of graph.inputCandidates || []) {
+    const cid = toId(c.id || c.label || "input");
+    const cVal = safeNumber(c.value, 0);
+    const existing = leverById.get(cid);
+    if (existing) {
+      const base = safeNumber(existing.scenarios?.base, 0);
+      if (Math.abs(base) === 0 && Math.abs(cVal) > 0) {
+        existing.scenarios = {
+          base: cVal,
+          bull: safeNumber(existing.scenarios?.bull, cVal * 1.1),
+          bear: safeNumber(existing.scenarios?.bear, cVal * 0.9),
+        };
+      }
+      continue;
+    }
+    if (Math.abs(cVal) > 0) {
+      const newLever: ModelSchemaLever = {
+        id: cid,
+        label: c.label || c.id,
+        type: "input_driver",
+        category: "assumption",
+        scenarios: { base: cVal, bull: cVal * 1.1, bear: cVal * 0.9 },
+        affectsSheets: [c.sheet],
+        unit: "value",
+      };
+      schema.scenarioLevers.push(newLever);
+      leverById.set(cid, newLever);
+    }
+  }
+
+  // Fill and add outputs from candidates.
+  for (const c of graph.outputCandidates || []) {
+    const cid = toId(c.id || c.label || "metric");
+    const cVal = safeNumber(c.value, 0);
+    if (!outputById.has(cid) && Math.abs(cVal) > 0) {
+      const metric: ModelSchemaOutput = {
+        id: cid,
+        label: c.label || c.id,
+        sheet: c.sheet,
+        row: c.row,
+        isKPI: true,
+      };
+      schema.outputMetrics.push(metric);
+      outputById.set(cid, metric);
+    }
+    const existingVal = safeNumber(schema.baseValues[cid], 0);
+    if (Math.abs(existingVal) === 0 && Math.abs(cVal) > 0) {
+      schema.baseValues[cid] = cVal;
+    }
+  }
+
+  return schema;
+}
+
+function evaluateExtractionQuality(schema: ModelSchema, graph: WorkbookGraph, iteration: number): ExtractionQualityReport {
+  const leverTotal = schema.scenarioLevers.length;
+  const leverNonZero = schema.scenarioLevers.filter((l) => Math.abs(safeNumber(l.scenarios?.base, 0)) > 0).length;
+  const metricTotal = schema.outputMetrics.length;
+  const metricNonZero = schema.outputMetrics.filter((m) => Math.abs(safeNumber(schema.baseValues[m.id], 0)) > 0).length;
+
+  const candidateLeverTotal = (graph.inputCandidates || []).filter((c) => Math.abs(safeNumber(c.value, 0)) > 0).length;
+  const candidateMetricTotal = (graph.outputCandidates || []).filter((c) => Math.abs(safeNumber(c.value, 0)) > 0).length;
+
+  let leverMatches = 0;
+  for (const c of graph.inputCandidates || []) {
+    const cid = toId(c.id || c.label || "input");
+    const expected = safeNumber(c.value, 0);
+    if (Math.abs(expected) === 0) continue;
+    const lever = schema.scenarioLevers.find((l) => toId(l.id) === cid);
+    if (lever && Math.abs(safeNumber(lever.scenarios?.base, 0)) > 0) leverMatches++;
+  }
+  let metricMatches = 0;
+  for (const c of graph.outputCandidates || []) {
+    const cid = toId(c.id || c.label || "metric");
+    const expected = safeNumber(c.value, 0);
+    if (Math.abs(expected) === 0) continue;
+    if (Math.abs(safeNumber(schema.baseValues[cid], 0)) > 0) metricMatches++;
+  }
+
+  const leverPct = leverTotal > 0 ? leverNonZero / leverTotal : 0;
+  const metricPct = metricTotal > 0 ? metricNonZero / metricTotal : 0;
+  const leverAlignPct = candidateLeverTotal > 0 ? leverMatches / candidateLeverTotal : 1;
+  const metricAlignPct = candidateMetricTotal > 0 ? metricMatches / candidateMetricTotal : 1;
+
+  const issues: string[] = [];
+  if (leverPct < 0.8) issues.push(`Lever non-zero coverage too low (${leverNonZero}/${leverTotal})`);
+  if (metricPct < 0.8) issues.push(`Metric non-zero coverage too low (${metricNonZero}/${metricTotal})`);
+  if (leverAlignPct < 0.7) issues.push(`Lever candidate alignment too low (${leverMatches}/${candidateLeverTotal})`);
+  if (metricAlignPct < 0.7) issues.push(`Metric candidate alignment too low (${metricMatches}/${candidateMetricTotal})`);
+  if (graph.dependencies.length > 0 && metricTotal === 0) issues.push("Dependency graph exists but no output metrics were extracted");
+
+  return {
+    iteration,
+    leverCoverage: { nonZero: leverNonZero, total: leverTotal, pct: leverPct },
+    metricCoverage: { nonZero: metricNonZero, total: metricTotal, pct: metricPct },
+    candidateAlignment: {
+      leverMatches,
+      leverTotal: candidateLeverTotal,
+      metricMatches,
+      metricTotal: candidateMetricTotal,
+    },
+    passes: issues.length === 0,
+    issues,
+  };
+}
+
+async function repairModelSchemaWithFeedback(
+  schema: ModelSchema,
+  graph: WorkbookGraph,
+  docName: string,
+  report: ExtractionQualityReport,
+): Promise<ModelSchema> {
+  if (!getApiKey()) return schema;
+  const system = `You are repairing a financial ModelSchema extraction.
+Return JSON only.
+Focus on non-zero value recovery and alignment with workbook candidates.
+Do not invent unrealistic values. Prefer candidate values when available.`;
+  const userMessage = `Document: ${docName}
+Current schema JSON:
+${JSON.stringify(schema).slice(0, 100000)}
+
+Workbook candidates:
+inputCandidates=${JSON.stringify((graph.inputCandidates || []).slice(0, 1000))}
+outputCandidates=${JSON.stringify((graph.outputCandidates || []).slice(0, 1000))}
+
+Quality issues:
+${report.issues.map((x) => `- ${x}`).join("\n")}
+
+Repair requirements:
+1) Maximize non-zero seeded levers and metrics from candidates.
+2) Preserve existing ids when possible; normalize to snake_case.
+3) Ensure baseValues has non-zero entries for outputMetrics when candidate exists.
+4) Ensure scenarioLevers.base is non-zero when candidate exists.
+`;
+  const repaired = await callClaudeStructured({
+    system,
+    userMessage,
+    schema: modelSchemaZ,
+    toolName: "submit_repaired_schema",
+    toolDescription: "Submit the repaired financial model schema",
+    temperature: 0.0,
+    maxTokens: 2500,
+    purpose: "context_build",
+  });
+  return normalizeModelSchema(repaired, docName, graph);
+}
+
+function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema {
+  const timeCols = graph.timeAxis?.columns || [];
+  const periods = timeCols.length > 0 ? timeCols.length : 4;
+  const granularity = timeCols.some((c) => /q[1-4]/i.test(c)) ? "quarterly" : "monthly";
+  const summarySheet = Object.entries(graph.sheets).find(([, s]) => s.role === "summary")?.[0] || Object.keys(graph.sheets)[0] || "Sheet1";
+
+  const scenarioLevers: ModelSchemaLever[] = (graph.inputCandidates || []).slice(0, 20).map((c) => ({
+    id: toId(c.id || c.label),
+    label: c.label,
+    type: "input_driver",
+    category: "assumption",
+    scenarios: {
+      base: safeNumber(c.value, 0),
+      bull: safeNumber(c.value, 0) * 1.1,
+      bear: safeNumber(c.value, 0) * 0.9,
+    },
+    affectsSheets: [c.sheet],
+    unit: "value",
+  }));
+  if (scenarioLevers.length === 0 && graph.scenarioToggle) {
+    scenarioLevers.push({
+      id: "scenario_selector",
+      label: "Scenario Selector",
+      type: "selector",
+      category: "scenario_driver",
+      scenarios: { base: 0, bull: 1, bear: -1 },
+      affectsSheets: Object.keys(graph.sheets),
+      unit: "index",
+    });
+  }
+
+  const outputMetrics: ModelSchemaOutput[] = (graph.outputCandidates || []).slice(0, 12).map((c) => ({
+    id: toId(c.id || c.label),
+    label: c.label,
+    sheet: c.sheet || summarySheet,
+    row: c.row,
+    isKPI: true,
+  }));
+  if (outputMetrics.length === 0) {
+    outputMetrics.push(
+      { id: "revenue", label: "Revenue", sheet: summarySheet, row: 1, isKPI: true },
+      { id: "ebitda", label: "EBITDA", sheet: summarySheet, row: 2, isKPI: true },
+      { id: "net_income", label: "Net Income", sheet: summarySheet, row: 3, isKPI: true },
+    );
+  }
+
+  const baseValues: Record<string, number> = {};
+  for (const c of graph.outputCandidates || []) {
+    baseValues[toId(c.id || c.label)] = safeNumber(c.value, 0);
+  }
+
+  return {
+    company: docName,
+    industry: "Unknown",
+    currency: graph.currency || "USD",
+    unit: graph.unit || "Million",
+    fiscalYear: "FY-Current",
+    scenarioLevers,
+    outputMetrics,
+    timeDimension: { granularity, periods, columns: timeCols },
+    baseValues,
+  };
+}
+
+function toModelDefinition(schema: ModelSchema): ModelDefinition {
+  const variables = [
+    ...schema.scenarioLevers.map((lever) => ({
+      id: lever.id,
+      name: lever.label,
+      formula: String(lever.scenarios?.base ?? 0),
+      dependencies: [] as string[],
+      tags: ["input", "percent_delta"],
+    })),
+    ...schema.outputMetrics.map((m) => ({
+      id: m.id,
+      name: m.label,
+      formula: String(schema.baseValues[m.id] ?? 0),
+      dependencies: [] as string[],
+      tags: ["pl_metric", "output"],
+    })),
+  ];
+
+  const currentYear = new Date().getFullYear();
+  return {
+    model_version: `xlsx-${Date.now()}`,
+    variables,
+    time_horizon: {
+      start: `${currentYear}-Q1`,
+      end: `${currentYear}-Q4`,
+      granularity: schema.timeDimension.granularity === "monthly" ? "monthly" : "quarterly",
+    },
+  };
+}
+
+async function llmModelSchema(graph: WorkbookGraph, docName: string): Promise<ModelSchema> {
+  if (!getApiKey()) return fallbackModelSchema(graph, docName);
+
+  const system = `You are extracting an XLSX financial model schema from structured workbook graph JSON.
+Return JSON only.
+Required keys:
+company, industry, currency, unit, fiscalYear, scenarioLevers, outputMetrics, timeDimension, baseValues
+
+Rules:
+- scenarioLevers must use ids in snake_case.
+- Use numeric defaults for base/bull/bear.
+- outputMetrics should include KPI-like metrics from summary sheets.
+- Keep arrays concise and deterministic.`;
+
+  const parsed = await callClaudeStructured({
+    system,
+    userMessage: `Document name: ${docName}\nWorkbookGraph:\n${JSON.stringify(graph).slice(0, 120000)}`,
+    schema: modelSchemaZ,
+    toolName: "submit_model_schema",
+    toolDescription: "Submit the extracted financial model schema",
+    temperature: 0.1,
+    maxTokens: 2500,
+    purpose: "context_build",
+  });
+  return normalizeModelSchema(parsed, docName, graph);
+}
+
+export async function buildExcelContext(userIdentifier: string): Promise<CompanyContext> {
+  const userId = await resolveUserId(userIdentifier);
+  const docsRes = await pool.query(
+    `SELECT document_id, name, workbook_graph
+     FROM documents
+     WHERE created_by = $1
+       AND status = 'ready'
+       AND document_kind = 'spreadsheet_model'
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [userId],
+  );
+  if (docsRes.rows.length === 0) {
+    throw new Error("No processed XLSX model found. Upload an XLSX model first.");
+  }
+
+  const doc = docsRes.rows[0] as { document_id: string; name: string; workbook_graph: WorkbookGraph };
+  const workbookGraph = doc.workbook_graph;
+  if (!workbookGraph || !workbookGraph.sheets) {
+    throw new Error("Workbook graph is not available for the selected XLSX document.");
+  }
+
+  let modelSchema: ModelSchema;
+  try {
+    modelSchema = await llmModelSchema(workbookGraph, doc.name);
+  } catch {
+    modelSchema = normalizeModelSchema(fallbackModelSchema(workbookGraph, doc.name), doc.name, workbookGraph);
+  }
+  modelSchema = enrichFromCandidates(modelSchema, workbookGraph);
+
+  // Validation + feedback loop (deterministic repair + LLM-assisted correction)
+  const qualityIterations: ExtractionQualityReport[] = [];
+  const MAX_REPAIR_LOOPS = 3;
+  for (let i = 1; i <= MAX_REPAIR_LOOPS; i++) {
+    const report = evaluateExtractionQuality(modelSchema, workbookGraph, i);
+    qualityIterations.push(report);
+    if (report.passes) break;
+    modelSchema = enrichFromCandidates(modelSchema, workbookGraph);
+    if (report.passes) break;
+    try {
+      modelSchema = await repairModelSchemaWithFeedback(modelSchema, workbookGraph, doc.name, report);
+      modelSchema = enrichFromCandidates(modelSchema, workbookGraph);
+    } catch {
+      // Deterministic enrichment already applied; continue loop.
+    }
+  }
+  const finalQuality = qualityIterations[qualityIterations.length - 1];
+
+  await pool.query(
+    `UPDATE documents
+     SET model_schema = $1,
+         validation_status = 'needs_validation',
+         updated_at = NOW()
+     WHERE document_id = $2`,
+    [JSON.stringify(modelSchema), doc.document_id],
+  );
+
+  const contextData = {
+    company_name: modelSchema.company,
+    industry: modelSchema.industry,
+    currency: modelSchema.currency,
+    currency_unit: modelSchema.unit,
+    business_model: "Extracted from XLSX structural interpretation",
+    revenue_streams: [],
+    financial_metrics: [],
+    competitive_landscape: "",
+    key_risks: [],
+    benchmarks: {},
+    model_schema: modelSchema,
+    workbook_graph: workbookGraph,
+    extraction_quality: {
+      final: finalQuality,
+      iterations: qualityIterations,
+    },
+    validation_status: "needs_validation",
+  };
+
+  await pool.query("UPDATE company_context SET status = 'superseded' WHERE created_by = $1 AND status = 'active'", [userId]);
+  const ctxInsert = await pool.query(
+    `INSERT INTO company_context (created_by, company_name, industry, context_data, source_document_ids, status)
+     VALUES ($1, $2, $3, $4, $5, 'active')
+     RETURNING *`,
+    [userId, modelSchema.company, modelSchema.industry, JSON.stringify(contextData), [doc.document_id]],
+  );
+
+  await pool.query("UPDATE user_models SET is_active = false WHERE created_by = $1 AND is_active = true", [userId]);
+  const modelDef = toModelDefinition(modelSchema);
+  await pool.query(
+    `INSERT INTO user_models (created_by, name, model_definition, source_context_id, is_active)
+     VALUES ($1, $2, $3, $4, true)`,
+    [userId, `${modelSchema.company} XLSX Model`, JSON.stringify(modelDef), ctxInsert.rows[0].context_id],
+  );
+
+  const row = ctxInsert.rows[0];
+  return {
+    context_id: row.context_id,
+    company_name: row.company_name,
+    industry: row.industry,
+    context_data: row.context_data,
+    source_document_ids: row.source_document_ids,
+    status: row.status,
+    created_at: row.created_at,
+    updated_at: row.updated_at,
+  };
+}

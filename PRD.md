@@ -2,6 +2,8 @@
 
 ## Product Requirements Document (PRD)
 
+> **Historical note (July 2026):** Parts of this PRD still describe earlier design choices (e.g. Qdrant vector DB, header-based auth). Current product truth — local JWT auth, Postgres document search (optional embeddings), HyperFormula XLSX runtime, audit hash chain — is documented in **README.md** and `docs/adr/`. Prefer README when this PRD conflicts.
+
 **Status:** Engineering-Ready Spec — Active Development
 **Owner:** FP&A Product Team
 **Last Updated:** February 22, 2026

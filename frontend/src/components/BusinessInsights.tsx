@@ -2,6 +2,7 @@
 
 import { useState, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
+import { MarkdownContent } from "./MarkdownContent";
 import {
   generateBusinessAnalysis,
   type BusinessInsight,
@@ -11,6 +12,7 @@ import {
   type QAReport,
   type ReflectionStep,
 } from "@/lib/api";
+import { strings } from "@/lib/strings";
 
 interface BusinessInsightsProps {
   scenarioId: string;
@@ -88,7 +90,7 @@ function RecommendationCard({ item, index }: { item: BusinessRecommendation; ind
             </span>
             {item.owner && (
               <span className="text-[10px] text-[var(--text-faint)]">
-                \u2192 {item.owner}
+                → {item.owner}
               </span>
             )}
           </div>
@@ -209,7 +211,9 @@ export function BusinessInsights({ scenarioId, onClose, onMinimize, preloaded }:
           {/* Decision Context */}
           <section className="rounded-xl border-2 border-accent/20 bg-accent/5 p-4">
             <h4 className="text-xs font-semibold text-accent mb-1.5">Decision Framework</h4>
-            <p className="text-xs leading-relaxed text-[var(--text-secondary)]">{insight.decision_context}</p>
+            <div className="text-xs [&_p]:mb-1.5 leading-relaxed text-[var(--text-secondary)]">
+              <MarkdownContent content={insight.decision_context} />
+            </div>
           </section>
 
           {/* QA-BA Reflection Log */}
@@ -338,11 +342,32 @@ function QAScoreBar({ score }: { score: number }) {
 }
 
 function QAReportSection({ report }: { report: QAReport }) {
-  const hasError = report.overall_score === 0 || report.dimensions.some((d) => d.name === "qa_error");
-  const [expanded, setExpanded] = useState(hasError || !report.passed);
-  const scoreColor = hasError ? "text-[var(--danger)]" : report.overall_score >= 7 ? "text-[var(--success)]" : report.overall_score >= 5 ? "text-[var(--warning)]" : "text-[var(--danger)]";
-  const scoreBg = hasError ? "bg-[var(--danger-bg)]" : report.overall_score >= 7 ? "bg-[var(--success-bg)]" : report.overall_score >= 5 ? "bg-[var(--warning-bg)]" : "bg-[var(--danger-bg)]";
-  const borderColor = hasError ? "border-[var(--danger)]/40" : "border-[var(--card-border)]";
+  const notAssessed = report.status === "not_assessed";
+  const hasError = !notAssessed && (report.overall_score === 0 || report.dimensions.some((d) => d.name === "qa_error"));
+  const [expanded, setExpanded] = useState(notAssessed || hasError || !report.passed);
+  const scoreColor = notAssessed
+    ? "text-[var(--warning)]"
+    : hasError
+      ? "text-[var(--danger)]"
+      : report.overall_score >= 7
+        ? "text-[var(--success)]"
+        : report.overall_score >= 5
+          ? "text-[var(--warning)]"
+          : "text-[var(--danger)]";
+  const scoreBg = notAssessed
+    ? "bg-[var(--warning-bg)]"
+    : hasError
+      ? "bg-[var(--danger-bg)]"
+      : report.overall_score >= 7
+        ? "bg-[var(--success-bg)]"
+        : report.overall_score >= 5
+          ? "bg-[var(--warning-bg)]"
+          : "bg-[var(--danger-bg)]";
+  const borderColor = notAssessed
+    ? "border-[var(--warning)]/40"
+    : hasError
+      ? "border-[var(--danger)]/40"
+      : "border-[var(--card-border)]";
 
   return (
     <section className={`rounded-xl border ${borderColor} bg-[var(--card-bg)] overflow-hidden`}>
@@ -354,20 +379,29 @@ function QAReportSection({ report }: { report: QAReport }) {
         <div className="flex items-center gap-2.5">
           <div className={`w-6 h-6 rounded-lg ${scoreBg} flex items-center justify-center`}>
             <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className={scoreColor}>
-              {report.passed && !hasError
-                ? <polyline points="20 6 9 17 4 12" />
-                : <><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>
+              {notAssessed
+                ? <><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></>
+                : report.passed && !hasError
+                  ? <polyline points="20 6 9 17 4 12" />
+                  : <><line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" /></>
               }
             </svg>
           </div>
           <span className="text-xs font-semibold text-[var(--text-primary)]">
-            {hasError ? (
-              <span className={scoreColor}>Quality Assurance: Error</span>
+            {notAssessed ? (
+              <span className={scoreColor}>Quality Assurance</span>
+            ) : hasError ? (
+              <span className={scoreColor}>{strings.qa.error}</span>
             ) : (
-              <>Quality Assurance: <span className={scoreColor}>{report.overall_score}/10</span></>
+              <>{strings.qa.label}: <span className={scoreColor}>{report.overall_score}/10</span></>
             )}
           </span>
-          {report.iterations > 0 && !hasError && (
+          {notAssessed && (
+            <span className="text-[10px] font-semibold px-2 py-0.5 rounded-full bg-[var(--warning-bg)] text-[var(--warning)] border border-[var(--warning)]/30">
+              {strings.qa.notAssessed}
+            </span>
+          )}
+          {report.iterations > 0 && !hasError && !notAssessed && (
             <span className="text-[10px] text-[var(--text-faint)]">
               ({report.iterations} {report.iterations === 1 ? "review" : "reviews"})
             </span>
@@ -380,7 +414,7 @@ function QAReportSection({ report }: { report: QAReport }) {
 
       {expanded && (
         <div className="px-4 pb-4 space-y-3 border-t border-[var(--border-light)]">
-          <p className={`text-xs mt-3 ${hasError ? "text-[var(--danger)]" : "text-[var(--text-secondary)]"}`}>{report.summary}</p>
+          <p className={`text-xs mt-3 ${notAssessed || hasError ? "text-[var(--warning)]" : "text-[var(--text-secondary)]"}`}>{report.summary}</p>
 
           {report.dimensions.length > 0 && (
             <div className="grid gap-2">
@@ -401,7 +435,9 @@ function QAReportSection({ report }: { report: QAReport }) {
           {report.improvement_guidance && !report.passed && (
             <div className="rounded-lg bg-[var(--warning-bg)] border border-[var(--warning)]/20 px-3 py-2">
               <p className="text-[10px] font-semibold text-[var(--warning)] mb-1">Improvement Guidance</p>
-              <p className="text-[10px] text-[var(--text-secondary)] whitespace-pre-wrap">{report.improvement_guidance}</p>
+              <div className="text-[10px] text-[var(--text-secondary)] [&_p]:mb-1">
+                <MarkdownContent content={report.improvement_guidance} />
+              </div>
             </div>
           )}
         </div>

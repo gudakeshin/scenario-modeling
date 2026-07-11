@@ -1,7 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
-import { pool, getDefaultUserId } from "../db/index.js";
-
-export type Role = "viewer" | "analyst" | "approver" | "admin";
+import type { Role } from "../auth/provider.js";
 
 const ROLE_HIERARCHY: Record<Role, number> = {
   viewer: 0,
@@ -11,38 +9,22 @@ const ROLE_HIERARCHY: Record<Role, number> = {
 };
 
 /**
- * Middleware that checks the user has at least `minRole`.
- * In V1, user is identified via `x-user-id` header or falls back to the default user.
- * In production, this would be replaced by SSO/JWT.
+ * Middleware that checks the authenticated user has at least `minRole`.
+ * Requires `authenticate` to have run first (req.user set).
  */
 export function requireRole(minRole: Role) {
-  return async (req: Request, res: Response, next: NextFunction) => {
-    try {
-      const userId = req.headers["x-user-id"] as string | undefined;
-      let role: Role = "viewer";
-      if (userId) {
-        // Support both UUID and email as user identifier
-        const isUuid = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(userId);
-        const r = isUuid
-          ? await pool.query("SELECT role FROM users WHERE user_id = $1", [userId])
-          : await pool.query("SELECT role FROM users WHERE email = $1", [userId]);
-        if (r.rows[0]) role = r.rows[0].role as Role;
-        else return res.status(403).json({ error: "User not found" });
-      } else {
-        // Fallback: get default system user role via DB function
-        const defaultId = await getDefaultUserId();
-        const r = await pool.query("SELECT role FROM users WHERE user_id = $1", [defaultId]);
-        role = (r.rows[0]?.role as Role) || "analyst";
-      }
-
-      if (ROLE_HIERARCHY[role] < ROLE_HIERARCHY[minRole]) {
-        return res.status(403).json({ error: `Requires role '${minRole}' or above. Your role: '${role}'` });
-      }
-      (req as unknown as Record<string, unknown>).userRole = role;
-      next();
-    } catch (e) {
-      console.error(e);
-      return res.status(500).json({ error: "Authorization failed" });
+  return (req: Request, res: Response, next: NextFunction) => {
+    const user = req.user;
+    if (!user) {
+      return res.status(401).json({ error: "Authentication required" });
     }
+    if (ROLE_HIERARCHY[user.role] < ROLE_HIERARCHY[minRole]) {
+      return res.status(403).json({
+        error: `Requires role '${minRole}' or above. Your role: '${user.role}'`,
+      });
+    }
+    next();
   };
 }
+
+export type { Role };

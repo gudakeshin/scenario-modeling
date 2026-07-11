@@ -1,5 +1,5 @@
 import { Router } from "express";
-import { parseScenario } from "../services/parser.js";
+import { parseScenario, toTypedDelta } from "../services/parser.js";
 import { resolveToModelVariable } from "../services/mappingService.js";
 import { runSimulation } from "../services/simulationService.js";
 import { compareScenarios } from "../services/comparisonService.js";
@@ -12,27 +12,51 @@ import {
 } from "../services/qaAgent.js";
 import { logAudit } from "../services/auditService.js";
 import { requireRole } from "../middleware/rbac.js";
-import { pool, getDefaultUserId, resolveUserId } from "../db/index.js";
+import { validateBody } from "../middleware/validate.js";
+import { pool } from "../db/index.js";
+import { config } from "../config.js";
+import {
+  assertCanReadScenario,
+  assertCanWriteScenario,
+  scenarioVisibilityClause,
+} from "../services/authzService.js";
 import { getUserModelId, getUserModelDefinition } from "../models/registry.js";
+import {
+  ensureScenarioContext,
+  mergeTouchedLevers,
+  getScenarioContext,
+  lockLever,
+  resetUnlockedLevers,
+  addComparisonVersion,
+  getTouchedLeverSnapshot,
+  addQuestionHistory,
+  hydrateScenarioContext,
+} from "../services/scenarioContextService.js";
+import {
+  compareSchema,
+  createScenarioSchema,
+  lockLeverSchema,
+  parseScenarioSchema,
+  refineScenarioSchema,
+  updateParameterSchema,
+} from "../schemas/auth.js";
+import { logger } from "../logger.js";
 
 export const scenariosRouter = Router();
 
-// ── Input sanitization helpers ──
-const MAX_INPUT_LENGTH = Number(process.env.MAX_INPUT_LENGTH) || 2000;
+function authzError(e: unknown) {
+  return (e as { status?: number }).status;
+}
 
 function sanitize(s: string): string {
   return s.replace(/[<>]/g, "").trim();
-}
-function validateLength(s: string, max: number, field: string): string | null {
-  if (s.length > max) return `${field} exceeds maximum length of ${max} characters`;
-  return null;
 }
 
 // ── Base case (before /:id routes) ──
 scenariosRouter.get("/base-case", async (req, res) => {
   try {
     const { computeBaseCase: compute, getPLMetrics: getMetrics } = await import("../models/registry.js");
-    const userId = await resolveUserId(req.headers["x-user-id"] as string | undefined);
+    const userId = req.user!.userId;
     const model = await getUserModelDefinition(userId);
     if (!model) {
       return res.json({ pl: {}, all_variables: {}, time_horizon: null, needs_onboarding: true });
@@ -45,51 +69,47 @@ scenariosRouter.get("/base-case", async (req, res) => {
     }
     return res.json({ pl, all_variables: baseValues, time_horizon: model.time_horizon });
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to compute base case" });
   }
 });
 
 // ── Comparison (before /:id routes) ──
-scenariosRouter.post("/compare", async (req, res) => {
+scenariosRouter.post("/compare", validateBody(compareSchema), async (req, res) => {
   try {
     const { scenario_ids } = req.body;
-    if (!Array.isArray(scenario_ids) || scenario_ids.length < 1) {
-      return res.status(400).json({ error: "Provide scenario_ids array (1–4)" });
+    for (const id of scenario_ids) {
+      await assertCanReadScenario(req.user!.userId, req.user!.role, id);
     }
     const result = await compareScenarios(scenario_ids);
     return res.json(result);
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Comparison failed" });
   }
 });
 
-scenariosRouter.post("/parse", async (req, res) => {
+scenariosRouter.post("/parse", requireRole("analyst"), validateBody(parseScenarioSchema), async (req, res) => {
   try {
-    const { nl_input: rawInput } = req.body;
-    if (typeof rawInput !== "string" || !rawInput.trim()) {
-      return res.status(400).json({ error: "nl_input is required and must be a non-empty string" });
-    }
-    const nl_input = sanitize(rawInput);
-    const lenErr = validateLength(nl_input, MAX_INPUT_LENGTH, "nl_input");
-    if (lenErr) return res.status(400).json({ error: lenErr });
-    const userId = await resolveUserId(req.headers["x-user-id"] as string | undefined);
-    const result = await parseScenario(nl_input.trim(), userId);
+    const nl_input = sanitize(req.body.nl_input).slice(0, config.MAX_INPUT_LENGTH);
+    if (!nl_input) return res.status(400).json({ error: "nl_input is required" });
+    const userId = req.user!.userId;
+    const result = await parseScenario(nl_input, userId);
     return res.json(result);
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to parse scenario" });
   }
 });
 
-scenariosRouter.post("/", async (req, res) => {
+scenariosRouter.post("/", requireRole("analyst"), validateBody(createScenarioSchema), async (req, res) => {
   try {
-    const { nl_input, name } = req.body;
-    if (typeof nl_input !== "string" || !nl_input.trim()) {
-      return res.status(400).json({ error: "nl_input is required" });
-    }
-    const creatorId = await resolveUserId(req.headers["x-user-id"] as string | undefined);
+    const { nl_input: rawInput, name } = req.body;
+    const nl_input = sanitize(rawInput).slice(0, config.MAX_INPUT_LENGTH);
+    if (!nl_input) return res.status(400).json({ error: "nl_input is required" });
+    const creatorId = req.user!.userId;
 
     // Look up the user's active model
     const modelId = await getUserModelId(creatorId);
@@ -112,6 +132,7 @@ scenariosRouter.post("/", async (req, res) => {
     const row = r.rows[0];
     const parseResult = await parseScenario(nl_input.trim(), creatorId);
     const scenarioId = row.scenario_id;
+    ensureScenarioContext(scenarioId);
     const paramsWithMapping: { name: string; mapped_variable_id: string; scenario_value: number; confidence: number }[] = [];
     for (const p of parseResult.parameters) {
       // Resolution priority:
@@ -138,8 +159,8 @@ scenariosRouter.post("/", async (req, res) => {
         variableId = `extracted_${p.name.replace(/\W+/g, "_").toLowerCase()}`;
       }
 
-      // Default magnitude to 0 if the parser/LLM didn't extract a numeric value
-      const scenarioValue = (p.magnitude != null && !isNaN(Number(p.magnitude))) ? Number(p.magnitude) : 0;
+      // Signed, typed delta (direction and percent/absolute semantics preserved)
+      const { value: scenarioValue, delta_type: deltaType } = toTypedDelta(p);
       paramsWithMapping.push({
         name: p.name,
         mapped_variable_id: variableId,
@@ -147,12 +168,22 @@ scenariosRouter.post("/", async (req, res) => {
         confidence: p.confidence,
       });
       await pool.query(
-        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, confidence_score, status)
-         VALUES ($1, $2, $3, $4, $5, 'pending')`,
-        [scenarioId, p.name, variableId, scenarioValue, p.confidence]
+        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+        [scenarioId, p.name, variableId, scenarioValue, deltaType, p.confidence]
       );
     }
-    await logAudit(scenarioId, "created", { nl_input: nl_input.trim(), param_count: parseResult.parameters.length, has_search: !!parseResult.search_context });
+    mergeTouchedLevers(
+      scenarioId,
+      paramsWithMapping.map((p) => ({
+        id: p.mapped_variable_id,
+        value: p.scenario_value,
+        confidence: p.confidence,
+        nlSource: nl_input.trim(),
+        source: "parser_extract" as const,
+      })),
+    );
+    await logAudit(scenarioId, "created", { nl_input: nl_input.trim(), param_count: parseResult.parameters.length, has_search: !!parseResult.search_context }, creatorId);
     return res.status(201).json({
       scenario_id: row.scenario_id,
       nl_input: row.nl_input,
@@ -170,15 +201,17 @@ scenariosRouter.post("/", async (req, res) => {
       notices: parseResult.notices ?? undefined,
     });
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to create scenario" });
   }
 });
 
 // ── Refine scenario with follow-up answers ──
-scenariosRouter.post("/:id/refine", async (req, res) => {
+scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineScenarioSchema), async (req, res) => {
   try {
     const sid = req.params.id;
+    const userId = req.user!.userId;
+    await assertCanWriteScenario(userId, req.user!.role, sid);
     const { answers } = req.body;
     // answers: { question_id: string, answer: string }[]
     if (!Array.isArray(answers) || answers.length === 0) {
@@ -197,7 +230,7 @@ scenariosRouter.post("/:id/refine", async (req, res) => {
     const enrichedInput = `${originalInput}\n\nAdditional context from user:\n${answerContext}`;
 
     // Re-parse with the enriched input
-    const userId = await resolveUserId(req.headers["x-user-id"] as string | undefined);
+    await hydrateScenarioContext(sid);
     const parseResult = await parseScenario(enrichedInput, userId);
 
     // Persist enriched input so downstream operations (narrative, analysis) have full context
@@ -218,16 +251,29 @@ scenariosRouter.post("/:id/refine", async (req, res) => {
       }
       if (!variableId) variableId = `extracted_${p.name.replace(/\W+/g, "_").toLowerCase()}`;
 
-      const scenarioValue = (p.magnitude != null && !isNaN(Number(p.magnitude))) ? Number(p.magnitude) : 0;
+      const { value: scenarioValue, delta_type: deltaType } = toTypedDelta(p);
       paramsWithMapping.push({ name: p.name, mapped_variable_id: variableId, scenario_value: scenarioValue, confidence: p.confidence });
       await pool.query(
-        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, confidence_score, status)
-         VALUES ($1, $2, $3, $4, $5, 'pending')`,
-        [sid, p.name, variableId, scenarioValue, p.confidence]
+        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+        [sid, p.name, variableId, scenarioValue, deltaType, p.confidence]
       );
     }
+    mergeTouchedLevers(
+      sid,
+      paramsWithMapping.map((p) => ({
+        id: p.mapped_variable_id,
+        value: p.scenario_value,
+        confidence: p.confidence,
+        nlSource: enrichedInput,
+        source: "parser_extract" as const,
+      })),
+    );
+    for (const answer of answers) {
+      addQuestionHistory(sid, answer.question_id, String(answer.answer || ""), paramsWithMapping.map((p) => p.mapped_variable_id));
+    }
 
-    await logAudit(sid, "refined", { answer_count: answers.length, new_param_count: parseResult.parameters.length });
+    await logAudit(sid, "refined", { answer_count: answers.length, new_param_count: parseResult.parameters.length }, userId);
 
     return res.json({
       scenario_id: sid,
@@ -242,26 +288,31 @@ scenariosRouter.post("/:id/refine", async (req, res) => {
       notices: parseResult.notices ?? undefined,
     });
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to refine scenario" });
   }
 });
 
-scenariosRouter.get("/", async (_req, res) => {
+scenariosRouter.get("/", async (req, res) => {
   try {
+    const vis = scenarioVisibilityClause(req.user!.userId, req.user!.role);
     const r = await pool.query(
-      `SELECT scenario_id, name, nl_input, status, created_at, updated_at
-       FROM scenarios ORDER BY created_at DESC LIMIT 100`
+      `SELECT s.scenario_id, s.name, s.nl_input, s.status, s.created_at, s.updated_at
+       FROM scenarios s WHERE ${vis.sql} ORDER BY s.created_at DESC LIMIT 100`,
+      vis.params
     );
     return res.json({ scenarios: r.rows });
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to list scenarios" });
   }
 });
 
 scenariosRouter.get("/:id", async (req, res) => {
   try {
+    await assertCanReadScenario(req.user!.userId, req.user!.role, req.params.id);
     const r = await pool.query(
       `SELECT scenario_id, name, description, nl_input, status, model_version_hash, base_case_id, created_at, updated_at
        FROM scenarios WHERE scenario_id = $1`,
@@ -270,13 +321,16 @@ scenariosRouter.get("/:id", async (req, res) => {
     if (r.rows.length === 0) return res.status(404).json({ error: "Scenario not found" });
     return res.json(r.rows[0]);
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to get scenario" });
   }
 });
 
 scenariosRouter.get("/:id/parameters", async (req, res) => {
   try {
+    await assertCanReadScenario(req.user!.userId, req.user!.role, req.params.id);
     const r = await pool.query(
       `SELECT parameter_id, extracted_name, mapped_variable_id, base_value, scenario_value, confidence_score, status
        FROM scenario_parameters WHERE scenario_id = $1 ORDER BY created_at`,
@@ -284,13 +338,17 @@ scenariosRouter.get("/:id/parameters", async (req, res) => {
     );
     return res.json({ parameters: r.rows });
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to get parameters" });
   }
 });
 
-scenariosRouter.put("/:id/parameters/:paramId", async (req, res) => {
+scenariosRouter.put("/:id/parameters/:paramId", requireRole("analyst"), validateBody(updateParameterSchema), async (req, res) => {
   try {
+    const userId = req.user!.userId;
+    await assertCanWriteScenario(userId, req.user!.role, req.params.id);
     const { scenario_value, status, override_reason } = req.body;
 
     // Record override history if value is changing
@@ -300,11 +358,10 @@ scenariosRouter.put("/:id/parameters/:paramId", async (req, res) => {
         [req.params.id, req.params.paramId]
       );
       if (prev.rows.length > 0) {
-        const userId = await getDefaultUserId();
         await pool.query(
           `INSERT INTO parameter_override_history (parameter_id, previous_value, new_value, changed_by, reason)
            VALUES ($1, $2, $3, $4, $5)`,
-          [req.params.paramId, prev.rows[0].scenario_value, Number(scenario_value), userId, override_reason || null]
+          [req.params.paramId, prev.rows[0].scenario_value, scenario_value, userId, override_reason || null]
         );
       }
     }
@@ -314,34 +371,45 @@ scenariosRouter.put("/:id/parameters/:paramId", async (req, res) => {
     let i = 1;
     if (scenario_value !== undefined) {
       updates.push(`scenario_value = $${i++}`);
-      values.push(Number(scenario_value));
+      values.push(scenario_value);
       updates.push(`is_override = TRUE`);
       if (override_reason) {
         updates.push(`override_reason = $${i++}`);
         values.push(override_reason);
       }
     }
-    if (status !== undefined && ["pending", "accepted", "rejected", "modified"].includes(status)) {
+    if (status !== undefined) {
       updates.push(`status = $${i++}`);
       values.push(status);
     }
-    if (updates.length === 0) return res.status(400).json({ error: "No updates provided" });
     values.push(req.params.id, req.params.paramId);
     const r = await pool.query(
       `UPDATE scenario_parameters SET ${updates.join(", ")} WHERE scenario_id = $${i++} AND parameter_id = $${i} RETURNING parameter_id, extracted_name, mapped_variable_id, scenario_value, status, is_override, override_reason`,
       values
     );
     if (r.rows.length === 0) return res.status(404).json({ error: "Parameter not found" });
-    await logAudit(req.params.id, "parameter_updated", { parameter_id: req.params.paramId, new_value: scenario_value, status });
+    if (scenario_value !== undefined) {
+      mergeTouchedLevers(req.params.id, [{
+        id: r.rows[0].mapped_variable_id,
+        value: Number(scenario_value),
+        confidence: 1,
+        nlSource: "Manual parameter override",
+        source: "manual_override",
+      }]);
+    }
+    await logAudit(req.params.id, "parameter_updated", { parameter_id: req.params.paramId, new_value: scenario_value, status }, userId);
     return res.json(r.rows[0]);
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to update parameter" });
   }
 });
 
-scenariosRouter.post("/:id/parameters/:paramId/reject", async (req, res) => {
+scenariosRouter.post("/:id/parameters/:paramId/reject", requireRole("analyst"), async (req, res) => {
   try {
+    await assertCanWriteScenario(req.user!.userId, req.user!.role, req.params.id);
     const r = await pool.query(
       `UPDATE scenario_parameters SET status = 'rejected' WHERE scenario_id = $1 AND parameter_id = $2 RETURNING parameter_id`,
       [req.params.id, req.params.paramId]
@@ -349,7 +417,9 @@ scenariosRouter.post("/:id/parameters/:paramId/reject", async (req, res) => {
     if (r.rows.length === 0) return res.status(404).json({ error: "Parameter not found" });
     return res.json({ parameter_id: r.rows[0].parameter_id, status: "rejected" });
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to reject parameter" });
   }
 });
@@ -358,6 +428,8 @@ scenariosRouter.post("/:id/parameters/:paramId/reject", async (req, res) => {
 scenariosRouter.post("/:id/approve", requireRole("approver"), async (req, res) => {
   try {
     const sid = req.params.id;
+    const userId = req.user!.userId;
+    await assertCanWriteScenario(userId, req.user!.role, sid);
     const params = await pool.query(
       "SELECT status FROM scenario_parameters WHERE scenario_id = $1",
       [sid]
@@ -367,35 +439,49 @@ scenariosRouter.post("/:id/approve", requireRole("approver"), async (req, res) =
     if (!hasAccepted) {
       return res.status(400).json({ error: "At least one parameter must be accepted before approval" });
     }
-    const userId = await getDefaultUserId();
     await pool.query(
       `UPDATE scenarios SET status = 'approved', approved_at = NOW(), approved_by = $2 WHERE scenario_id = $1`,
       [sid, userId]
     );
-    await logAudit(sid, "approved", { approved_by: userId });
+    await logAudit(sid, "approved", { approved_by: userId }, userId);
     return res.json({ scenario_id: sid, status: "approved" });
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to approve scenario" });
   }
 });
 
 // ── Run simulation (requires approval) ──
-scenariosRouter.post("/:id/run", async (req, res) => {
+scenariosRouter.post("/:id/run", requireRole("analyst"), async (req, res) => {
   try {
     const sid = req.params.id;
+    const userId = req.user!.userId;
+    await assertCanWriteScenario(userId, req.user!.role, sid);
     const sRes = await pool.query("SELECT status FROM scenarios WHERE scenario_id = $1", [sid]);
     if (sRes.rows.length === 0) return res.status(404).json({ error: "Scenario not found" });
     if (sRes.rows[0].status !== "approved" && sRes.rows[0].status !== "completed") {
       return res.status(400).json({ error: "Scenario must be approved before running. Accept parameters and click Approve first." });
     }
+    await hydrateScenarioContext(sid);
     const output = await runSimulation(sid);
-    await logAudit(sid, "simulation_run", { metrics: Object.keys(output.pl) });
+    addComparisonVersion(sid, `run_${new Date().toISOString()}`, output.pl);
+    await logAudit(
+      sid,
+      "simulation_run",
+      { metrics: Object.keys(output.pl) },
+      userId,
+      getTouchedLeverSnapshot(sid) as unknown as Record<string, unknown>[],
+    );
     return res.json({ scenario_id: sid, ...output });
   } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
     const msg = (e as Error).message;
     if (msg === "Scenario not found") return res.status(404).json({ error: msg });
-    console.error(e);
+    if (msg.includes("not validated")) return res.status(400).json({ error: msg, needs_validation: true });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Simulation failed" });
   }
 });
@@ -403,6 +489,7 @@ scenariosRouter.post("/:id/run", async (req, res) => {
 // ── Outputs ──
 scenariosRouter.get("/:id/outputs", async (req, res) => {
   try {
+    await assertCanReadScenario(req.user!.userId, req.user!.role, req.params.id);
     const r = await pool.query(
       `SELECT output_id, output_type, output_data, narrative_summary, created_at
        FROM scenario_outputs WHERE scenario_id = $1 ORDER BY created_at DESC`,
@@ -410,15 +497,18 @@ scenariosRouter.get("/:id/outputs", async (req, res) => {
     );
     return res.json({ outputs: r.rows });
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to get outputs" });
   }
 });
 
 // ── Narrative ──
-scenariosRouter.post("/:id/narrative", async (req, res) => {
+scenariosRouter.post("/:id/narrative", requireRole("analyst"), async (req, res) => {
   try {
     const sid = req.params.id;
+    await assertCanWriteScenario(req.user!.userId, req.user!.role, sid);
     const audience = req.body?.audience === "board" ? "board" : "internal";
     const sRes = await pool.query("SELECT name, nl_input FROM scenarios WHERE scenario_id = $1", [sid]);
     if (sRes.rows.length === 0) return res.status(404).json({ error: "Scenario not found" });
@@ -449,15 +539,62 @@ scenariosRouter.post("/:id/narrative", async (req, res) => {
     );
     return res.json({ narrative });
   } catch (e) {
-    console.error(e);
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to generate narrative" });
   }
 });
 
+// ── Scenario context endpoints ──
+scenariosRouter.get("/:id/context", async (req, res) => {
+  try {
+    await assertCanReadScenario(req.user!.userId, req.user!.role, req.params.id);
+    const ctx = (await hydrateScenarioContext(req.params.id)) ?? getScenarioContext(req.params.id);
+    if (!ctx) return res.status(404).json({ error: "Scenario context not found" });
+    return res.json({ scenario_id: req.params.id, context: ctx });
+  } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
+    return res.status(500).json({ error: "Failed to get scenario context" });
+  }
+});
+
+scenariosRouter.post("/:id/context/reset", requireRole("analyst"), async (req, res) => {
+  try {
+    await assertCanWriteScenario(req.user!.userId, req.user!.role, req.params.id);
+    await hydrateScenarioContext(req.params.id);
+    const ctx = resetUnlockedLevers(req.params.id);
+    return res.json({ scenario_id: req.params.id, context: ctx });
+  } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
+    return res.status(500).json({ error: "Failed to reset scenario context" });
+  }
+});
+
+scenariosRouter.post("/:id/context/lock", requireRole("analyst"), validateBody(lockLeverSchema), async (req, res) => {
+  try {
+    await assertCanWriteScenario(req.user!.userId, req.user!.role, req.params.id);
+    const { lever_id, locked } = req.body;
+    await hydrateScenarioContext(req.params.id);
+    const ctx = lockLever(req.params.id, lever_id, !!locked);
+    return res.json({ scenario_id: req.params.id, context: ctx });
+  } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
+    return res.status(500).json({ error: "Failed to lock scenario lever" });
+  }
+});
+
 // ── Business Analysis Agent + QA Reflection Loop ──
-scenariosRouter.post("/:id/business-analysis", async (req, res) => {
+scenariosRouter.post("/:id/business-analysis", requireRole("analyst"), async (req, res) => {
   try {
     const sid = req.params.id;
+    await assertCanWriteScenario(req.user!.userId, req.user!.role, sid);
     const sRes = await pool.query("SELECT status FROM scenarios WHERE scenario_id = $1", [sid]);
     if (sRes.rows.length === 0) return res.status(404).json({ error: "Scenario not found" });
 
@@ -473,7 +610,7 @@ scenariosRouter.post("/:id/business-analysis", async (req, res) => {
       detail: `Headline: "${currentAnalysis.headline.slice(0, 120)}". ${currentAnalysis.implications.length} implications, ${currentAnalysis.risks.length} risks, ${currentAnalysis.recommendations.length} recommendations.`,
       duration_ms: Date.now() - baStart,
     });
-    console.log(`[BA Agent] Initial analysis generated (${Date.now() - baStart}ms)`);
+    logger.info(`[BA Agent] Initial analysis generated (${Date.now() - baStart}ms)`);
 
     let qaReport: QAReport | null = null;
 
@@ -486,7 +623,7 @@ scenariosRouter.post("/:id/business-analysis", async (req, res) => {
 
         // ── QA Agent evaluates ──
         const qaStart = Date.now();
-        const report = await evaluateAnalysis(currentAnalysis, scenarioContext);
+        const report = await evaluateAnalysis(currentAnalysis, scenarioContext, sid);
         report.iterations = iteration;
         qaReport = report;
 
@@ -495,22 +632,27 @@ scenariosRouter.post("/:id/business-analysis", async (req, res) => {
           .join(", ");
         reflectionLog.push({
           agent: "Quality Assurance",
-          action: `Evaluation #${iteration} — Score: ${report.overall_score}/10`,
-          detail: report.passed
-            ? `PASSED. ${report.summary}`
-            : `FAILED (threshold: ${QA_THRESHOLD}/10). ${report.summary} [${dimSummary}]`,
-          score: report.overall_score,
-          passed: report.passed,
+          action: report.status === "not_assessed"
+            ? `Evaluation #${iteration} — not assessed`
+            : `Evaluation #${iteration} — Score: ${report.overall_score}/10`,
+          detail: report.status === "not_assessed"
+            ? `QA COULD NOT RUN. ${report.summary}`
+            : report.passed
+              ? `PASSED. ${report.summary}`
+              : `FAILED (threshold: ${QA_THRESHOLD}/10). ${report.summary} [${dimSummary}]`,
+          score: report.status === "not_assessed" ? undefined : report.overall_score,
+          passed: report.status === "not_assessed" ? undefined : report.passed,
           duration_ms: Date.now() - qaStart,
         });
-        console.log(`[QA Agent] Iteration ${iteration}: ${report.overall_score}/10 (${report.passed ? "PASSED" : "FAILED"}) — ${Date.now() - qaStart}ms`);
+        logger.info(`[QA Agent] Iteration ${iteration}: ${report.status === "not_assessed" ? "NOT ASSESSED" : `${report.overall_score}/10 (${report.passed ? "PASSED" : "FAILED"})`} — ${Date.now() - qaStart}ms`);
 
-        // If passed or QA had an error (score 0 means error), stop the loop
-        if (report.passed || report.overall_score === 0) break;
+        // Stop when QA passes, or when QA could not run at all — a QA
+        // failure to execute must not be treated as an analysis pass.
+        if (report.passed || report.status === "not_assessed") break;
 
         // ── Business Analysis Agent regenerates with QA feedback ──
         const refineStart = Date.now();
-        console.log(`[BA Agent] Regenerating with QA feedback (iteration ${iteration})...`);
+        logger.info(`[BA Agent] Regenerating with QA feedback (iteration ${iteration})...`);
 
         const lowestDims = [...report.dimensions]
           .sort((a, b) => a.score - b.score)
@@ -525,7 +667,7 @@ scenariosRouter.post("/:id/business-analysis", async (req, res) => {
           detail: `Regenerated analysis addressing: ${lowestDims}. New headline: "${currentAnalysis.headline.slice(0, 100)}".`,
           duration_ms: Date.now() - refineStart,
         });
-        console.log(`[BA Agent] Refinement ${iteration} complete (${Date.now() - refineStart}ms)`);
+        logger.info(`[BA Agent] Refinement ${iteration} complete (${Date.now() - refineStart}ms)`);
       }
 
       // If QA never passed after all iterations, mark it clearly
@@ -551,7 +693,7 @@ scenariosRouter.post("/:id/business-analysis", async (req, res) => {
       qa_score: qaReport?.overall_score,
       qa_iterations: qaReport?.iterations,
       qa_passed: qaReport?.passed,
-    });
+    }, req.user!.userId);
 
     await pool.query(
       `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'business_analysis', $2)`,
@@ -564,9 +706,11 @@ scenariosRouter.post("/:id/business-analysis", async (req, res) => {
       reflection_log: reflectionLog,
     });
   } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
     const msg = (e as Error).message;
     if (msg === "Scenario not found") return res.status(404).json({ error: msg });
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Business analysis failed" });
   }
 });

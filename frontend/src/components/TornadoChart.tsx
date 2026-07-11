@@ -1,9 +1,21 @@
 "use client";
 
-import { useState, useCallback, useEffect } from "react";
+import { useState, useCallback, useEffect, useMemo } from "react";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceLine,
+} from "recharts";
 import { runSensitivity, getActiveModel, type SensitivityResult, type TornadoBar } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
-import { fmtCurrency, fmtCurrencySigned } from "@/lib/metrics";
+import { ChartDataTable } from "./ChartDataTable";
+import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol } from "@/lib/metrics";
+import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface TornadoChartProps {
   scenarioId: string;
@@ -15,66 +27,31 @@ function labelFromId(id: string): string {
   return id.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
 
-/**
- * Tornado bar: shows negative impact (left, red) and positive impact (right, green).
- * Handles sign correctly — for cost variables, decreasing the variable (low scenario)
- * can increase the metric, so low_delta can be positive.
- */
-function Bar({ bar, maxDelta }: { bar: TornadoBar; maxDelta: number }) {
-  // Determine which delta goes left (negative/downside) and which goes right (positive/upside)
-  const negDelta = Math.min(bar.low_delta, bar.high_delta);
-  const posDelta = Math.max(bar.low_delta, bar.high_delta);
-  const leftPct = maxDelta > 0 ? (Math.abs(negDelta) / maxDelta) * 100 : 0;
-  const rightPct = maxDelta > 0 ? (Math.abs(posDelta) / maxDelta) * 100 : 0;
+interface TornadoDatum {
+  name: string;
+  downside: number;
+  upside: number;
+  spread: number;
+  base_value: number;
+  absolute_step?: boolean;
+}
 
+function TornadoTooltip({ active, payload }: { active?: boolean; payload?: Array<{ payload: TornadoDatum }> }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0].payload;
   return (
-    <div className="flex items-center gap-2 mb-2.5">
-      <div className="w-32 text-right text-xs font-medium truncate text-[var(--text-primary)]" title={bar.variable_name}>
-        {bar.variable_name}
-      </div>
-      <div className="flex-1 flex items-center h-8">
-        {/* Left (negative/downside) bar */}
-        <div className="flex-1 flex justify-end">
-          <div
-            className="h-6 rounded-l-md flex items-center justify-end pr-1.5 transition-all"
-            style={{
-              width: `${leftPct}%`,
-              minWidth: leftPct > 0 ? "4px" : "0",
-              backgroundColor: "rgba(218, 41, 28, 0.55)",
-            }}
-          >
-            {leftPct > 15 && (
-              <span className="text-[10px] text-white whitespace-nowrap font-medium drop-shadow-sm">
-                {fmtCurrencySigned(negDelta)}
-              </span>
-            )}
-          </div>
-        </div>
-        {/* Center line (base) */}
-        <div className="w-0.5 h-8 bg-[var(--text-muted)]/40 rounded-full" />
-        {/* Right (positive/upside) bar */}
-        <div className="flex-1">
-          <div
-            className="h-6 rounded-r-md flex items-center pl-1.5 transition-all"
-            style={{
-              width: `${rightPct}%`,
-              minWidth: rightPct > 0 ? "4px" : "0",
-              backgroundColor: "rgba(134, 188, 37, 0.65)",
-            }}
-          >
-            {rightPct > 15 && (
-              <span className="text-[10px] text-white whitespace-nowrap font-medium drop-shadow-sm">
-                {fmtCurrencySigned(posDelta)}
-              </span>
-            )}
-          </div>
-        </div>
-      </div>
-      {/* Labels outside bars when they don't fit inside */}
-      <div className="w-20 text-right flex flex-col items-end">
-        <span className="text-[10px] font-semibold text-[var(--text-secondary)]">{fmtCurrency(bar.spread)}</span>
-        <span className="text-[9px] text-[var(--text-faint)]">{bar.base_value !== 0 ? ((bar.spread / Math.abs(bar.base_value)) * 100).toFixed(1) : 0}%</span>
-      </div>
+    <div className="bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg shadow-panel px-3 py-2">
+      <p className="text-xs font-semibold text-[var(--text-primary)]">{d.name}</p>
+      <p className="text-[11px] text-[var(--danger)]">Downside: {fmtCurrencySigned(d.downside)}</p>
+      <p className="text-[11px]" style={{ color: "var(--chart-positive)" }}>
+        Upside: {fmtCurrencySigned(d.upside)}
+      </p>
+      <p className="text-[11px] text-[var(--text-secondary)] mt-1">
+        Spread: {fmtCurrency(d.spread)} ({d.base_value !== 0 ? ((d.spread / Math.abs(d.base_value)) * 100).toFixed(1) : 0}% of base)
+      </p>
+      {d.absolute_step && (
+        <p className="text-[10px] text-[var(--text-faint)] italic mt-0.5">Zero-baseline input — absolute step used</p>
+      )}
     </div>
   );
 }
@@ -120,10 +97,19 @@ export function TornadoChart({ scenarioId, onClose, onMinimize }: TornadoChartPr
     setLoading(false);
   }, [scenarioId, targetMetric, swingPct]);
 
-  // Max absolute delta across all bars — used to scale bar widths
-  const maxDelta = result
-    ? Math.max(...result.bars.flatMap((b) => [Math.abs(b.low_delta), Math.abs(b.high_delta)]), 1)
-    : 1;
+  const chartData: TornadoDatum[] = useMemo(
+    () =>
+      (result?.bars ?? []).map((b: TornadoBar) => ({
+        name: b.variable_name,
+        downside: Math.min(b.low_delta, b.high_delta),
+        upside: Math.max(b.low_delta, b.high_delta),
+        spread: b.spread,
+        base_value: b.base_value,
+        absolute_step: b.absolute_step,
+      })),
+    [result],
+  );
+  const chartHeight = Math.max(chartData.length * 36 + 40, 120);
 
   return (
     <div className="border-t border-[var(--border)] bg-background p-4 max-h-[60vh] overflow-auto">
@@ -176,27 +162,43 @@ export function TornadoChart({ scenarioId, onClose, onMinimize }: TornadoChartPr
       {result && (
         <>
           <p className="text-xs text-[var(--text-faint)] mb-3">
-            Base {metricOptions.find((o) => o.value === result.target_metric)?.label || labelFromId(result.target_metric)}: {fmtCurrency(result.base_metric_value)} | \u00B1{result.swing_pct}% swing
+            Base {metricOptions.find((o) => o.value === result.target_metric)?.label || labelFromId(result.target_metric)}: {fmtCurrency(result.base_metric_value)} | ±{result.swing_pct}% swing
           </p>
 
-          {/* Header */}
-          <div className="flex items-center gap-2 mb-2 text-[10px] text-[var(--text-faint)] font-medium uppercase tracking-wider">
-            <div className="w-32 text-right">Variable</div>
-            <div className="flex-1 flex">
-              <div className="flex-1 text-right text-[var(--danger)]">{"\u2190"} Downside</div>
-              <div className="w-0.5" />
-              <div className="flex-1 text-[rgb(134,188,37)]">Upside {"\u2192"}</div>
-            </div>
-            <div className="w-20 text-right">Spread</div>
-          </div>
-
-          {/* Bars */}
-          {result.bars.map((bar) => (
-            <Bar key={bar.variable_id} bar={bar} maxDelta={maxDelta} />
-          ))}
-
-          {result.bars.length === 0 && (
+          {result.bars.length === 0 ? (
             <p className="text-xs text-[var(--text-faint)]">No input variables found to analyze.</p>
+          ) : (
+            <div style={{ height: chartHeight }}>
+              <ResponsiveContainer width="100%" height="100%">
+                <BarChart data={chartData} layout="vertical" margin={{ left: 8, right: 16 }}>
+                  <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" horizontal={false} />
+                  <XAxis
+                    type="number"
+                    tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
+                    tick={{ fontSize: 10, fill: "var(--text-faint)" }}
+                    axisLine={{ stroke: "var(--border)" }}
+                    tickLine={false}
+                  />
+                  <YAxis
+                    type="category"
+                    dataKey="name"
+                    width={110}
+                    tick={{ fontSize: 11, fill: "var(--text-primary)" }}
+                    axisLine={false}
+                    tickLine={false}
+                  />
+                  <Tooltip content={<TornadoTooltip />} />
+                  <ReferenceLine x={0} stroke="var(--border)" strokeWidth={1.5} />
+                  <Bar dataKey="downside" stackId="tornado" fill="var(--danger)" radius={[3, 0, 0, 3]} />
+                  <Bar dataKey="upside" stackId="tornado" fill="var(--chart-positive)" radius={[0, 3, 3, 0]} />
+                </BarChart>
+              </ResponsiveContainer>
+              <ChartDataTable
+                caption={`Sensitivity tornado for ${metricOptions.find((o) => o.value === result.target_metric)?.label || labelFromId(result.target_metric)}`}
+                columns={["Variable", "Downside", "Upside", "Spread"]}
+                rows={chartData.map((d) => [d.name, d.downside, d.upside, d.spread])}
+              />
+            </div>
           )}
 
           {/* Impact ranking */}

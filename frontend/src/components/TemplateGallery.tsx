@@ -159,7 +159,7 @@ export function TemplateGallery({ scenarioId, onCloned, onClose, onMinimize }: T
                   <p className="text-[11px] text-[var(--text-muted)] truncate mt-0.5">{t.description}</p>
                 )}
                 <p className="text-[10px] text-[var(--text-faint)] mt-0.5">
-                  {t.parameter_set.length} params \u00B7 {timeAgo(t.created_at)}
+                  {t.parameter_set.length} params · {timeAgo(t.created_at)}
                 </p>
               </div>
               <button

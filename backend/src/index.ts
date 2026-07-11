@@ -1,6 +1,12 @@
-import "dotenv/config";
+import { config } from "./config.js";
 import express from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import { httpLogger, logger } from "./logger.js";
+import { httpRequestDuration, registry } from "./metrics.js";
+import { pool } from "./db/index.js";
+import { requestContext } from "./requestContext.js";
 import { scenariosRouter } from "./routes/scenarios.js";
 import { mappingsRouter } from "./routes/mappings.js";
 import { auditRouter } from "./routes/audit.js";
@@ -11,37 +17,94 @@ import { templatesRouter } from "./routes/templates.js";
 import { sessionsRouter } from "./routes/sessions.js";
 import { documentsRouter } from "./routes/documents.js";
 import { contextRouter } from "./routes/context.js";
+import { authRouter } from "./routes/auth.js";
+import { authenticate } from "./auth/middleware.js";
 import { requireRole } from "./middleware/rbac.js";
+import { startServer } from "./server.js";
 
 const app = express();
-app.use(cors({ origin: process.env.FRONTEND_ORIGIN || "http://localhost:3000" }));
-app.use(express.json());
 
-// Rate limiting: simple in-memory limiter (configurable via env)
-const RATE_WINDOW = Number(process.env.RATE_LIMIT_WINDOW_MS) || 60_000;
-const RATE_MAX = Number(process.env.RATE_LIMIT_MAX_REQUESTS) || 120;
-const rateLimitMap = new Map<string, { count: number; reset: number }>();
+app.set("trust proxy", 1);
+app.use(helmet());
+app.use(httpLogger);
+
+// Propagate pino-http request id + client meta for audit hashing.
 app.use((req, res, next) => {
-  const key = (req.headers["x-user-id"] as string) || req.ip || "anon";
-  const now = Date.now();
-  const entry = rateLimitMap.get(key);
-  if (!entry || now > entry.reset) {
-    rateLimitMap.set(key, { count: 1, reset: now + RATE_WINDOW });
+  const id = (req as { id?: string }).id;
+  requestContext.run(
+    {
+      requestId: id ? String(id) : undefined,
+      ip: req.ip,
+      userAgent: req.get("user-agent") || undefined,
+    },
+    next,
+  );
+});
+
+// Prometheus HTTP duration (skip probes / metrics scrape).
+app.use((req, res, next) => {
+  if (req.path === "/health" || req.path === "/ready" || req.path === "/metrics") {
     return next();
   }
-  entry.count++;
-  if (entry.count > RATE_MAX) {
-    return res.status(429).json({ error: "Rate limit exceeded. Try again in a minute." });
-  }
+  const end = httpRequestDuration.startTimer();
+  res.on("finish", () => {
+    const route = req.route?.path
+      ? `${req.baseUrl}${req.route.path}`
+      : req.path;
+    end({ method: req.method, route, status: String(res.statusCode) });
+  });
   next();
 });
 
-// Input size limit (JSON bodies; file uploads handled by multer)
+app.use(
+  cors({
+    origin: config.FRONTEND_ORIGIN,
+    credentials: true,
+  })
+);
 app.use(express.json({ limit: "5mb" }));
+
+const authLimiter = rateLimit({
+  windowMs: config.RATE_LIMIT_WINDOW_MS,
+  max: config.AUTH_RATE_LIMIT_MAX,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: "Too many auth attempts. Try again later." },
+});
+
+const apiLimiter = rateLimit({
+  windowMs: config.RATE_LIMIT_WINDOW_MS,
+  max: config.RATE_LIMIT_MAX_REQUESTS,
+  standardHeaders: true,
+  legacyHeaders: false,
+  keyGenerator: (req) => req.user?.userId || req.ip || "anon",
+  validate: { keyGeneratorIpFallback: false },
+  message: { error: "Rate limit exceeded. Try again in a minute." },
+});
 
 app.get("/health", (_req, res) => {
   res.json({ status: "ok", service: "scenario-modeling-api" });
 });
+
+app.get("/ready", async (_req, res) => {
+  try {
+    await pool.query("SELECT 1");
+    res.json({ status: "ready" });
+  } catch (err) {
+    logger.error({ err }, "Readiness check failed: Postgres unreachable");
+    res.status(503).json({ status: "not_ready", reason: "database_unreachable" });
+  }
+});
+
+app.get("/metrics", async (_req, res) => {
+  res.setHeader("Content-Type", registry.contentType);
+  res.send(await registry.metrics());
+});
+
+app.use("/api/v1/auth", authLimiter, authRouter);
+
+// All other API routes require authentication
+app.use("/api/v1", authenticate, apiLimiter);
 
 app.use("/api/v1/scenarios", scenariosRouter);
 app.use("/api/v1/scenarios", exportsRouter);
@@ -54,12 +117,8 @@ app.use("/api/v1/sessions", sessionsRouter);
 app.use("/api/v1/documents", documentsRouter);
 app.use("/api/v1/context", contextRouter);
 
-// Export app for integration testing (supertest)
 export { app };
 
-const port = Number(process.env.PORT) || 4000;
-if (process.env.NODE_ENV !== "test") {
-  app.listen(port, () => {
-    console.log(`API listening on http://localhost:${port}`);
-  });
+if (config.NODE_ENV !== "test") {
+  startServer(app);
 }

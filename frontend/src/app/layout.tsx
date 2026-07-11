@@ -1,6 +1,9 @@
 import type { Metadata } from "next";
 import localFont from "next/font/local";
+import { Toaster } from "sonner";
 import "./globals.css";
+import { THEME_INIT_SCRIPT } from "@/lib/theme";
+import { ErrorBoundary } from "@/components/ErrorBoundary";
 
 const geistSans = localFont({
   src: "./fonts/GeistVF.woff",
@@ -24,11 +27,26 @@ export default function RootLayout({
   children: React.ReactNode;
 }>) {
   return (
-    <html lang="en">
+    <html lang="en" suppressHydrationWarning>
+      <head>
+        {/* Runs before paint to avoid a flash of the wrong theme. */}
+        <script dangerouslySetInnerHTML={{ __html: THEME_INIT_SCRIPT }} />
+      </head>
       <body
         className={`${geistSans.variable} ${geistMono.variable} antialiased`}
       >
-        {children}
+        <ErrorBoundary>{children}</ErrorBoundary>
+        <Toaster
+          richColors
+          position="bottom-right"
+          toastOptions={{
+            style: {
+              background: "var(--card-bg)",
+              border: "1px solid var(--border)",
+              color: "var(--text-primary)",
+            },
+          }}
+        />
       </body>
     </html>
   );

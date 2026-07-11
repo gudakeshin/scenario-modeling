@@ -66,10 +66,14 @@ export function ThinkingBlock({ data }: ThinkingBlockProps) {
   return (
     <div className="flex justify-start px-4 py-1.5">
       <div className="max-w-[85%] sm:max-w-[75%] w-full">
+        <div aria-live="polite" aria-atomic="true" className="sr-only">
+          {isStreaming ? "Thinking…" : `Thought for ${durationSec} seconds`}
+        </div>
         {/* Thinking header — always visible */}
         <button
           onClick={() => setIsExpanded((prev) => !prev)}
           className="flex items-center gap-2 text-xs font-medium text-[var(--text-tertiary)] hover:text-[var(--text-secondary)] transition-colors group w-full text-left"
+          aria-expanded={isExpanded}
         >
           {/* Animated thinking indicator */}
           <span className="relative flex h-4 w-4 items-center justify-center">

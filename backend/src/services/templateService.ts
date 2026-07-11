@@ -6,7 +6,7 @@
  * and versioning / sharing.
  */
 
-import { pool, getDefaultUserId } from "../db/index.js";
+import { pool } from "../db/index.js";
 
 export interface Template {
   template_id: string;
@@ -24,14 +24,16 @@ export interface Template {
 
 // ── CRUD ──
 
-export async function listTemplates(scope?: string): Promise<Template[]> {
+export async function listTemplates(userId: string, scope?: string): Promise<Template[]> {
   let query = `SELECT * FROM scenario_templates`;
   const params: string[] = [];
   if (scope === "shared") {
     query += ` WHERE is_shared = true`;
   } else if (scope === "private") {
-    const userId = await getDefaultUserId();
     query += ` WHERE created_by = $1 AND is_shared = false`;
+    params.push(userId);
+  } else {
+    query += ` WHERE is_shared = true OR created_by = $1`;
     params.push(userId);
   }
   query += ` ORDER BY updated_at DESC`;
@@ -44,7 +46,7 @@ export async function getTemplate(templateId: string): Promise<Template | null> 
   return r.rows[0] || null;
 }
 
-export async function createTemplate(data: {
+export async function createTemplate(userId: string, data: {
   name: string;
   description?: string;
   parameter_set: { variable_id: string; value: number; label: string }[];
@@ -52,7 +54,6 @@ export async function createTemplate(data: {
   is_shared?: boolean;
   sharing_scope?: string;
 }): Promise<Template> {
-  const userId = await getDefaultUserId();
   const r = await pool.query(
     `INSERT INTO scenario_templates (name, description, parameter_set, model_version_hash, is_shared, sharing_scope, created_by)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -102,11 +103,10 @@ export async function deleteTemplate(templateId: string): Promise<boolean> {
 
 // ── Clone template → new scenario ──
 
-export async function cloneTemplateToScenario(templateId: string, nlInput?: string): Promise<string> {
+export async function cloneTemplateToScenario(templateId: string, userId: string, nlInput?: string): Promise<string> {
   const tpl = await getTemplate(templateId);
   if (!tpl) throw new Error("Template not found");
 
-  const userId = await getDefaultUserId();
   const name = `${tpl.name} (clone)`;
   const input = nlInput || `Cloned from template: ${tpl.name}`;
 
@@ -133,6 +133,7 @@ export async function cloneTemplateToScenario(templateId: string, nlInput?: stri
 
 export async function saveScenarioAsTemplate(
   scenarioId: string,
+  userId: string,
   name: string,
   description?: string,
   isShared = false
@@ -151,7 +152,7 @@ export async function saveScenarioAsTemplate(
     label: r.extracted_name,
   }));
 
-  return createTemplate({
+  return createTemplate(userId, {
     name,
     description,
     parameter_set: paramSet,

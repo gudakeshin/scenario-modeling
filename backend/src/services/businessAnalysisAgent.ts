@@ -14,44 +14,43 @@
  *   - confidence_note:  How much to trust this analysis
  */
 
-import { getApiKey, callClaude } from "./llmClient.js";
+import { z } from "zod";
+import { getApiKey, callClaudeStructured } from "./llmClient.js";
 import { pool } from "../db/index.js";
 import { computeBaseCase } from "../models/registry.js";
-
-function repairJson(raw: string): string {
-  let text = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  try { JSON.parse(text); return text; } catch { /* needs repair */ }
-  text = text.replace(/,\s*"[^"]*":\s*"[^"]*$/, "");
-  text = text.replace(/,\s*"[^"]*":\s*$/, "");
-  text = text.replace(/,\s*$/, "");
-  const openBraces = (text.match(/{/g) || []).length;
-  const closeBraces = (text.match(/}/g) || []).length;
-  const openBrackets = (text.match(/\[/g) || []).length;
-  const closeBrackets = (text.match(/]/g) || []).length;
-  for (let i = 0; i < openBrackets - closeBrackets; i++) {
-    text = text.replace(/,\s*$/, "") + "]";
-  }
-  for (let i = 0; i < openBraces - closeBraces; i++) {
-    text = text.replace(/,\s*$/, "") + "}";
-  }
-  try { JSON.parse(text); return text; } catch { /* still broken */ }
-  const match = text.match(/\{[\s\S]*\}/);
-  if (match) {
-    try { JSON.parse(match[0]); return match[0]; } catch { /* give up */ }
-  }
-  return text;
-}
+import { logger } from "../logger.js";
 
 // ── Types ──
 
-export interface BusinessInsight {
-  headline: string;
-  implications: { title: string; detail: string; severity: "positive" | "negative" | "neutral" }[];
-  risks: { risk: string; likelihood: "high" | "medium" | "low"; mitigation: string }[];
-  recommendations: { action: string; priority: "immediate" | "short-term" | "monitor"; rationale: string; owner?: string }[];
-  decision_context: string;
-  confidence_note: string;
-}
+const evidenceRefSchema = z.object({
+  metric_id: z.string().describe("Model variable id this claim is grounded in, e.g. 'net_income'"),
+  value: z.number().describe("The computed value being cited"),
+});
+
+const businessInsightSchema = z.object({
+  headline: z.string(),
+  implications: z.array(z.object({
+    title: z.string(),
+    detail: z.string(),
+    severity: z.enum(["positive", "negative", "neutral"]),
+    evidence: z.array(evidenceRefSchema).optional().describe("Metrics this implication is grounded in"),
+  })).min(1),
+  risks: z.array(z.object({
+    risk: z.string(),
+    likelihood: z.enum(["high", "medium", "low"]),
+    mitigation: z.string(),
+  })).min(1),
+  recommendations: z.array(z.object({
+    action: z.string(),
+    priority: z.enum(["immediate", "short-term", "monitor"]),
+    rationale: z.string(),
+    owner: z.string().optional(),
+  })).min(1),
+  decision_context: z.string(),
+  confidence_note: z.string(),
+});
+
+export type BusinessInsight = z.infer<typeof businessInsightSchema>;
 
 interface AnalysisContext {
   scenario_name: string | null;
@@ -308,26 +307,10 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
 
 // ── LLM-powered analysis ──
 
-const SYSTEM_PROMPT = `You are a senior business strategy analyst. Given financial scenario data, you produce structured "So What?" analysis.
-
-You must return ONLY valid JSON matching this exact schema:
-{
-  "headline": "One sentence: the single most important business takeaway",
-  "implications": [
-    {"title": "Short title", "detail": "2-3 sentence explanation", "severity": "positive|negative|neutral"}
-  ],
-  "risks": [
-    {"risk": "Description", "likelihood": "high|medium|low", "mitigation": "Concrete action"}
-  ],
-  "recommendations": [
-    {"action": "Specific action item", "priority": "immediate|short-term|monitor", "rationale": "Why this matters", "owner": "Team/Role"}
-  ],
-  "decision_context": "2-3 sentences framing the decision for executives",
-  "confidence_note": "How reliable is this analysis + what would strengthen it"
-}
+const SYSTEM_PROMPT = `You are a senior business strategy analyst. Given financial scenario data, you produce structured "So What?" analysis using the provided tool.
 
 Rules:
-- implications: 3-5 items, focus on BUSINESS impact not just numbers
+- implications: 3-5 items, focus on BUSINESS impact not just numbers. Each implication that cites a number MUST include an "evidence" entry with the exact metric_id and value from the P&L data provided — never cite a number that isn't in the data you were given.
 - risks: 2-4 items, each with a specific mitigation action
 - recommendations: 3-5 items, ordered by priority. Each must be CONCRETE and ACTIONABLE (not "consider" or "think about" — use "do X", "establish Y", "convene Z")
 - Always ask "so what does this mean for the business?" — don't just restate the numbers
@@ -388,25 +371,18 @@ export async function generateBusinessAnalysis(scenarioId: string): Promise<Busi
   }
 
   try {
-    const rawText = await callClaude({
+    return await callClaudeStructured({
       system: SYSTEM_PROMPT,
-      userMessage: buildUserPrompt(ctx) + "\n\nReturn JSON only — no markdown, no code fences. Keep each string value under 200 characters.",
+      userMessage: buildUserPrompt(ctx) + "\n\nKeep each string value under 200 characters.",
+      schema: businessInsightSchema,
+      toolName: "submit_business_analysis",
+      toolDescription: "Submit the structured business analysis",
       maxTokens: 3000,
       temperature: 0.4,
+      purpose: "business_analysis",
     });
-
-    const repaired = repairJson(rawText);
-    if (!repaired) return generateFallbackAnalysis(ctx);
-
-    const parsed = JSON.parse(repaired) as BusinessInsight;
-
-    if (!parsed.headline || !Array.isArray(parsed.implications) || !Array.isArray(parsed.recommendations)) {
-      return generateFallbackAnalysis(ctx);
-    }
-
-    return parsed;
   } catch (e) {
-    console.error("Business analysis LLM call failed, using fallback:", (e as Error).message);
+    logger.error({ err: e }, "Business analysis LLM call failed, using fallback");
     return generateFallbackAnalysis(ctx);
   }
 }
@@ -443,25 +419,60 @@ export async function regenerateWithFeedback(
   ].join("\n");
 
   try {
-    const rawText = await callClaude({
+    return await callClaudeStructured({
       system: SYSTEM_PROMPT + "\n\nIMPORTANT: You are in a refinement cycle. A QA analyst reviewed your previous output and found issues. You MUST address their feedback to produce a higher-quality analysis.",
-      userMessage: buildUserPrompt(ctx) + feedbackSection + "\n\nReturn JSON only — no markdown, no code fences. Keep each string value under 200 characters.",
+      userMessage: buildUserPrompt(ctx) + feedbackSection + "\n\nKeep each string value under 200 characters.",
+      schema: businessInsightSchema,
+      toolName: "submit_business_analysis",
+      toolDescription: "Submit the structured, revised business analysis",
       maxTokens: 3000,
       temperature: 0.3,
+      purpose: "business_analysis",
     });
-
-    const repaired = repairJson(rawText);
-    if (!repaired) return generateFallbackAnalysis(ctx);
-
-    const parsed = JSON.parse(repaired) as BusinessInsight;
-
-    if (!parsed.headline || !Array.isArray(parsed.implications) || !Array.isArray(parsed.recommendations)) {
-      return generateFallbackAnalysis(ctx);
-    }
-
-    return parsed;
   } catch (e) {
-    console.error(`[BA Agent] Refinement iteration ${iterationNumber} failed:`, (e as Error).message);
+    logger.error({ err: e }, `[BA Agent] Refinement iteration ${iterationNumber} failed`);
     return generateFallbackAnalysis(ctx);
   }
+}
+
+// ── Grounding verification ──
+
+export interface EvidenceMismatch {
+  implication_title: string;
+  metric_id: string;
+  claimed_value: number;
+  actual_value: number | undefined;
+}
+
+const EVIDENCE_TOLERANCE_PCT = 0.5;
+
+/**
+ * Check that every evidence-backed claim in an insight actually matches
+ * a computed metric (scenario or base P&L) within tolerance. Feeds the
+ * QA reflection loop's numeric-consistency check — an LLM asserting a
+ * number that isn't in the data it was given is a hallucination, not a
+ * stylistic nit, and should fail QA distinctly from "could be clearer."
+ */
+export async function verifyEvidence(
+  insight: BusinessInsight,
+  scenarioId: string,
+): Promise<{ ok: boolean; mismatches: EvidenceMismatch[] }> {
+  const ctx = await loadAnalysisContext(scenarioId);
+  const knownValues: Record<string, number> = { ...ctx.base_pl, ...ctx.pl };
+
+  const mismatches: EvidenceMismatch[] = [];
+  for (const imp of insight.implications) {
+    for (const ev of imp.evidence ?? []) {
+      const actual = knownValues[ev.metric_id];
+      if (actual == null) {
+        mismatches.push({ implication_title: imp.title, metric_id: ev.metric_id, claimed_value: ev.value, actual_value: undefined });
+        continue;
+      }
+      const tolerance = Math.max(Math.abs(actual) * (EVIDENCE_TOLERANCE_PCT / 100), 0.01);
+      if (Math.abs(ev.value - actual) > tolerance) {
+        mismatches.push({ implication_title: imp.title, metric_id: ev.metric_id, claimed_value: ev.value, actual_value: actual });
+      }
+    }
+  }
+  return { ok: mismatches.length === 0, mismatches };
 }

@@ -1,24 +1,49 @@
 /**
  * Document Service
  *
- * Handles document upload, text extraction, chunking, embedding, and storage.
- * Supports: PDF, TXT, MD, CSV
+ * Handles document upload, text extraction (LlamaParse + local fallback),
+ * chunking, and Postgres storage. Vector DB (Qdrant) has been removed.
+ * Supports: PDF, TXT, MD, CSV, XLSX, DOCX
  */
 
 import { pool } from "../db/index.js";
-import { embed } from "./embeddingService.js";
-import { upsertChunks, deleteDocumentChunks, type ChunkPoint } from "./qdrantService.js";
+import type { Role } from "../auth/provider.js";
 import { randomUUID } from "crypto";
+import ExcelJS from "exceljs";
+import { parse as parseCsv } from "csv-parse/sync";
+import { extractWorkbookGraph } from "./excelExtractor.js";
+import {
+  parseWithLlamaParse,
+  shouldUseLlamaParse,
+} from "./llamaParseService.js";
+import { logger } from "../logger.js";
+
+const CSV_TYPES = new Set(["text/csv", "csv"]);
+
+/**
+ * Parse CSV with proper quote/delimiter handling (was raw buffer.toString,
+ * which mangled quoted commas and multi-line cells) and render as
+ * tab-separated rows — the same shape the XLSX local extractor produces,
+ * so downstream chunking/LLM extraction sees a consistent format.
+ */
+export function extractCsvText(buffer: Buffer): string {
+  const records = parseCsv(buffer, {
+    bom: true,
+    relax_column_count: true,
+    skip_empty_lines: true,
+  }) as string[][];
+  return records
+    .map((row, i) => `Row ${i + 1}:\t${row.map((c) => c.trim()).join("\t")}`)
+    .join("\n");
+}
 
 // ── Text extraction ──
 
-async function extractText(buffer: Buffer, fileType: string): Promise<string> {
+async function extractTextLocal(buffer: Buffer, fileType: string, filename = ""): Promise<string> {
   if (fileType === "application/pdf" || fileType === "pdf") {
-    // pdf-parse v2+ uses a class-based API: new PDFParse({ data }) → load() → getText()
-    // getText() returns { pages, text, total } — we need the .text property
     const { createRequire } = await import("module");
     const require = createRequire(import.meta.url);
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
+     
     const { PDFParse } = require("pdf-parse") as {
       PDFParse: new (opts: { data: Uint8Array }) => {
         load: () => Promise<void>;
@@ -28,11 +53,64 @@ async function extractText(buffer: Buffer, fileType: string): Promise<string> {
     const parser = new PDFParse({ data: new Uint8Array(buffer) });
     await parser.load();
     const result = await parser.getText();
-    // Handle both string and object return types
     return typeof result === "string" ? result : result.text;
   }
-  // Plain text, markdown, CSV → use buffer as-is
+  if (
+    fileType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+    fileType === "xlsx"
+  ) {
+    const workbook = new ExcelJS.Workbook();
+    const arrayBuffer = buffer.buffer.slice(
+      buffer.byteOffset,
+      buffer.byteOffset + buffer.byteLength
+    ) as ArrayBuffer;
+    await workbook.xlsx.load(arrayBuffer);
+
+    const lines: string[] = [];
+    workbook.eachSheet((sheet) => {
+      lines.push(`Sheet: ${sheet.name}`);
+      sheet.eachRow((row, rowNumber) => {
+        const values = row.values as unknown[];
+        const cells = values
+          .slice(1)
+          .map((v) => (v == null ? "" : String(v).trim()))
+          .filter((v) => v.length > 0);
+        if (cells.length > 0) {
+          lines.push(`Row ${rowNumber}:\t${cells.join("\t")}`);
+        }
+      });
+      lines.push("");
+    });
+
+    return lines.join("\n");
+  }
+  if (CSV_TYPES.has(fileType) || /\.csv$/i.test(filename)) {
+    try {
+      return extractCsvText(buffer);
+    } catch {
+      // Malformed CSV (inconsistent quoting, binary content, etc.) — fall
+      // back to raw text rather than failing the whole upload.
+      return buffer.toString("utf-8");
+    }
+  }
   return buffer.toString("utf-8");
+}
+
+async function extractText(
+  buffer: Buffer,
+  fileType: string,
+  filename: string
+): Promise<{ text: string; parser: "llamaparse" | "local" }> {
+  if (shouldUseLlamaParse(fileType, filename)) {
+    try {
+      const text = await parseWithLlamaParse(buffer, filename);
+      return { text, parser: "llamaparse" };
+    } catch (e) {
+      logger.warn({ detail: (e as Error).message }, `[Documents] LlamaParse failed for ${filename}, falling back to local extract:`);
+    }
+  }
+  const text = await extractTextLocal(buffer, fileType, filename);
+  return { text, parser: "local" };
 }
 
 // ── Chunking ──
@@ -65,36 +143,21 @@ function chunkText(text: string): Chunk[] {
   return chunks;
 }
 
-// ── DB table auto-creation ──
-
-let tableEnsured = false;
-async function ensureTable(): Promise<void> {
-  if (tableEnsured) return;
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS documents (
-      document_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
-      name VARCHAR(255) NOT NULL,
-      original_filename VARCHAR(500) NOT NULL,
-      file_type VARCHAR(50) NOT NULL,
-      file_size_bytes INTEGER,
-      chunk_count INTEGER DEFAULT 0,
-      status VARCHAR(50) DEFAULT 'processing',
-      qdrant_collection VARCHAR(255),
-      created_by UUID REFERENCES users(user_id),
-      created_at TIMESTAMP DEFAULT NOW(),
-      updated_at TIMESTAMP DEFAULT NOW()
-    )
-  `);
-  tableEnsured = true;
-}
-
 // ── Public API ──
+
+/** Explicit column list — file_bytes is intentionally excluded from reads. */
+const DOCUMENT_COLUMNS =
+  "document_id, name, original_filename, file_type, document_kind, validation_status, " +
+  "file_size_bytes, chunk_count, status, model_schema, workbook_graph, qdrant_collection, " +
+  "created_by, created_at, updated_at";
 
 export interface DocumentRecord {
   document_id: string;
   name: string;
   original_filename: string;
   file_type: string;
+  document_kind?: "spreadsheet_model" | "document_text";
+  validation_status?: "processing" | "needs_validation" | "ready";
   file_size_bytes: number;
   chunk_count: number;
   status: string;
@@ -102,7 +165,7 @@ export interface DocumentRecord {
 }
 
 /**
- * Process an uploaded document: extract text, chunk, embed, store in Qdrant.
+ * Process an uploaded document: parse (LlamaParse or local), chunk, store in Postgres.
  */
 export async function processDocument(
   buffer: Buffer,
@@ -110,57 +173,67 @@ export async function processDocument(
   fileType: string,
   userId: string
 ): Promise<DocumentRecord> {
-  await ensureTable();
-
   const docName = originalFilename.replace(/\.[^.]+$/, "");
   const docId = randomUUID();
+  const normalizedFileType = (fileType || "unknown").slice(0, 255);
+  const isXlsx =
+    fileType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+    fileType === "xlsx" ||
+    /\.xlsx$/i.test(originalFilename);
+  const documentKind = isXlsx ? "spreadsheet_model" : "document_text";
 
-  // Insert document record (status: processing)
+  // Original bytes are persisted so spreadsheet models can be re-processed
+  // (cell-level simulation needs the full workbook, not just extracted text).
   await pool.query(
-    `INSERT INTO documents (document_id, name, original_filename, file_type, file_size_bytes, status, created_by)
-     VALUES ($1, $2, $3, $4, $5, 'processing', $6)`,
-    [docId, docName, originalFilename, fileType, buffer.length, userId]
+    `INSERT INTO documents (document_id, name, original_filename, file_type, file_size_bytes, status, created_by, document_kind, validation_status, file_bytes)
+     VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8, $9)`,
+    [docId, docName, originalFilename, normalizedFileType, buffer.length, userId, documentKind, "processing", buffer]
   );
 
   try {
-    // 1. Extract text
-    const text = await extractText(buffer, fileType);
+    let workbookGraph: Record<string, unknown> | null = null;
+    if (isXlsx) {
+      workbookGraph = await extractWorkbookGraph(buffer) as unknown as Record<string, unknown>;
+    }
+
+    const { text, parser } = await extractText(buffer, fileType, originalFilename);
     if (!text.trim()) {
       await pool.query("UPDATE documents SET status = 'error', updated_at = NOW() WHERE document_id = $1", [docId]);
       throw new Error("No text could be extracted from the document");
     }
 
-    // 2. Chunk
     const chunks = chunkText(text);
     if (chunks.length === 0) {
       await pool.query("UPDATE documents SET status = 'error', updated_at = NOW() WHERE document_id = $1", [docId]);
       throw new Error("Document is empty after chunking");
     }
 
-    // 3. Embed
-    const vectors = await embed(chunks.map((c) => c.text));
+    for (const chunk of chunks) {
+      await pool.query(
+        `INSERT INTO document_chunks (document_id, chunk_index, text)
+         VALUES ($1, $2, $3)
+         ON CONFLICT (document_id, chunk_index) DO UPDATE SET text = EXCLUDED.text`,
+        [docId, chunk.index, chunk.text]
+      );
+    }
 
-    // 4. Store in Qdrant
-    const points: ChunkPoint[] = chunks.map((chunk, i) => ({
-      id: randomUUID(), // Qdrant expects UUID or unsigned int as point IDs
-      vector: vectors[i],
-      payload: {
-        document_id: docId,
-        document_name: docName,
-        chunk_index: chunk.index,
-        text: chunk.text,
-      },
-    }));
-
-    await upsertChunks(points);
-
-    // 5. Update document record
     await pool.query(
-      "UPDATE documents SET chunk_count = $1, status = 'ready', qdrant_collection = $2, updated_at = NOW() WHERE document_id = $3",
-      [chunks.length, process.env.QDRANT_COLLECTION || "scenario_documents", docId]
+      `UPDATE documents
+       SET chunk_count = $1,
+           status = 'ready',
+           qdrant_collection = $2,
+           workbook_graph = $3,
+           updated_at = NOW()
+       WHERE document_id = $4`,
+      [
+        chunks.length,
+        parser === "llamaparse" ? "llamaparse" : "local",
+        workbookGraph ? JSON.stringify(workbookGraph) : null,
+        docId,
+      ]
     );
 
-    const r = await pool.query("SELECT * FROM documents WHERE document_id = $1", [docId]);
+    const r = await pool.query(`SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE document_id = $1`, [docId]);
     return r.rows[0];
   } catch (e) {
     await pool.query("UPDATE documents SET status = 'error', updated_at = NOW() WHERE document_id = $1", [docId]);
@@ -168,12 +241,84 @@ export async function processDocument(
   }
 }
 
+/** Load chunks from Postgres for context / RAG fallback. */
+export async function getDocumentChunksFromDb(documentIds: string[]): Promise<{
+  document_id: string;
+  document_name: string;
+  chunk_index: number;
+  text: string;
+}[]> {
+  if (documentIds.length === 0) return [];
+  const r = await pool.query(
+    `SELECT c.document_id, d.name AS document_name, c.chunk_index, c.text
+     FROM document_chunks c
+     JOIN documents d ON d.document_id = c.document_id
+     WHERE c.document_id = ANY($1::uuid[])
+     ORDER BY c.document_id, c.chunk_index`,
+    [documentIds]
+  );
+  return r.rows;
+}
+
+/**
+ * Simple keyword search over stored document chunks (Postgres).
+ */
+export async function searchDocumentChunksInDb(
+  question: string,
+  topK = 6,
+  documentId?: string
+): Promise<{
+  score: number;
+  text: string;
+  document_id: string;
+  document_name: string;
+  chunk_index: number;
+}[]> {
+  const terms = question
+    .toLowerCase()
+    .split(/\W+/)
+    .filter((t) => t.length > 2)
+    .slice(0, 8);
+  if (terms.length === 0) return [];
+
+  const params: unknown[] = [];
+  let where = "TRUE";
+  if (documentId) {
+    params.push(documentId);
+    where = `c.document_id = $${params.length}`;
+  }
+
+  const r = await pool.query(
+    `SELECT c.document_id, d.name AS document_name, c.chunk_index, c.text
+     FROM document_chunks c
+     JOIN documents d ON d.document_id = c.document_id
+     WHERE ${where}
+     ORDER BY c.created_at DESC
+     LIMIT 200`,
+    params
+  );
+
+  const scored = r.rows.map((row: { document_id: string; document_name: string; chunk_index: number; text: string }) => {
+    const lower = row.text.toLowerCase();
+    let hits = 0;
+    for (const t of terms) if (lower.includes(t)) hits++;
+    return { ...row, score: hits / terms.length };
+  });
+
+  return scored
+    .filter((s: { score: number }) => s.score > 0)
+    .sort((a: { score: number }, b: { score: number }) => b.score - a.score)
+    .slice(0, topK);
+}
+
 /**
  * List all documents.
  */
-export async function listDocuments(): Promise<DocumentRecord[]> {
-  await ensureTable();
-  const r = await pool.query("SELECT * FROM documents ORDER BY created_at DESC");
+export async function listDocuments(userId: string, role: Role): Promise<DocumentRecord[]> {
+  const r = await pool.query(
+    `SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE ($1::text = 'admin' OR created_by = $2) ORDER BY created_at DESC`,
+    [role, userId]
+  );
   return r.rows;
 }
 
@@ -181,16 +326,13 @@ export async function listDocuments(): Promise<DocumentRecord[]> {
  * Get a single document by ID.
  */
 export async function getDocument(documentId: string): Promise<DocumentRecord | null> {
-  await ensureTable();
-  const r = await pool.query("SELECT * FROM documents WHERE document_id = $1", [documentId]);
+  const r = await pool.query(`SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE document_id = $1`, [documentId]);
   return r.rows[0] || null;
 }
 
 /**
- * Delete a document and its chunks from Qdrant.
+ * Delete a document (chunks cascade via FK).
  */
 export async function deleteDocument(documentId: string): Promise<void> {
-  await ensureTable();
-  await deleteDocumentChunks(documentId);
   await pool.query("DELETE FROM documents WHERE document_id = $1", [documentId]);
 }

@@ -19,7 +19,7 @@ export interface ComparisonResult {
   metrics: ComparisonRow[];
   assumption_diff: {
     parameter: string;
-    base_value: string;
+    base_value: number | string;
     scenarios: (ScenarioRef & { value: string })[];
   }[];
   key_callouts: { label: string; base: number; scenario: number; delta: number; delta_pct: number | null }[];
@@ -30,28 +30,43 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
     throw new Error("Provide 1–4 scenario IDs to compare");
   }
 
-  // Fetch outputs for each scenario
-  const scenarioData: { id: string; name: string | null; nl_input: string; created_at: string; pl: Record<string, number> }[] = [];
-  for (const id of scenarioIds) {
-    const sRes = await pool.query("SELECT name, nl_input, created_at FROM scenarios WHERE scenario_id = $1", [id]);
-    const oRes = await pool.query(
-      "SELECT output_data FROM scenario_outputs WHERE scenario_id = $1 AND output_type = 'pl' ORDER BY created_at DESC LIMIT 1",
-      [id]
-    );
-    const rawOutput = oRes.rows[0]?.output_data ?? {};
+  // Batched lookups — one query per table instead of N per scenario.
+  const [scenariosRes, outputsRes, paramsRes] = await Promise.all([
+    pool.query(
+      "SELECT scenario_id, name, nl_input, created_at, model_version_hash FROM scenarios WHERE scenario_id = ANY($1::uuid[])",
+      [scenarioIds],
+    ),
+    pool.query(
+      `SELECT DISTINCT ON (scenario_id) scenario_id, output_data
+       FROM scenario_outputs
+       WHERE scenario_id = ANY($1::uuid[]) AND output_type = 'pl'
+       ORDER BY scenario_id, created_at DESC`,
+      [scenarioIds],
+    ),
+    pool.query(
+      "SELECT scenario_id, extracted_name, mapped_variable_id, scenario_value, status FROM scenario_parameters WHERE scenario_id = ANY($1::uuid[])",
+      [scenarioIds],
+    ),
+  ]);
+
+  const scenarioRowById = new Map(scenariosRes.rows.map((r) => [r.scenario_id, r]));
+  const outputByScenarioId = new Map(outputsRes.rows.map((r) => [r.scenario_id, r.output_data]));
+
+  const scenarioData = scenarioIds.map((id) => {
+    const row = scenarioRowById.get(id);
+    const rawOutput = outputByScenarioId.get(id) ?? {};
     const pl = rawOutput.aggregate ?? rawOutput;
-    scenarioData.push({
+    return {
       id,
-      name: sRes.rows[0]?.name ?? null,
-      nl_input: sRes.rows[0]?.nl_input ?? "",
-      created_at: sRes.rows[0]?.created_at ?? "",
+      name: row?.name ?? null,
+      nl_input: row?.nl_input ?? "",
+      created_at: row?.created_at ?? "",
       pl,
-    });
-  }
+    };
+  });
 
   // Look up model from the first scenario's model_version_hash
-  const modelRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioIds[0]]);
-  const modelHash = modelRef.rows[0]?.model_version_hash;
+  const modelHash = scenarioRowById.get(scenarioIds[0])?.model_version_hash;
   const model = await getModelDefinition(modelHash);
   if (!model) return { scenarios: [], metrics: [], assumption_diff: [], key_callouts: [] };
   const baseCtx = await computeBaseCase(model);
@@ -85,29 +100,31 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
     };
   });
 
-  // Assumption diff
+  // Assumption diff — base_value is the model's actual base for the
+  // parameter's mapped variable (was hardcoded to "—" for every row).
   const assumption_diff: ComparisonResult["assumption_diff"] = [];
-  const allParams = new Map<string, Map<string, string>>();
-  for (const s of scenarioData) {
-    const pRes = await pool.query(
-      "SELECT extracted_name, scenario_value, status FROM scenario_parameters WHERE scenario_id = $1",
-      [s.id]
-    );
-    for (const p of pRes.rows) {
-      if (!allParams.has(p.extracted_name)) allParams.set(p.extracted_name, new Map());
-      allParams.get(p.extracted_name)!.set(s.id, `${p.scenario_value} (${p.status})`);
+  const allParams = new Map<string, { variableId: string | null; values: Map<string, string> }>();
+  for (const p of paramsRes.rows as Array<{
+    scenario_id: string; extracted_name: string; mapped_variable_id: string | null; scenario_value: number; status: string;
+  }>) {
+    if (!allParams.has(p.extracted_name)) {
+      allParams.set(p.extracted_name, { variableId: p.mapped_variable_id, values: new Map() });
     }
+    allParams.get(p.extracted_name)!.values.set(p.scenario_id, `${p.scenario_value} (${p.status})`);
   }
-  for (const [param, vals] of allParams) {
+  for (const [param, { variableId, values }] of allParams) {
+    const baseValue = variableId && baseCtx[variableId] != null
+      ? Math.round(baseCtx[variableId] * 100) / 100
+      : "—";
     assumption_diff.push({
       parameter: param,
-      base_value: "—",
+      base_value: baseValue,
       scenarios: scenarioData.map((s) => ({
         scenario_id: s.id,
         name: s.name,
         nl_input: s.nl_input,
         created_at: s.created_at,
-        value: vals.get(s.id) ?? "—",
+        value: values.get(s.id) ?? "—",
       })),
     });
   }

@@ -61,7 +61,6 @@ export async function exportToPptx(scenarioId: string): Promise<Buffer> {
   const periodCount = periods.length || 1;
 
   // Create presentation
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any
   const pptx = new (PptxGenJS as any)();
   pptx.author = "Scenario Modeling | Deloitte";
   pptx.company = "Deloitte";

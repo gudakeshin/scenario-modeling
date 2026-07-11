@@ -1,133 +1,188 @@
 /**
  * Monte Carlo Simulation Engine
  *
- * Runs N iterations of the financial model with probabilistic distributions
- * applied to scenario parameters. Produces P10/P50/P90 confidence intervals
- * and per-metric distribution data for fan charts and histograms.
+ * Runs N iterations of the financial model (formula DAG or XLSX cell graph)
+ * with probabilistic distributions applied to scenario inputs.
+ *
+ * Statistical properties:
+ *  - Seeded PRNG (mulberry32) — every run is reproducible; the seed is
+ *    persisted with the result and can be passed back in to replay.
+ *  - Distributions: normal, lognormal, triangular, uniform, PERT.
+ *  - Optional pairwise correlations via Gaussian copula (Cholesky).
+ *  - Sample standard deviation (n-1), percentiles p5–p95, VaR/CVaR at 5%,
+ *    probability of negative outcome, and a 95% CI on the mean.
  */
 
 import { pool } from "../db/index.js";
-import { getModelDefinition, getPLMetrics, getPercentDeltaVars, type ModelVariable } from "../models/registry.js";
+import { monteCarloIterations } from "../metrics.js";
+import {
+  getEvaluableModelForScenario,
+  loadScenarioOverrides,
+  resolveOverridesToAbsolute,
+} from "./modelResolver.js";
+import type { DeltaType, EvaluableModel } from "./expression.js";
+import {
+  mulberry32,
+  randomSeed,
+  normal01,
+  normalCdf,
+  lognormalRandom,
+  triangularRandom,
+  uniformRandom,
+  pertRandom,
+  cholesky,
+  type Rng,
+} from "./random.js";
 
 // ── Distribution types ──
 
-export type DistributionType = "normal" | "triangular" | "uniform";
+export type DistributionType = "normal" | "lognormal" | "triangular" | "uniform" | "pert";
 
 export interface DistributionConfig {
   variable_id: string;
   type: DistributionType;
-  /** For normal: mean; for triangular: mode; for uniform: ignored (uses min/max) */
+  /** Center of the distribution: mean (normal/lognormal) or mode (triangular/PERT). */
   base_value: number;
-  /** Standard deviation (normal), or spread factor. For triangular/uniform: min bound */
+  /** Lower bound for triangular/uniform/PERT. Default: base * 0.8. */
   min?: number;
-  /** For triangular/uniform: max bound */
+  /** Upper bound for triangular/uniform/PERT. Default: base * 1.2. */
   max?: number;
-  /** For normal: stddev. Default = 10% of base_value */
+  /** Stddev for normal/lognormal. Default: 10% of |base|. */
   stddev?: number;
+  /**
+   * How the sampled value is applied to the model input:
+   *  - "percent": sampled value is a % delta on the input's base value
+   *  - "absolute": sampled value IS the input value
+   * Default "percent" (matches scenario parameters, which are deltas).
+   */
+  delta_type?: DeltaType;
+}
+
+export interface CorrelationSpec {
+  a: string;
+  b: string;
+  rho: number;
 }
 
 export interface MonteCarloConfig {
   scenario_id: string;
   iterations: number;
   distributions: DistributionConfig[];
+  correlations?: CorrelationSpec[];
+  /** Reproducibility: pass a previous run's seed to replay it exactly. */
+  seed?: number;
 }
 
 export interface PercentileResult {
+  p5: number;
   p10: number;
+  p25: number;
   p50: number;
+  p75: number;
   p90: number;
+  p95: number;
   mean: number;
+  /** Sample standard deviation (n-1). */
   stddev: number;
   min: number;
   max: number;
+  /** Value at Risk at 5% (the p5 outcome). */
+  var_5: number;
+  /** Conditional VaR: mean of outcomes at or below p5. */
+  cvar_5: number;
+  /** Probability the metric is negative. */
+  prob_negative: number;
+  /** 95% confidence interval on the mean. */
+  mean_ci_95: [number, number];
 }
 
 export interface MonteCarloResult {
   iterations: number;
+  requested_iterations: number;
+  seed: number;
   metrics: Record<string, PercentileResult>;
   /** Raw distribution data: metric → array of iteration values (for histograms) */
   distributions: Record<string, number[]>;
-  /** Fan chart data: sorted percentile bands per metric */
-  fan_chart: Record<string, { p10: number; p25: number; p50: number; p75: number; p90: number }>;
+  /** Percentile bands per metric */
+  fan_chart: Record<string, { p5: number; p10: number; p25: number; p50: number; p75: number; p90: number; p95: number }>;
+  correlations_applied: boolean;
+  notices?: string[];
 }
 
-// ── RNG helpers ──
+// ── Sampling ──
 
-/** Box-Muller transform for normal distribution */
-function normalRandom(mean: number, stddev: number): number {
-  const u1 = Math.random();
-  const u2 = Math.random();
-  const z = Math.sqrt(-2 * Math.log(u1)) * Math.cos(2 * Math.PI * u2);
-  return mean + z * stddev;
+const COPULA_SUPPORTED: ReadonlySet<DistributionType> = new Set([
+  "normal",
+  "lognormal",
+  "triangular",
+  "uniform",
+]);
+
+function defaultStddev(base: number): number {
+  return Math.abs(base * 0.1) || 1;
 }
 
-function triangularRandom(min: number, mode: number, max: number): number {
-  const u = Math.random();
-  const fc = (mode - min) / (max - min);
-  if (u < fc) {
-    return min + Math.sqrt(u * (max - min) * (mode - min));
-  }
-  return max - Math.sqrt((1 - u) * (max - min) * (max - mode));
+function defaultBounds(config: DistributionConfig): { min: number; max: number } {
+  const lo = config.min ?? Math.min(config.base_value * 0.8, config.base_value * 1.2);
+  const hi = config.max ?? Math.max(config.base_value * 0.8, config.base_value * 1.2);
+  return { min: lo, max: hi };
 }
 
-function uniformRandom(min: number, max: number): number {
-  return min + Math.random() * (max - min);
-}
-
-function sampleDistribution(config: DistributionConfig): number {
+/** Sample independently (no copula). */
+function sampleDistribution(rng: Rng, config: DistributionConfig): number {
   switch (config.type) {
-    case "normal": {
-      const sd = config.stddev ?? (Math.abs(config.base_value * 0.1) || 1);
-      return normalRandom(config.base_value, sd);
-    }
+    case "normal":
+      return config.base_value + normal01(rng) * (config.stddev ?? defaultStddev(config.base_value));
+    case "lognormal":
+      return lognormalRandom(rng, config.base_value, config.stddev ?? defaultStddev(config.base_value));
     case "triangular": {
-      const min = config.min ?? config.base_value * 0.8;
-      const max = config.max ?? config.base_value * 1.2;
-      return triangularRandom(min, config.base_value, max);
+      const { min, max } = defaultBounds(config);
+      return triangularRandom(rng, min, config.base_value, max);
     }
     case "uniform": {
-      const min = config.min ?? config.base_value * 0.8;
-      const max = config.max ?? config.base_value * 1.2;
-      return uniformRandom(min, max);
+      const { min, max } = defaultBounds(config);
+      return uniformRandom(rng, min, max);
+    }
+    case "pert": {
+      const { min, max } = defaultBounds(config);
+      return pertRandom(rng, min, config.base_value, max);
     }
     default:
       return config.base_value;
   }
 }
 
-// ── Topological sort & formula eval (duplicated for isolation) ──
-
-function topologicalSort(variables: ModelVariable[]): string[] {
-  const order: string[] = [];
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-  const byId = new Map(variables.map((v) => [v.id, v]));
-  function visit(id: string) {
-    if (visited.has(id)) return;
-    if (visiting.has(id)) throw new Error(`Circular dependency: ${id}`);
-    visiting.add(id);
-    const v = byId.get(id);
-    if (v) for (const d of v.dependencies) visit(d);
-    visiting.delete(id);
-    visited.add(id);
-    order.push(id);
-  }
-  for (const v of variables) visit(v.id);
-  return order; // DFS post-order: dependencies are pushed before dependents
-}
-
-function evaluateFormula(formula: string, ctx: Record<string, number>): number {
-  let expr = formula.trim();
-  for (const [k, v] of Object.entries(ctx)) {
-    expr = expr.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"), String(v));
-  }
-  if (!/^[\d\s+\-*/().]+$/.test(expr)) return 0;
-  try {
-    return new Function(`return (${expr})`)();
-  } catch {
-    return 0;
+/** Transform a standard normal draw into the target distribution (Gaussian copula). */
+function transformNormalDraw(z: number, config: DistributionConfig): number {
+  switch (config.type) {
+    case "normal":
+      return config.base_value + z * (config.stddev ?? defaultStddev(config.base_value));
+    case "lognormal": {
+      const mean = config.base_value;
+      const sd = config.stddev ?? defaultStddev(mean);
+      const variance = sd * sd;
+      const mu = Math.log(mean * mean / Math.sqrt(variance + mean * mean));
+      const sigma = Math.sqrt(Math.log(1 + variance / (mean * mean)));
+      return Math.exp(mu + sigma * z);
+    }
+    case "uniform": {
+      const { min, max } = defaultBounds(config);
+      return min + normalCdf(z) * (max - min);
+    }
+    case "triangular": {
+      const { min, max } = defaultBounds(config);
+      const mode = config.base_value;
+      const u = normalCdf(z);
+      const fc = (mode - min) / (max - min);
+      if (u < fc) return min + Math.sqrt(u * (max - min) * (mode - min));
+      return max - Math.sqrt((1 - u) * (max - min) * (max - mode));
+    }
+    default:
+      return config.base_value;
   }
 }
+
+// ── Statistics ──
 
 function percentile(sorted: number[], p: number): number {
   const idx = (p / 100) * (sorted.length - 1);
@@ -137,127 +192,209 @@ function percentile(sorted: number[], p: number): number {
   return sorted[lo] + (sorted[hi] - sorted[lo]) * (idx - lo);
 }
 
-function stddev(arr: number[], mean: number): number {
+function sampleStddev(arr: number[], mean: number): number {
+  if (arr.length < 2) return 0;
   const sumSq = arr.reduce((s, v) => s + (v - mean) ** 2, 0);
-  return Math.sqrt(sumSq / arr.length);
+  return Math.sqrt(sumSq / (arr.length - 1));
+}
+
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 // ── Main engine ──
 
-// PL_METRICS and PERCENT_DELTA_VARS are now derived dynamically inside runMonteCarlo
+export const MC_MIN_ITERATIONS = 100;
+export const MC_MAX_ITERATIONS = 20_000;
+export const MC_DEFAULT_ITERATIONS = 10_000;
+const MC_TIME_BUDGET_MS = Number(process.env.MC_TIME_BUDGET_MS) || 30_000;
+
+class McConfigError extends Error {
+  status = 422;
+}
 
 export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarloResult> {
-  const iterations = Math.min(Math.max(config.iterations || 1000, 100), 10000);
-
-  // Load model
-  const scenarioRes = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [config.scenario_id]);
-  if (scenarioRes.rows.length === 0) throw new Error("Scenario not found");
-  const model = await getModelDefinition(scenarioRes.rows[0].model_version_hash);
-  if (!model) throw new Error("No model found. Please build a model from your documents first.");
-  const order = topologicalSort(model.variables);
-
-  // Derive from model — not hardcoded
-  const PL_METRICS = getPLMetrics(model);
-  const PERCENT_DELTA_VARS = getPercentDeltaVars(model);
-
-  // Load scenario overrides (deterministic)
-  const paramsRes = await pool.query(
-    "SELECT mapped_variable_id, scenario_value, status FROM scenario_parameters WHERE scenario_id = $1 AND status IN ('pending','accepted','modified')",
-    [config.scenario_id]
+  const requestedIterations = Math.min(
+    Math.max(config.iterations || MC_DEFAULT_ITERATIONS, MC_MIN_ITERATIONS),
+    MC_MAX_ITERATIONS,
   );
-  const deterministicOverrides = new Map<string, number>();
-  for (const row of paramsRes.rows) {
-    deterministicOverrides.set(row.mapped_variable_id, Number(row.scenario_value));
+  const seed = config.seed != null && Number.isFinite(config.seed) ? config.seed >>> 0 : randomSeed();
+  const rng = mulberry32(seed);
+  const notices: string[] = [];
+
+  const resolved = await getEvaluableModelForScenario(config.scenario_id);
+  const model: EvaluableModel = resolved.model;
+  const outputIds = model.outputIds;
+  if (outputIds.length === 0) throw new McConfigError("Model has no output metrics to simulate");
+
+  // Deterministic scenario overrides applied to every iteration
+  const overrides = await loadScenarioOverrides(config.scenario_id);
+  const { absolute: deterministicAbs } = resolveOverridesToAbsolute(model, overrides);
+
+  const inputBaseById = new Map(model.inputs.map((i) => [i.id, i.base]));
+
+  // Validate distributions
+  const dists = config.distributions.filter((d) => d && d.variable_id);
+  for (const d of dists) {
+    if (!Number.isFinite(d.base_value)) {
+      throw new McConfigError(`Distribution for '${d.variable_id}' has a non-numeric base_value`);
+    }
+    if (d.type === "lognormal" && d.base_value <= 0) {
+      throw new McConfigError(`Lognormal distribution for '${d.variable_id}' requires a positive base_value`);
+    }
   }
 
-  // Build distribution lookup
-  const distMap = new Map<string, DistributionConfig>();
-  for (const d of config.distributions) {
-    distMap.set(d.variable_id, d);
+  // ── Correlation setup (Gaussian copula) ──
+  let correlated: { order: string[]; L: number[][] } | null = null;
+  const correlations = (config.correlations || []).filter((c) => c && c.a && c.b);
+  if (correlations.length > 0) {
+    const distById = new Map(dists.map((d) => [d.variable_id, d]));
+    const corrVars = [...new Set(correlations.flatMap((c) => [c.a, c.b]))];
+    for (const v of corrVars) {
+      const d = distById.get(v);
+      if (!d) throw new McConfigError(`Correlation references '${v}' which has no distribution`);
+      if (!COPULA_SUPPORTED.has(d.type)) {
+        throw new McConfigError(
+          `Correlated sampling is not supported for '${d.type}' distributions (variable '${v}'). ` +
+            "Use normal, lognormal, triangular, or uniform for correlated variables.",
+        );
+      }
+    }
+    for (const c of correlations) {
+      if (!Number.isFinite(c.rho) || c.rho < -1 || c.rho > 1) {
+        throw new McConfigError(`Correlation between '${c.a}' and '${c.b}' must be in [-1, 1]`);
+      }
+    }
+    const n = corrVars.length;
+    const matrix: number[][] = Array.from({ length: n }, (_, i) =>
+      Array.from({ length: n }, (_, j) => (i === j ? 1 : 0)),
+    );
+    const idx = new Map(corrVars.map((v, i) => [v, i]));
+    for (const c of correlations) {
+      const i = idx.get(c.a)!;
+      const j = idx.get(c.b)!;
+      matrix[i][j] = c.rho;
+      matrix[j][i] = c.rho;
+    }
+    let L: number[][];
+    try {
+      L = cholesky(matrix);
+    } catch (e) {
+      throw new McConfigError((e as Error).message);
+    }
+    correlated = { order: corrVars, L };
   }
 
-  // Compute base context once
-  const baseCtx: Record<string, number> = {};
-  for (const id of order) {
-    const v = model.variables.find((x) => x.id === id);
-    if (!v) continue;
-    baseCtx[id] = evaluateFormula(v.formula, baseCtx);
-  }
-
-  // Run iterations
+  // ── Iterations ──
   const results: Record<string, number[]> = {};
-  for (const m of PL_METRICS) results[m] = [];
+  for (const m of outputIds) results[m] = [];
 
-  for (let i = 0; i < iterations; i++) {
-    const ctx: Record<string, number> = { ...baseCtx };
+  const startedAt = Date.now();
+  let completed = 0;
+  const correlatedSet = new Set(correlated?.order ?? []);
 
-    // Apply deterministic overrides first
-    for (const [id, val] of deterministicOverrides) {
-      if (PERCENT_DELTA_VARS.has(id) && val >= 0 && val <= 100 && baseCtx[id] != null) {
-        ctx[id] = baseCtx[id] * (1 + val / 100);
-      } else {
-        ctx[id] = val;
+  monteCarloIterations.inc(requestedIterations);
+  for (let i = 0; i < requestedIterations; i++) {
+    const absVals: Record<string, number> = { ...deterministicAbs };
+
+    // Correlated block first (consumes one normal draw per correlated var)
+    if (correlated) {
+      const { order, L } = correlated;
+      const z = order.map(() => normal01(rng));
+      for (let r = 0; r < order.length; r++) {
+        let zc = 0;
+        for (let k = 0; k <= r; k++) zc += L[r][k] * z[k];
+        const dist = dists.find((d) => d.variable_id === order[r])!;
+        applySampled(absVals, dist, transformNormalDraw(zc, dist), inputBaseById, notices);
       }
     }
 
-    // Apply stochastic perturbation from distributions
-    for (const [varId, dist] of distMap) {
-      const sampled = sampleDistribution(dist);
-      if (PERCENT_DELTA_VARS.has(varId) && baseCtx[varId] != null) {
-        // treat sampled value as percentage delta
-        ctx[varId] = baseCtx[varId] * (1 + sampled / 100);
-      } else {
-        ctx[varId] = sampled;
-      }
+    // Independent distributions
+    for (const dist of dists) {
+      if (correlatedSet.has(dist.variable_id)) continue;
+      applySampled(absVals, dist, sampleDistribution(rng, dist), inputBaseById, notices);
     }
 
-    // Re-evaluate dependent variables
-    for (const id of order) {
-      if (deterministicOverrides.has(id) || distMap.has(id)) continue;
-      const v = model.variables.find((x) => x.id === id);
-      if (!v) continue;
-      ctx[id] = evaluateFormula(v.formula, ctx);
+    const out = model.evaluate(absVals);
+    for (const m of outputIds) {
+      results[m].push(round2(out[m] ?? 0));
     }
+    completed++;
 
-    for (const m of PL_METRICS) {
-      results[m].push(Math.round((ctx[m] ?? 0) * 100) / 100);
+    // Soft time budget so huge XLSX models degrade gracefully
+    if ((i & 0x1ff) === 0x1ff && Date.now() - startedAt > MC_TIME_BUDGET_MS) {
+      notices.push(
+        `Stopped after ${completed} of ${requestedIterations} iterations (time budget ${MC_TIME_BUDGET_MS / 1000}s). ` +
+          "Results are statistically valid for the completed sample size.",
+      );
+      break;
     }
   }
 
-  // Compute statistics
+  // ── Statistics ──
   const metrics: Record<string, PercentileResult> = {};
-  const fan_chart: Record<string, { p10: number; p25: number; p50: number; p75: number; p90: number }> = {};
+  const fan_chart: MonteCarloResult["fan_chart"] = {};
 
-  for (const m of PL_METRICS) {
-    const arr = results[m].sort((a, b) => a - b);
-    const mean = arr.reduce((s, v) => s + v, 0) / arr.length;
+  for (const m of outputIds) {
+    const arr = results[m].slice().sort((a, b) => a - b);
+    const n = arr.length;
+    const mean = arr.reduce((s, v) => s + v, 0) / n;
+    const sd = sampleStddev(arr, mean);
+    const p5 = percentile(arr, 5);
+    const tail = arr.filter((v) => v <= p5);
+    const cvar = tail.length > 0 ? tail.reduce((s, v) => s + v, 0) / tail.length : p5;
+    const ciHalf = 1.96 * (sd / Math.sqrt(n));
+
     metrics[m] = {
-      p10: Math.round(percentile(arr, 10) * 100) / 100,
-      p50: Math.round(percentile(arr, 50) * 100) / 100,
-      p90: Math.round(percentile(arr, 90) * 100) / 100,
-      mean: Math.round(mean * 100) / 100,
-      stddev: Math.round(stddev(arr, mean) * 100) / 100,
+      p5: round2(p5),
+      p10: round2(percentile(arr, 10)),
+      p25: round2(percentile(arr, 25)),
+      p50: round2(percentile(arr, 50)),
+      p75: round2(percentile(arr, 75)),
+      p90: round2(percentile(arr, 90)),
+      p95: round2(percentile(arr, 95)),
+      mean: round2(mean),
+      stddev: round2(sd),
       min: arr[0],
-      max: arr[arr.length - 1],
+      max: arr[n - 1],
+      var_5: round2(p5),
+      cvar_5: round2(cvar),
+      prob_negative: round2(arr.filter((v) => v < 0).length / n),
+      mean_ci_95: [round2(mean - ciHalf), round2(mean + ciHalf)],
     };
     fan_chart[m] = {
+      p5: metrics[m].p5,
       p10: metrics[m].p10,
-      p25: Math.round(percentile(arr, 25) * 100) / 100,
+      p25: metrics[m].p25,
       p50: metrics[m].p50,
-      p75: Math.round(percentile(arr, 75) * 100) / 100,
+      p75: metrics[m].p75,
       p90: metrics[m].p90,
+      p95: metrics[m].p95,
     };
   }
 
-  // Store result
+  const dedupedNotices = [...new Set(notices)];
+
+  // Store result (seed included for reproducibility / audit)
   await pool.query(
     `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'monte_carlo', $2)`,
-    [config.scenario_id, JSON.stringify({ iterations, metrics, fan_chart })]
+    [
+      config.scenario_id,
+      JSON.stringify({
+        iterations: completed,
+        requested_iterations: requestedIterations,
+        seed,
+        metrics,
+        fan_chart,
+        correlations_applied: !!correlated,
+        ...(dedupedNotices.length > 0 ? { notices: dedupedNotices } : {}),
+      }),
+    ],
   );
 
-  // Return truncated distributions (max 200 bins for histogram)
+  // Return truncated distributions (max 200 samples per metric for histograms)
   const truncatedDist: Record<string, number[]> = {};
-  for (const m of PL_METRICS) {
+  for (const m of outputIds) {
     if (results[m].length > 200) {
       const step = Math.floor(results[m].length / 200);
       truncatedDist[m] = results[m].filter((_, idx) => idx % step === 0);
@@ -266,5 +403,37 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
     }
   }
 
-  return { iterations, metrics, distributions: truncatedDist, fan_chart };
+  return {
+    iterations: completed,
+    requested_iterations: requestedIterations,
+    seed,
+    metrics,
+    distributions: truncatedDist,
+    fan_chart,
+    correlations_applied: !!correlated,
+    ...(dedupedNotices.length > 0 ? { notices: dedupedNotices } : {}),
+  };
+}
+
+/** Apply one sampled value to the absolute input map, honoring delta semantics. */
+function applySampled(
+  absVals: Record<string, number>,
+  dist: DistributionConfig,
+  sampled: number,
+  inputBaseById: Map<string, number>,
+  notices: string[],
+): void {
+  const deltaType: DeltaType = dist.delta_type ?? "percent";
+  if (deltaType === "percent") {
+    const base = inputBaseById.get(dist.variable_id);
+    if (base == null || base === 0) {
+      notices.push(
+        `Distribution for '${dist.variable_id}' was skipped — percent deltas need a non-zero model base value.`,
+      );
+      return;
+    }
+    absVals[dist.variable_id] = base * (1 + sampled / 100);
+  } else {
+    absVals[dist.variable_id] = sampled;
+  }
 }

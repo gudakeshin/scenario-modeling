@@ -9,6 +9,7 @@
  */
 
 import OpenAI from "openai";
+import { logger } from "../logger.js";
 
 export interface SearchResult {
   query: string;
@@ -67,7 +68,7 @@ export function needsExternalSearch(nlInput: string): boolean {
 export async function searchPerplexity(nlInput: string): Promise<SearchResult | null> {
   const apiKey = process.env.PERPLEXITY_API_KEY;
   if (!apiKey) {
-    console.warn("PERPLEXITY_API_KEY not set — skipping external search");
+    logger.warn("PERPLEXITY_API_KEY not set — skipping external search");
     return null;
   }
 
@@ -144,7 +145,7 @@ Be precise with numbers. Always cite the approximate time frame of data (e.g., "
       has_quantitative_data: hasQuantitative,
     };
   } catch (e) {
-    console.error("Perplexity search failed:", (e as Error).message);
+    logger.error({ err: e }, "Perplexity search failed");
     return null;
   }
 }

@@ -1,19 +1,13 @@
 /**
- * RAG (Retrieval-Augmented Generation) Service
- *
- * Combines Qdrant vector search with Claude to answer questions about documents.
- * Flow:
- *  1. Embed the user's question
- *  2. Search Qdrant for top-K relevant chunks
- *  3. Build a context-rich prompt with the retrieved chunks
- *  4. Send to Claude for a grounded answer
+ * RAG Service — retrieve document chunks from Postgres and answer with Claude.
+ * (Qdrant removed; LlamaParse handles ingest parsing.)
  */
 
-import { embed } from "./embeddingService.js";
-import { searchChunks, type SearchResult } from "./qdrantService.js";
+import { searchDocumentChunksInDb } from "./documentService.js";
 import { callClaude } from "./llmClient.js";
+import { logger } from "../logger.js";
 
-const TOP_K = 6; // Number of chunks to retrieve
+const TOP_K = 6;
 
 export interface RAGResponse {
   answer: string;
@@ -23,32 +17,14 @@ export interface RAGResponse {
     chunk_index: number;
     score: number;
   }[];
-  /** If Qdrant or Claude unavailable, this explains the limitation */
   notice?: string;
 }
 
-/**
- * Answer a question about a document (or all documents) using RAG.
- */
 export async function queryDocument(
   question: string,
   documentId?: string
 ): Promise<RAGResponse> {
-  // 1. Embed the question
-  const [queryVector] = await embed([question]);
-
-  // 2. Search Qdrant
-  let results: SearchResult[];
-  try {
-    results = await searchChunks(queryVector, TOP_K, documentId);
-  } catch (e) {
-    console.error("Qdrant search failed:", e);
-    return {
-      answer: "I couldn't search the document database. Please check the Qdrant connection settings.",
-      sources: [],
-      notice: "Qdrant search failed: " + (e as Error).message,
-    };
-  }
+  const results = await searchDocumentChunksInDb(question, TOP_K, documentId);
 
   if (results.length === 0) {
     return {
@@ -57,7 +33,6 @@ export async function queryDocument(
     };
   }
 
-  // 3. Build context from retrieved chunks
   const context = results
     .map((r, i) => `[Source ${i + 1}] (${r.document_name}, chunk ${r.chunk_index}, relevance: ${(r.score * 100).toFixed(0)}%)\n${r.text}`)
     .join("\n\n---\n\n");
@@ -78,7 +53,6 @@ Question: ${question}
 
 Please answer based on the document excerpts above. Cite your sources using [Source N] references.`;
 
-  // 4. Call Claude
   let answer: string;
   try {
     answer = await callClaude({
@@ -87,8 +61,7 @@ Please answer based on the document excerpts above. Cite your sources using [Sou
       maxTokens: 1500,
     });
   } catch (e) {
-    console.error("Claude call failed in RAG:", e);
-    // Fall back: return the raw chunks
+    logger.error({ err: e }, "Claude call failed in RAG:");
     answer =
       "I found relevant passages but couldn't generate a synthesized answer (AI service unavailable).\n\n" +
       results

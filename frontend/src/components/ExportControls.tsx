@@ -1,6 +1,7 @@
 "use client";
 
 import { useState } from "react";
+import { toast } from "sonner";
 import { getExcelExportUrl, getCsvExportUrl, getPptxExportUrl, downloadWithAuth } from "@/lib/api";
 
 interface ExportControlsProps {
@@ -18,7 +19,7 @@ export function ExportControls({ scenarioId }: ExportControlsProps) {
       const url = urlMap[format](scenarioId);
       await downloadWithAuth(url, `scenario_${scenarioId.slice(0, 8)}.${extMap[format]}`);
     } catch (e) {
-      alert("Export failed: " + (e as Error).message);
+      toast.error("Export failed", { description: (e as Error).message });
     }
     setDownloading(null);
   };

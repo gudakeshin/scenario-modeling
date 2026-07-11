@@ -1,83 +1,52 @@
 /**
  * Sensitivity Analysis / Tornado Chart Service
  *
- * For each input variable, perturbs it ±X% from its base value
- * while holding everything else constant, and measures the impact
- * on a target metric (default: net_income). Produces ranked bars
- * for a tornado chart.
+ * One-at-a-time perturbation: each input is swung ±X% around its value in
+ * the SCENARIO being analyzed (base + the scenario's own parameter
+ * overrides — previously the overrides were loaded but never applied, so
+ * the tornado was always centered on the model base instead).
+ *
+ * Inputs whose scenario value is exactly 0 are perturbed by an absolute
+ * step instead of being skipped, and are annotated as such.
  */
 
 import { pool } from "../db/index.js";
-import { getModelDefinition, getInputVariables as getModelInputVars, type ModelVariable } from "../models/registry.js";
+import {
+  getEvaluableModelForScenario,
+  loadScenarioOverrides,
+  resolveOverridesToAbsolute,
+} from "./modelResolver.js";
 
 export interface TornadoBar {
   variable_id: string;
   variable_name: string;
   low_value: number;    // metric value when variable is at -swing%
   high_value: number;   // metric value when variable is at +swing%
-  base_value: number;   // metric value at base
+  base_value: number;   // metric value at the scenario baseline
   low_delta: number;    // low_value - base_value
   high_delta: number;   // high_value - base_value
   spread: number;       // |high_value - low_value|
+  /** True when the input's scenario value was 0 and an absolute step was used. */
+  absolute_step?: boolean;
 }
 
 export interface SensitivityResult {
   target_metric: string;
   swing_pct: number;
+  /** Metric value at the scenario baseline (scenario overrides applied). */
   base_metric_value: number;
+  /** Overrides from the scenario were applied before perturbation. */
+  scenario_applied: boolean;
   bars: TornadoBar[];
+  notices?: string[];
 }
 
-// ── Helpers (isolated copies) ──
-
-function topologicalSort(variables: ModelVariable[]): string[] {
-  const order: string[] = [];
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-  const byId = new Map(variables.map((v) => [v.id, v]));
-  function visit(id: string) {
-    if (visited.has(id)) return;
-    if (visiting.has(id)) throw new Error(`Circular dependency: ${id}`);
-    visiting.add(id);
-    const v = byId.get(id);
-    if (v) for (const d of v.dependencies) visit(d);
-    visiting.delete(id);
-    visited.add(id);
-    order.push(id);
-  }
-  for (const v of variables) visit(v.id);
-  return order; // DFS post-order: dependencies are pushed before dependents
+class SensitivityError extends Error {
+  status = 422;
 }
 
-function evaluateFormula(formula: string, ctx: Record<string, number>): number {
-  let expr = formula.trim();
-  for (const [k, v] of Object.entries(ctx)) {
-    expr = expr.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"), String(v));
-  }
-  if (!/^[\d\s+\-*/().]+$/.test(expr)) return 0;
-  try {
-    return new Function(`return (${expr})`)();
-  } catch {
-    return 0;
-  }
-}
-
-function evalModel(
-  order: string[],
-  variables: ModelVariable[],
-  overrides: Record<string, number>
-): Record<string, number> {
-  const ctx: Record<string, number> = {};
-  for (const id of order) {
-    if (id in overrides) {
-      ctx[id] = overrides[id];
-      continue;
-    }
-    const v = variables.find((x) => x.id === id);
-    if (!v) continue;
-    ctx[id] = evaluateFormula(v.formula, ctx);
-  }
-  return ctx;
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
 export async function runSensitivity(
@@ -85,53 +54,65 @@ export async function runSensitivity(
   targetMetric = "net_income",
   swingPct = 20
 ): Promise<SensitivityResult> {
-  const scenarioRes = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
-  if (scenarioRes.rows.length === 0) throw new Error("Scenario not found");
+  const resolved = await getEvaluableModelForScenario(scenarioId);
+  const model = resolved.model;
 
-  const model = await getModelDefinition(scenarioRes.rows[0].model_version_hash);
-  if (!model) throw new Error("No model found. Please build a model from your documents first.");
-  const order = topologicalSort(model.variables);
-  const inputs = getModelInputVars(model);
+  // Scenario baseline: model base + the scenario's own overrides
+  const overrides = await loadScenarioOverrides(scenarioId);
+  const { absolute: scenarioAbs, unresolved } = resolveOverridesToAbsolute(model, overrides);
+  const scenarioCtx = model.evaluate(scenarioAbs);
 
-  // Load scenario overrides
-  const paramsRes = await pool.query(
-    "SELECT mapped_variable_id, scenario_value FROM scenario_parameters WHERE scenario_id = $1 AND status IN ('pending','accepted','modified')",
-    [scenarioId]
-  );
-  const scenarioOverrides: Record<string, number> = {};
-  for (const row of paramsRes.rows) {
-    scenarioOverrides[row.mapped_variable_id] = Number(row.scenario_value);
+  if (!(targetMetric in scenarioCtx)) {
+    throw new SensitivityError(
+      `Unknown target metric '${targetMetric}'. Available metrics: ${model.outputIds.join(", ")}`,
+    );
   }
-
-  // Base run
-  const baseCtx = evalModel(order, model.variables, {});
-  const baseMetricValue = baseCtx[targetMetric] ?? 0;
+  const baseMetricValue = scenarioCtx[targetMetric] ?? 0;
 
   const bars: TornadoBar[] = [];
   const swing = swingPct / 100;
+  const notices: string[] = [];
+  if (unresolved.length > 0) {
+    notices.push(
+      `Percent overrides for ${unresolved.join(", ")} could not be applied (no non-zero base value).`,
+    );
+  }
 
-  for (const input of inputs) {
-    const baseVal = baseCtx[input.id] ?? 0;
-    if (baseVal === 0) continue;
+  for (const input of model.inputs) {
+    // The input's value in the scenario (override if present, else base)
+    const scenarioVal = scenarioAbs[input.id] ?? input.base;
 
-    const lowOverrides = { [input.id]: baseVal * (1 - swing) };
-    const highOverrides = { [input.id]: baseVal * (1 + swing) };
+    let low: number;
+    let high: number;
+    let absoluteStep = false;
+    if (scenarioVal === 0) {
+      // Zero baseline: swing by an absolute step derived from the model
+      // base (or ±1.0 as a last resort) instead of dropping the driver.
+      const step = Math.abs(input.base) > 0 ? Math.abs(input.base) * swing : swing * 5;
+      low = -step;
+      high = step;
+      absoluteStep = true;
+    } else {
+      low = scenarioVal * (1 - swing);
+      high = scenarioVal * (1 + swing);
+    }
 
-    const lowCtx = evalModel(order, model.variables, lowOverrides);
-    const highCtx = evalModel(order, model.variables, highOverrides);
+    const lowCtx = model.evaluate({ ...scenarioAbs, [input.id]: low });
+    const highCtx = model.evaluate({ ...scenarioAbs, [input.id]: high });
 
-    const lowMetric = Math.round((lowCtx[targetMetric] ?? 0) * 100) / 100;
-    const highMetric = Math.round((highCtx[targetMetric] ?? 0) * 100) / 100;
+    const lowMetric = round2(lowCtx[targetMetric] ?? 0);
+    const highMetric = round2(highCtx[targetMetric] ?? 0);
 
     bars.push({
       variable_id: input.id,
       variable_name: input.name,
       low_value: lowMetric,
       high_value: highMetric,
-      base_value: Math.round(baseMetricValue * 100) / 100,
-      low_delta: Math.round((lowMetric - baseMetricValue) * 100) / 100,
-      high_delta: Math.round((highMetric - baseMetricValue) * 100) / 100,
-      spread: Math.round(Math.abs(highMetric - lowMetric) * 100) / 100,
+      base_value: round2(baseMetricValue),
+      low_delta: round2(lowMetric - baseMetricValue),
+      high_delta: round2(highMetric - baseMetricValue),
+      spread: round2(Math.abs(highMetric - lowMetric)),
+      ...(absoluteStep ? { absolute_step: true } : {}),
     });
   }
 
@@ -141,13 +122,21 @@ export async function runSensitivity(
   // Store result
   await pool.query(
     `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'sensitivity', $2)`,
-    [scenarioId, JSON.stringify({ target_metric: targetMetric, swing_pct: swingPct, bars })]
+    [scenarioId, JSON.stringify({
+      target_metric: targetMetric,
+      swing_pct: swingPct,
+      scenario_applied: true,
+      bars,
+      ...(notices.length > 0 ? { notices } : {}),
+    })]
   );
 
   return {
     target_metric: targetMetric,
     swing_pct: swingPct,
-    base_metric_value: Math.round(baseMetricValue * 100) / 100,
+    base_metric_value: round2(baseMetricValue),
+    scenario_applied: true,
     bars,
+    ...(notices.length > 0 ? { notices } : {}),
   };
 }

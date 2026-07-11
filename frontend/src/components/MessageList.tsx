@@ -41,15 +41,18 @@ export function MessageList({ messages, isLoading }: MessageListProps) {
         {messages.map((msg) => (
           <MessageBubble key={msg.id} message={msg} />
         ))}
-        {isLoading && (
-          <div className="flex justify-start px-4 py-2">
-            <div className="rounded-2xl bg-[var(--message-assistant-bg)] border border-[var(--border-light)] px-4 py-3 flex gap-1.5 shadow-card">
-              <span className="w-2 h-2 rounded-full bg-accent animate-bounce [animation-delay:-0.3s]" />
-              <span className="w-2 h-2 rounded-full bg-accent/70 animate-bounce [animation-delay:-0.15s]" />
-              <span className="w-2 h-2 rounded-full bg-accent/40 animate-bounce" />
+        <div aria-live="polite" aria-atomic="true" className="contents">
+          {isLoading && (
+            <div className="flex justify-start px-4 py-2" role="status">
+              <span className="sr-only">Assistant is thinking</span>
+              <div className="rounded-2xl bg-[var(--message-assistant-bg)] border border-[var(--border-light)] px-4 py-3 flex gap-1.5 shadow-card" aria-hidden="true">
+                <span className="w-2 h-2 rounded-full bg-accent animate-bounce [animation-delay:-0.3s]" />
+                <span className="w-2 h-2 rounded-full bg-accent/70 animate-bounce [animation-delay:-0.15s]" />
+                <span className="w-2 h-2 rounded-full bg-accent/40 animate-bounce" />
+              </div>
             </div>
-          </div>
-        )}
+          )}
+        </div>
         <div ref={bottomRef} />
       </div>
     </div>

@@ -1,5 +1,15 @@
 import { pool } from "../db/index.js";
-import { getModelDefinition, getPLMetrics, getPercentDeltaVars, type ModelDefinition, type TimeHorizon } from "../models/registry.js";
+import { getModelDefinition, getPLMetrics, type TimeHorizon } from "../models/registry.js";
+import { CompiledModel } from "./expression.js";
+import {
+  getEvaluableModelForScenario,
+  loadScenarioOverrides,
+  resolveOverridesToAbsolute,
+  type ResolvedModel,
+  type ScenarioOverride,
+} from "./modelResolver.js";
+import { simulationsRun } from "../metrics.js";
+import { logger } from "../logger.js";
 
 export interface ScenarioParameterRow {
   mapped_variable_id: string;
@@ -24,45 +34,9 @@ export interface SimulationOutput {
   /** Metadata */
   period_count: number;
   granularity: "monthly" | "quarterly";
+  simulation_mode: "formula_dag" | "xlsx_cell_graph";
   absurdity_warnings?: string[];
-}
-
-function topologicalSort(variables: { id: string; dependencies: string[] }[]): string[] {
-  const order: string[] = [];
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-  const byId = new Map(variables.map((v) => [v.id, v]));
-
-  function visit(id: string) {
-    if (visited.has(id)) return;
-    if (visiting.has(id)) throw new Error(`Circular dependency involving ${id}`);
-    visiting.add(id);
-    const v = byId.get(id);
-    if (v) for (const d of v.dependencies) visit(d);
-    visiting.delete(id);
-    visited.add(id);
-    order.push(id);
-  }
-
-  for (const v of variables) visit(v.id);
-  return order; // DFS post-order: dependencies are pushed before dependents
-}
-
-/** Simple formula eval: numbers, + - * / ( ), and variable refs. */
-function evaluateFormula(formula: string, ctx: Record<string, number>): number {
-  let expr = formula.trim();
-  for (const [k, v] of Object.entries(ctx)) {
-    expr = expr.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"), String(v));
-  }
-  if (!/^[\d\s+\-*/().]+$/.test(expr)) {
-    const missing = expr.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g);
-    throw new Error(`Unknown variable(s) in formula: ${missing?.join(", ") || formula}`);
-  }
-  try {
-    return new Function(`return (${expr})`)();
-  } catch (e) {
-    throw new Error(`Formula error: ${(e as Error).message}`);
-  }
+  notices?: string[];
 }
 
 // ── Time horizon helpers ──
@@ -120,63 +94,7 @@ function generatePeriodLabels(horizon: TimeHorizon): string[] {
   return labels.length > 0 ? labels : [horizon.start];
 }
 
-// ── Simulation core ──
-
-/**
- * Evaluate a single period of the model with given overrides.
- * Returns the full variable context for that period.
- */
-function evaluatePeriod(
-  model: ModelDefinition,
-  order: string[],
-  overrides: Map<string, number>,
-  percentDeltaVars: Set<string>,
-  periodIndex: number,
-  prevCtx: Record<string, number> | null,
-): Record<string, number> {
-  // Base pass
-  const baseCtx: Record<string, number> = {};
-  for (const id of order) {
-    const v = model.variables.find((x) => x.id === id);
-    if (!v) continue;
-    try {
-      const val = evaluateFormula(v.formula, baseCtx);
-      baseCtx[id] = Number.isFinite(val) ? val : 0;
-    } catch {
-      baseCtx[id] = 0;
-    }
-  }
-
-  // Apply overrides on top of base values.
-  // Each period applies the same delta to the ORIGINAL base — no compounding.
-  const ctx: Record<string, number> = { ...baseCtx };
-
-  for (const [id, scenarioValue] of overrides) {
-    if (!Number.isFinite(scenarioValue)) continue;
-    if (percentDeltaVars.has(id) && scenarioValue >= 0 && scenarioValue <= 100 && baseCtx[id] != null) {
-      // Apply % delta to the ORIGINAL base value — same adjustment each period, no compounding
-      ctx[id] = Math.round(baseCtx[id] * (1 + scenarioValue / 100) * 100) / 100;
-    } else {
-      ctx[id] = scenarioValue;
-    }
-  }
-
-  // Re-evaluate all dependent (calculated) variables using the adjusted input values
-  for (const id of order) {
-    if (overrides.has(id)) continue;
-    const v = model.variables.find((x) => x.id === id);
-    if (!v) continue;
-    if (v.dependencies.length === 0) continue; // Input vars keep their overridden or base values
-    try {
-      const val = evaluateFormula(v.formula, ctx);
-      ctx[id] = Number.isFinite(val) ? val : 0;
-    } catch {
-      ctx[id] = 0;
-    }
-  }
-
-  return ctx;
-}
+// ── Shared helpers ──
 
 const SIMULATION_TIMEOUT_MS = Number(process.env.SIMULATION_TIMEOUT_MS) || 60_000;
 
@@ -191,11 +109,124 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
   });
 }
 
-export async function runSimulation(scenarioId: string): Promise<SimulationOutput> {
-  return withTimeout(_runSimulation(scenarioId), SIMULATION_TIMEOUT_MS, "Simulation");
+function round2(n: number): number {
+  return Math.round(n * 100) / 100;
 }
 
-async function _runSimulation(scenarioId: string): Promise<SimulationOutput> {
+const MAX_REASONABLE_CHANGE_PCT = 200;
+
+/** Flag output changes disproportionate to any plausible scenario input. */
+function absurdityWarnings(
+  basePl: Record<string, number>,
+  scenarioPl: Record<string, number>,
+): string[] {
+  const warnings: string[] = [];
+  for (const [metric, scenarioVal] of Object.entries(scenarioPl)) {
+    const baseVal = basePl[metric];
+    if (baseVal == null || Math.abs(baseVal) <= 0.01) continue;
+    const changePct = ((scenarioVal - baseVal) / Math.abs(baseVal)) * 100;
+    if (Math.abs(changePct) > MAX_REASONABLE_CHANGE_PCT) {
+      warnings.push(
+        `${metric} changed by ${changePct.toFixed(0)}% — this seems disproportionate to the scenario inputs. ` +
+        `Base: ${baseVal.toLocaleString()}, Scenario: ${scenarioVal.toLocaleString()}`
+      );
+    }
+  }
+  return warnings;
+}
+
+function unresolvedNotices(unresolved: string[]): string[] {
+  if (unresolved.length === 0) return [];
+  return [
+    `Percent changes for ${unresolved.join(", ")} could not be applied — the model has no non-zero base value for them.`,
+  ];
+}
+
+async function storeAndComplete(scenarioId: string, outputData: Record<string, unknown>): Promise<void> {
+  await pool.query(
+    `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
+    [scenarioId, JSON.stringify(outputData)],
+  );
+  await pool.query(
+    `UPDATE scenarios SET status = 'completed', updated_at = NOW() WHERE scenario_id = $1`,
+    [scenarioId],
+  );
+}
+
+// ── Entry point ──
+
+export async function runSimulation(scenarioId: string): Promise<SimulationOutput> {
+  return withTimeout(_runSimulationDispatcher(scenarioId), SIMULATION_TIMEOUT_MS, "Simulation");
+}
+
+async function _runSimulationDispatcher(scenarioId: string): Promise<SimulationOutput> {
+  const resolved = await getEvaluableModelForScenario(scenarioId);
+  const overrides = await loadScenarioOverrides(scenarioId);
+  if (resolved.source === "xlsx_cell_graph") {
+    simulationsRun.inc({ engine: "xlsx" });
+    return _runXlsxSimulation(scenarioId, resolved, overrides);
+  }
+  simulationsRun.inc({ engine: "formula" });
+  return _runFormulaSimulation(scenarioId, overrides);
+}
+
+// ── XLSX path: real cell-level propagation via HyperFormula ──
+
+async function _runXlsxSimulation(
+  scenarioId: string,
+  resolved: ResolvedModel,
+  overrides: ScenarioOverride[],
+): Promise<SimulationOutput> {
+  const runtime = resolved.model;
+  const { absolute, unresolved } = resolveOverridesToAbsolute(runtime, overrides);
+
+  const baseOut = runtime.evaluate({});
+  const scenarioOut = runtime.evaluate(absolute);
+
+  const pl: Record<string, number> = {};
+  const basePl: Record<string, number> = {};
+  for (const id of runtime.outputIds) {
+    pl[id] = round2(scenarioOut[id] ?? 0);
+    basePl[id] = round2(baseOut[id] ?? 0);
+  }
+  const variables: Record<string, number> = {};
+  for (const input of runtime.inputs) {
+    variables[input.id] = round2(scenarioOut[input.id] ?? input.base);
+  }
+
+  const warnings = absurdityWarnings(basePl, pl);
+  const notices = unresolvedNotices(unresolved);
+
+  const outputData: Record<string, unknown> = {
+    aggregate: pl,
+    base_pl: basePl,
+    periods: [{ period: "FY", pl }],
+    granularity: "quarterly",
+    period_count: 1,
+    simulation_mode: "xlsx_cell_graph",
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+  };
+  await storeAndComplete(scenarioId, outputData);
+
+  return {
+    pl,
+    variables,
+    periods: [{ period: "FY", pl, variables }],
+    period_count: 1,
+    granularity: "quarterly",
+    simulation_mode: "xlsx_cell_graph",
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+  };
+}
+
+// ── Formula-DAG path (models built from text documents) ──
+
+async function _runFormulaSimulation(
+  scenarioId: string,
+  overrides: ScenarioOverride[],
+): Promise<SimulationOutput> {
   const scenarioRes = await pool.query(
     "SELECT model_version_hash FROM scenarios WHERE scenario_id = $1",
     [scenarioId]
@@ -203,104 +234,67 @@ async function _runSimulation(scenarioId: string): Promise<SimulationOutput> {
   if (scenarioRes.rows.length === 0) throw new Error("Scenario not found");
   const modelVersion = scenarioRes.rows[0].model_version_hash;
 
-  const paramsRes = await pool.query<ScenarioParameterRow & { confidence_score?: number }>(
-    `SELECT mapped_variable_id, scenario_value, status, confidence_score FROM scenario_parameters WHERE scenario_id = $1 AND status IN ('pending', 'accepted', 'modified')`,
-    [scenarioId]
-  );
-  const overrides = new Map<string, number>();
-  for (const row of paramsRes.rows) {
-    overrides.set(row.mapped_variable_id, Number(row.scenario_value));
-  }
+  const modelDef = await getModelDefinition(modelVersion);
+  if (!modelDef) throw new Error("No model found. Please build a model from your documents first.");
+  const model = new CompiledModel(modelDef);
+  const plMetricIds = getPLMetrics(modelDef);
 
-  const model = await getModelDefinition(modelVersion);
-  if (!model) throw new Error("No model found. Please build a model from your documents first.");
-  const order = topologicalSort(model.variables);
-  const percentDeltaVars = getPercentDeltaVars(model);
-  const plMetricIds = getPLMetrics(model);
+  const { absolute, unresolved } = resolveOverridesToAbsolute(model, overrides);
+  // Absolute overrides may also pin ids the model doesn't list as inputs
+  // (e.g. calculated vars explicitly set by the user) — evaluate() honors
+  // any known id present in the map and ignores unknown synthetic ids.
 
-  // ── Multi-period evaluation ──
-  const periodLabels = generatePeriodLabels(model.time_horizon);
-  const periods: PeriodResult[] = [];
-  let prevCtx: Record<string, number> | null = null;
+  const baseCtx = model.baseValues();
+  // Same delta applied to the original base each period — no compounding.
+  const scenarioCtx = model.evaluate(absolute);
 
-  for (let i = 0; i < periodLabels.length; i++) {
-    const ctx = evaluatePeriod(model, order, overrides, percentDeltaVars, i, prevCtx);
-
+  const periodLabels = generatePeriodLabels(modelDef.time_horizon);
+  const periods: PeriodResult[] = periodLabels.map((label) => {
     const periodPl: Record<string, number> = {};
     for (const id of plMetricIds) {
-      if (id in ctx) periodPl[id] = Math.round(ctx[id] * 100) / 100;
+      if (id in scenarioCtx) periodPl[id] = round2(scenarioCtx[id]);
     }
-
-    periods.push({
-      period: periodLabels[i],
-      pl: periodPl,
-      variables: { ...ctx },
-    });
-
-    prevCtx = ctx;
-  }
+    return { period: label, pl: periodPl, variables: { ...scenarioCtx } };
+  });
 
   // ── Aggregate: sum P&L across all periods ──
   const aggregatePl: Record<string, number> = {};
   for (const id of plMetricIds) {
     let total = 0;
-    for (const p of periods) {
-      total += p.pl[id] || 0;
-    }
-    aggregatePl[id] = Math.round(total * 100) / 100;
+    for (const p of periods) total += p.pl[id] || 0;
+    aggregatePl[id] = round2(total);
   }
-
-  // Aggregate variables: use last period values (most representative for rates)
   const lastPeriodVars = periods.length > 0 ? periods[periods.length - 1].variables : {};
 
-  // ── Absurdity check: validate that results are reasonable ──
-  const baseCase = evaluatePeriod(model, order, new Map(), percentDeltaVars, 0, null);
-  const warnings: string[] = [];
-  const KEY_METRICS = ["revenue", "ebitda", "ebit", "net_income", "gross_profit", "profit_before_tax"];
-  const MAX_REASONABLE_CHANGE_PCT = 200;
+  const basePl: Record<string, number> = {};
+  for (const id of plMetricIds) basePl[id] = round2(baseCtx[id] ?? 0);
+  const singlePeriodPl: Record<string, number> = periods[0]?.pl ?? {};
+  const warnings = absurdityWarnings(basePl, singlePeriodPl);
+  const notices = unresolvedNotices(unresolved);
 
-  for (const metric of KEY_METRICS) {
-    const singlePeriodVal = periods[0]?.pl[metric];
-    const baseVal = baseCase[metric];
-    if (baseVal != null && Math.abs(baseVal) > 0.01 && singlePeriodVal != null) {
-      const changePct = ((singlePeriodVal - baseVal) / Math.abs(baseVal)) * 100;
-      if (Math.abs(changePct) > MAX_REASONABLE_CHANGE_PCT) {
-        warnings.push(
-          `${metric} changed by ${changePct.toFixed(0)}% — this seems disproportionate to the scenario inputs. ` +
-          `Base: ${baseVal.toLocaleString()}, Scenario: ${singlePeriodVal.toLocaleString()}`
-        );
-        console.warn(`[Simulation] Absurdity warning: ${metric} changed by ${changePct.toFixed(0)}%`);
-      }
-    }
-  }
-
-  // Store both aggregate and period breakdown
   const outputData: Record<string, unknown> = {
     aggregate: aggregatePl,
+    base_pl: basePl,
     periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
-    granularity: model.time_horizon.granularity,
+    granularity: modelDef.time_horizon.granularity,
     period_count: periods.length,
+    simulation_mode: "formula_dag",
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
   };
   if (warnings.length > 0) {
-    outputData.absurdity_warnings = warnings;
-    console.warn(`[Simulation] ${warnings.length} absurdity warning(s) generated`);
+    logger.warn(`[Simulation] ${warnings.length} absurdity warning(s) generated`);
   }
-
-  await pool.query(
-    `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
-    [scenarioId, JSON.stringify(outputData)]
-  );
-  await pool.query(
-    `UPDATE scenarios SET status = 'completed', updated_at = NOW() WHERE scenario_id = $1`,
-    [scenarioId]
-  );
+  await storeAndComplete(scenarioId, outputData);
 
   return {
     pl: aggregatePl,
     variables: lastPeriodVars,
     periods,
     period_count: periods.length,
-    granularity: model.time_horizon.granularity,
+    granularity: modelDef.time_horizon.granularity,
+    simulation_mode: "formula_dag",
     ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
   };
 }

@@ -9,33 +9,23 @@
  *   BA generates → QA evaluates → if fails → BA regenerates with feedback → QA re-evaluates → ...
  */
 
-import { getApiKey, callClaude } from "./llmClient.js";
+import { z } from "zod";
+import { getApiKey, callClaudeStructured } from "./llmClient.js";
 import { pool } from "../db/index.js";
 import type { BusinessInsight } from "./businessAnalysisAgent.js";
+import { verifyEvidence } from "./businessAnalysisAgent.js";
+import { logger } from "../logger.js";
 
-function repairJson(raw: string): string {
-  let text = raw.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  try { JSON.parse(text); return text; } catch { /* needs repair */ }
-  text = text.replace(/,\s*"[^"]*":\s*"[^"]*$/, "");
-  text = text.replace(/,\s*"[^"]*":\s*$/, "");
-  text = text.replace(/,\s*$/, "");
-  const openBraces = (text.match(/{/g) || []).length;
-  const closeBraces = (text.match(/}/g) || []).length;
-  const openBrackets = (text.match(/\[/g) || []).length;
-  const closeBrackets = (text.match(/]/g) || []).length;
-  for (let i = 0; i < openBrackets - closeBrackets; i++) {
-    text = text.replace(/,\s*$/, "") + "]";
-  }
-  for (let i = 0; i < openBraces - closeBraces; i++) {
-    text = text.replace(/,\s*$/, "") + "}";
-  }
-  try { JSON.parse(text); return text; } catch { /* still broken */ }
-  const match = text.match(/\{[\s\S]*\}/);
-  if (match) {
-    try { JSON.parse(match[0]); return match[0]; } catch { /* give up */ }
-  }
-  return text;
-}
+const qaResponseSchema = z.object({
+  overall_score: z.number().min(0).max(10),
+  dimensions: z.array(z.object({
+    name: z.string(),
+    score: z.number().min(0).max(10),
+    feedback: z.string(),
+  })),
+  improvement_guidance: z.string(),
+  summary: z.string(),
+});
 
 export interface QADimension {
   name: string;
@@ -44,6 +34,12 @@ export interface QADimension {
 }
 
 export interface QAReport {
+  /**
+   * "assessed": the QA agent actually evaluated the analysis.
+   * "not_assessed": QA could not run (no API key / LLM failure) — the
+   * analysis is unvalidated and must NOT be presented as having passed QA.
+   */
+  status: "assessed" | "not_assessed";
   overall_score: number;
   passed: boolean;
   dimensions: QADimension[];
@@ -133,52 +129,70 @@ export async function buildScenarioContext(scenarioId: string): Promise<string> 
 
 /**
  * Evaluate a business analysis. Returns a QA report with scores and feedback.
+ * `scenarioId` is used for the numeric-consistency check: every metric the
+ * analysis cites as evidence must match a computed P&L value — an LLM
+ * asserting a number that isn't in the underlying data is a grounding
+ * failure, scored and reported distinctly from writing-quality issues.
  */
 export async function evaluateAnalysis(
   analysis: BusinessInsight,
   scenarioContext: string,
+  scenarioId: string,
 ): Promise<QAReport> {
+  const grounding = await verifyEvidence(analysis, scenarioId).catch(() => ({ ok: true, mismatches: [] }));
+
   if (!getApiKey()) {
+    // Previously this returned passed:true with a fabricated 7/10 — an
+    // unvalidated analysis must never be reported as having passed QA.
     return {
-      overall_score: 7,
-      passed: true,
-      dimensions: [{ name: "completeness", score: 7, feedback: "Unable to assess — LLM unavailable" }],
+      status: "not_assessed",
+      overall_score: 0,
+      passed: false,
+      dimensions: [],
       improvement_guidance: "",
-      summary: "QA assessment unavailable — API key not configured.",
+      summary: "QA was not run — the LLM is unavailable (API key not configured). This analysis has not been quality-checked.",
       iterations: 0,
     };
   }
 
-  const userMessage = `## Scenario Context\n${scenarioContext}\n\n## Analysis Being Reviewed\n${JSON.stringify(analysis, null, 2)}\n\nEvaluate this analysis rigorously. Score each dimension 1-10 and provide specific improvement guidance.`;
+  const groundingNote = grounding.ok
+    ? ""
+    : `\n\n## GROUNDING CHECK FAILED\nThe following cited figures do not match the computed P&L data:\n${grounding.mismatches
+        .map((m) => `- "${m.implication_title}" cites ${m.metric_id}=${m.claimed_value}, but the computed value is ${m.actual_value ?? "not present in the model"}`)
+        .join("\n")}\nScore "consistency" no higher than 2/10 and require the analysis to correct these figures.`;
+
+  const userMessage = `## Scenario Context\n${scenarioContext}\n\n## Analysis Being Reviewed\n${JSON.stringify(analysis, null, 2)}${groundingNote}\n\nEvaluate this analysis rigorously. Score each dimension 1-10 and provide specific improvement guidance.`;
 
   try {
-    const rawText = await callClaude({
+    const parsed = await callClaudeStructured({
       system: QA_SYSTEM_PROMPT,
       userMessage,
+      schema: qaResponseSchema,
+      toolName: "submit_qa_evaluation",
+      toolDescription: "Submit the QA evaluation scores and feedback",
       maxTokens: 2500,
       temperature: 0.3,
+      purpose: "qa",
     });
 
-    const text = repairJson(rawText);
-    const parsed = JSON.parse(text) as {
-      overall_score: number;
-      dimensions: QADimension[];
-      improvement_guidance: string;
-      summary: string;
-    };
+    const overallScore = grounding.ok ? parsed.overall_score : Math.min(parsed.overall_score, QA_THRESHOLD - 1);
 
     return {
-      overall_score: parsed.overall_score,
-      passed: parsed.overall_score >= QA_THRESHOLD,
-      dimensions: parsed.dimensions || [],
-      improvement_guidance: parsed.improvement_guidance || "",
-      summary: parsed.summary || "",
+      status: "assessed",
+      overall_score: overallScore,
+      passed: grounding.ok && overallScore >= QA_THRESHOLD,
+      dimensions: parsed.dimensions,
+      improvement_guidance: grounding.ok
+        ? parsed.improvement_guidance
+        : `Fix these grounded-evidence mismatches before anything else:\n${grounding.mismatches.map((m) => `- ${m.implication_title}: ${m.metric_id} claimed ${m.claimed_value}, actual ${m.actual_value ?? "N/A"}`).join("\n")}\n\n${parsed.improvement_guidance}`,
+      summary: parsed.summary,
       iterations: 1,
     };
   } catch (e) {
     const errMsg = (e as Error).message;
-    console.error("[QA Agent] Evaluation failed:", errMsg);
+    logger.error({ err: e }, "[QA Agent] Evaluation failed");
     return {
+      status: "not_assessed",
       overall_score: 0,
       passed: false,
       dimensions: [{ name: "qa_error", score: 0, feedback: `QA evaluation failed: ${errMsg}` }],

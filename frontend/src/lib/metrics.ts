@@ -27,17 +27,20 @@ export const METRIC_LABELS: Record<string, string> = {
   raw_material_cost: "Raw Materials",
 };
 
-/** Deloitte-branded colors for chart metrics */
+/**
+ * Chart colors for P&L metrics — CSS-var driven (see lib/chartTheme.ts) so
+ * they follow the active theme (incl. dark mode) instead of fixed hex.
+ */
 export const METRIC_COLORS: Record<string, string> = {
-  revenue: "#86BC25",      // Deloitte Green
-  cogs: "#DA291C",         // Deloitte Red
-  gross_margin: "#007CB0", // Deloitte Blue
-  opex: "#E87722",         // Deloitte Orange
-  ebitda: "#62B5E5",       // Light Blue
-  net_income: "#1D1D1B",   // Charcoal
-  units_sold: "#43B02A",   // Green alt
-  unit_price: "#7C4DFF",   // Purple
-  raw_material_cost: "#FF6F00", // Amber
+  revenue: "var(--chart-positive)",
+  cogs: "var(--chart-negative)",
+  gross_margin: "var(--chart-neutral)",
+  opex: "var(--chart-accent-3)",
+  ebitda: "var(--accent)",
+  net_income: "var(--text-primary)",
+  units_sold: "var(--chart-positive)",
+  unit_price: "var(--chart-accent-2)",
+  raw_material_cost: "var(--chart-accent-3)",
 };
 
 /** Format a metric key into a label, using the map with fallback to title-case */

@@ -15,6 +15,8 @@ import {
 } from "recharts";
 import type { PeriodResult } from "@/lib/api";
 import { METRIC_LABELS, METRIC_COLORS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import { formatCompactCurrency } from "@/lib/chartTheme";
+import { ChartDataTable } from "./ChartDataTable";
 
 interface TrendLineChartProps {
   periods: PeriodResult[];
@@ -128,7 +130,7 @@ export function TrendLineChart({ periods, granularity: _granularity }: TrendLine
               />
               <YAxis
                 tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-                tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
+                tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
                 axisLine={false}
                 tickLine={false}
               />
@@ -163,7 +165,7 @@ export function TrendLineChart({ periods, granularity: _granularity }: TrendLine
               />
               <YAxis
                 tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-                tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
+                tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
                 axisLine={false}
                 tickLine={false}
               />
@@ -189,6 +191,14 @@ export function TrendLineChart({ periods, granularity: _granularity }: TrendLine
             </AreaChart>
           )}
         </ResponsiveContainer>
+        <ChartDataTable
+          caption="Period trend metrics"
+          columns={["Period", ...activeMetrics.map((m) => METRIC_LABELS[m] || m)]}
+          rows={chartData.map((row) => [
+            String(row.fullPeriod ?? row.period),
+            ...activeMetrics.map((m) => Number((row as Record<string, unknown>)[m] ?? 0)),
+          ])}
+        />
       </div>
     </div>
   );

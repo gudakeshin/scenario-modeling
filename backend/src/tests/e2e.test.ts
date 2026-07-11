@@ -8,12 +8,65 @@
  * Requires a running PostgreSQL database (same as dev).
  */
 
-import test from "node:test";
+import test, { before } from "node:test";
 import assert from "node:assert";
 import request from "supertest";
 import { app } from "../index.js";
+import ExcelJS from "exceljs";
 
-const agent = request(app);
+const rawAgent = request(app);
+
+// All routes require a Bearer token since Phase 0 auth landed. Log in once
+// as the seeded dev admin and transparently attach the token to every
+// request this suite makes, so the 70+ existing call sites don't need to
+// change individually.
+let authToken = "";
+
+function withAuth<T extends { set: (field: string, val: string) => T }>(req: T): T {
+  return authToken ? req.set("Authorization", `Bearer ${authToken}`) : req;
+}
+
+const agent = new Proxy(rawAgent, {
+  get(target, prop, receiver) {
+    if (prop === "get" || prop === "post" || prop === "put" || prop === "delete" || prop === "patch") {
+      return (...args: unknown[]) =>
+        withAuth((target as unknown as Record<string, (...a: unknown[]) => { set: (f: string, v: string) => unknown }>)[prop as string](...args) as never);
+    }
+    return Reflect.get(target, prop, receiver);
+  },
+}) as typeof rawAgent;
+
+before(async () => {
+  const res = await rawAgent.post("/api/v1/auth/login").send({
+    email: "dev@example.com",
+    password: process.env.SEED_ADMIN_PASSWORD || "changeme-admin-password",
+  });
+  if (res.status !== 200) {
+    throw new Error(`e2e setup: seed admin login failed (run \`npm run db:seed\` first): ${JSON.stringify(res.body)}`);
+  }
+  authToken = res.body.access_token;
+});
+
+async function buildMinimalXlsxBuffer(): Promise<Buffer> {
+  const wb = new ExcelJS.Workbook();
+  const assumptions = wb.addWorksheet("Assumptions");
+  assumptions.getCell("A1").value = "All figures in INR Million";
+  assumptions.getCell("B4").value = "Base";
+  assumptions.getCell("B8").value = 0.06;
+
+  const volume = wb.addWorksheet("Volume_Plan");
+  volume.getCell("A1").value = "Product";
+  volume.getCell("B1").value = "Apr-24";
+  volume.getCell("C1").value = "May-24";
+  volume.getCell("D1").value = "FY Total";
+  volume.getCell("A2").value = "Bullet";
+  volume.getCell("B2").value = { formula: "Assumptions!B8*1000", result: 60 };
+
+  const pnl = wb.addWorksheet("P&L");
+  pnl.getCell("A1").value = "Revenue";
+  pnl.getCell("B1").value = { formula: "Volume_Plan!B2*100", result: 6000 };
+  return Buffer.from(await wb.xlsx.writeBuffer());
+}
 
 // ─── Helper: run the full happy-path and return scenario ID ───
 async function createAndRunScenario(nlInput: string): Promise<{
@@ -47,7 +100,6 @@ async function createAndRunScenario(nlInput: string): Promise<{
   // 4. Approve
   await agent
     .post(`/api/v1/scenarios/${scenarioId}/approve`)
-    .set("x-user-id", "dev@local")
     .expect(200);
 
   // 5. Run simulation
@@ -93,7 +145,6 @@ test("E2E: Full happy path — raw materials increase 8%", async () => {
   // Step 4: Approve scenario
   const approveRes = await agent
     .post(`/api/v1/scenarios/${scenario_id}/approve`)
-    .set("x-user-id", "dev@local")
     .expect(200);
   assert.strictEqual(approveRes.body.status, "approved");
 
@@ -256,7 +307,6 @@ test("E2E: Audit trail records scenario lifecycle", async () => {
   const auditRes = await agent
     .get("/api/v1/audit")
     .query({ scenario_id: scenarioId })
-    .set("x-user-id", "dev@local")
     .expect(200);
 
   const actions = auditRes.body.entries.map((e: { action_type: string }) => e.action_type);
@@ -275,7 +325,7 @@ test("E2E: Save and clone template", async () => {
   // Save as template (via from-scenario endpoint)
   const saveRes = await agent
     .post(`/api/v1/templates/from-scenario/${scenarioId}`)
-    .set("x-user-id", "dev@local")
+    
     .send({ name: "E2E Test Template", description: "Test" })
     .expect(201);
   const templateId = saveRes.body.template_id;
@@ -292,7 +342,6 @@ test("E2E: Save and clone template", async () => {
   // Clone template into new scenario
   const cloneRes = await agent
     .post(`/api/v1/templates/${templateId}/clone`)
-    .set("x-user-id", "dev@local")
     .expect(201);
   assert.ok(cloneRes.body.scenario_id, "clone should return new scenario_id");
   assert.notStrictEqual(cloneRes.body.scenario_id, scenarioId, "cloned scenario should be different");
@@ -388,7 +437,6 @@ test("Edge: Approve with no accepted parameters returns 400", async () => {
 
   const res = await agent
     .post(`/api/v1/scenarios/${createRes.body.scenario_id}/approve`)
-    .set("x-user-id", "dev@local")
     .expect(400);
   assert.ok(res.body.error, "should return error about parameters");
 });
@@ -429,7 +477,6 @@ test("E2E: Excel and CSV export after simulation", async () => {
   // Excel export
   const excelRes = await agent
     .get(`/api/v1/scenarios/${scenarioId}/export/excel`)
-    .set("x-user-id", "dev@local")
     .expect(200);
   assert.ok(
     excelRes.headers["content-type"]?.includes("spreadsheet") ||
@@ -440,7 +487,6 @@ test("E2E: Excel and CSV export after simulation", async () => {
   // CSV export
   const csvRes = await agent
     .get(`/api/v1/scenarios/${scenarioId}/export/csv`)
-    .set("x-user-id", "dev@local")
     .expect(200);
   assert.ok(
     csvRes.headers["content-type"]?.includes("csv") ||
@@ -550,7 +596,7 @@ test("E2E: Run endpoint returns periods in response", async () => {
   for (const p of paramsRes.body.parameters) {
     await agent.put(`/api/v1/scenarios/${scenarioId}/parameters/${p.parameter_id}`).send({ status: "accepted" }).expect(200);
   }
-  await agent.post(`/api/v1/scenarios/${scenarioId}/approve`).set("x-user-id", "dev@local").expect(200);
+  await agent.post(`/api/v1/scenarios/${scenarioId}/approve`).expect(200);
 
   const runRes = await agent.post(`/api/v1/scenarios/${scenarioId}/run`).expect(200);
 
@@ -568,7 +614,6 @@ test("E2E: Multi-period export includes period breakdown in CSV", async () => {
 
   const csvRes = await agent
     .get(`/api/v1/scenarios/${scenarioId}/export/csv`)
-    .set("x-user-id", "dev@local")
     .expect(200);
 
   assert.ok(csvRes.text.includes("Period Breakdown"), "CSV should include period breakdown section");
@@ -618,7 +663,7 @@ test("E2E: PowerPoint export returns PPTX file", async () => {
 
   const pptxRes = await agent
     .get(`/api/v1/scenarios/${scenarioId}/export/pptx`)
-    .set("x-user-id", "dev@local")
+    
     .buffer(true)
     .expect(200);
 
@@ -853,4 +898,45 @@ test("E2E: Refine endpoint includes reflection when available", async () => {
     assert.ok(refineRes.body.reflection.thinking.length > 0, "thinking should not be empty");
     assert.ok(typeof refineRes.body.reflection.duration_ms === "number", "duration_ms should be a number");
   }
+});
+
+// ═══════════════════════════════════════════════════════════════
+// 23. XLSX STRUCTURAL PIPELINE + VALIDATION GATE
+// ═══════════════════════════════════════════════════════════════
+
+test("E2E: XLSX upload stores structural metadata", async () => {
+  const xlsx = await buildMinimalXlsxBuffer();
+  await agent
+    .post("/api/v1/documents/upload")
+    .attach("file", xlsx, "structural_model.xlsx")
+    .expect(201);
+
+  const docs = await agent.get("/api/v1/documents").expect(200);
+  const xlsxDoc = docs.body.documents.find((d: { original_filename: string }) => d.original_filename === "structural_model.xlsx");
+  assert.ok(xlsxDoc, "uploaded XLSX should exist");
+  assert.strictEqual(xlsxDoc.document_kind, "spreadsheet_model");
+  assert.ok(xlsxDoc.workbook_graph, "XLSX should persist workbook_graph");
+});
+
+test("E2E: XLSX context build sets needs_validation and validate endpoint marks ready", async () => {
+  // Build context from latest spreadsheet model
+  const build = await agent
+    .post("/api/v1/context/build")
+    .expect(201);
+  assert.ok(build.body.context_data, "context should be returned");
+
+  const statusBefore = await agent
+    .get("/api/v1/context/status")
+    .expect(200);
+  assert.ok(
+    statusBefore.body.validation_status === "needs_validation" || statusBefore.body.validation_status === "ready",
+    "validation status should exist for spreadsheet model",
+  );
+
+  const validate = await agent
+    .post("/api/v1/context/model/validate")
+    
+    .send({})
+    .expect(200);
+  assert.strictEqual(validate.body.validation_status, "ready");
 });

@@ -2,16 +2,48 @@
  * Context Engine — builds company/industry understanding from uploaded documents.
  *
  * Flow:
- *  1. Retrieve document chunks from Qdrant for the user's documents
+ *  1. Retrieve document chunks from Postgres for the user's documents
  *  2. Send representative chunks to Claude for structured extraction
  *  3. Store extracted context (company profile, industry, metrics) in company_context table
  *  4. Generate a dynamic ModelDefinition from the extracted financial structure
  *  5. Store the model in user_models table
  */
 
+import { z } from "zod";
+import { config } from "../config.js";
 import { pool, resolveUserId } from "../db/index.js";
-import { callClaude, getApiKey } from "./llmClient.js";
+import { callClaudeStructured, getApiKey } from "./llmClient.js";
 import type { ModelDefinition } from "../models/registry.js";
+import { logger } from "../logger.js";
+
+const financialMetricSchema = z.object({
+  name: z.string(),
+  variable_id: z.string(),
+  description: z.string(),
+  typical_value: z.number().optional(),
+  unit: z.string(),
+  metric_type: z.enum(["currency", "count", "percent", "ratio", "volume", "unknown"]).optional(),
+  source_header: z.string().optional(),
+  source_column: z.string().optional(),
+  source_section: z.string().optional(),
+  category: z.enum(["revenue", "cost", "margin", "expense", "income", "other"]),
+  is_input: z.boolean(),
+  formula: z.string().optional(),
+  dependencies: z.array(z.string()).default([]),
+});
+
+const contextExtractionSchema = z.object({
+  company_name: z.string(),
+  industry: z.string(),
+  currency: z.string().optional(),
+  currency_unit: z.string().optional(),
+  business_model: z.string(),
+  revenue_streams: z.array(z.string()).default([]),
+  financial_metrics: z.array(financialMetricSchema).min(1),
+  competitive_landscape: z.string(),
+  key_risks: z.array(z.string()).default([]),
+  benchmarks: z.record(z.string()).default({}),
+});
 
 // ── Types ──
 
@@ -29,12 +61,23 @@ export interface CompanyContext {
 export interface ContextData {
   company_name: string;
   industry: string;
+  currency?: string;
+  currency_unit?: string;
   business_model: string;
   revenue_streams: string[];
   financial_metrics: FinancialMetric[];
+  header_mapping_suggestions?: HeaderMappingSuggestion[];
   competitive_landscape: string;
   key_risks: string[];
   benchmarks: Record<string, string>;
+}
+
+export interface HeaderMappingSuggestion {
+  header_pattern: string;
+  inferred_metric_type: "currency" | "count" | "percent" | "ratio" | "volume" | "unknown";
+  expected_unit: string;
+  mapping_guidance: string;
+  sample_variable_ids: string[];
 }
 
 export interface FinancialMetric {
@@ -43,10 +86,20 @@ export interface FinancialMetric {
   description: string;
   typical_value?: number;
   unit: string;
+  metric_type?: "currency" | "count" | "percent" | "ratio" | "volume" | "unknown";
+  source_header?: string;
+  source_column?: string;
+  source_section?: string;
   category: "revenue" | "cost" | "margin" | "expense" | "income" | "other";
   is_input: boolean;
   formula?: string;
   dependencies?: string[];
+}
+
+interface DenominationHints {
+  currency?: string;
+  currency_unit?: string;
+  evidence: string[];
 }
 
 // ── Context Building ──
@@ -56,7 +109,7 @@ export interface FinancialMetric {
  * Retrieves representative chunks, sends to Claude for extraction,
  * and stores the structured result.
  */
-export async function buildContext(userIdentifier?: string): Promise<CompanyContext> {
+export async function buildContext(userIdentifier: string): Promise<CompanyContext> {
   const userId = await resolveUserId(userIdentifier);
 
   // 1. Get all ready documents for this user
@@ -77,14 +130,16 @@ export async function buildContext(userIdentifier?: string): Promise<CompanyCont
   );
   const docsToUse = sortedDocs.slice(0, 2);
   const docIds = docsToUse.map((d: { document_id: string }) => d.document_id);
-  console.log(`[ContextEngine] Using ${docsToUse.length} documents (of ${docs.length} total):`,
-    docsToUse.map((d: { name: string; document_id: string }) => d.name).join(", "));
+  logger.info(
+    { docs: docsToUse.map((d: { name: string; document_id: string }) => d.name).join(", ") },
+    `[ContextEngine] Using ${docsToUse.length} documents (of ${docs.length} total)`
+  );
 
-  const { getAllChunksForDocuments } = await import("./qdrantService.js");
-  const allChunks = await getAllChunksForDocuments(docIds);
+  const { getDocumentChunksFromDb } = await import("./documentService.js");
+  const allChunks = await getDocumentChunksFromDb(docIds);
 
   if (allChunks.length === 0) {
-    throw new Error("Could not retrieve document content from vector store. Try re-uploading documents.");
+    throw new Error("Could not retrieve document content. Try re-uploading documents.");
   }
 
   // 3. Reconstruct full document text, preserving original order.
@@ -109,9 +164,10 @@ export async function buildContext(userIdentifier?: string): Promise<CompanyCont
     fullText += `\n[Document: ${docName}]\n${texts.join("\n")}\n`;
   }
 
-  // Allow generous text budget for extraction but cap to avoid token overflow
-  const MAX_CHARS = 18000;
-  const chunkText = fullText.length > MAX_CHARS ? fullText.slice(0, MAX_CHARS) : fullText;
+  // Allow larger budget and distribute coverage across documents/tabs/sheets.
+  const MAX_CHARS = 60000;
+  const chunkText = buildRepresentativeExcerpt(fullText, MAX_CHARS);
+  const denomHints = detectDenominationHints(fullText);
 
   if (!getApiKey()) {
     throw new Error("ANTHROPIC_API_KEY is required for context extraction. Please configure it.");
@@ -129,6 +185,15 @@ CRITICAL RULES FOR VALUE EXTRACTION:
 5. Do NOT extract from summary ratio tables or key metrics sections — use the ACTUAL income statement figures.
 6. Build a complete P&L hierarchy: Revenue → Cost of Revenue → Gross Profit → Operating Expenses → EBITDA → EBIT → Other Income → Finance Costs → PBT → Tax → Net Income.
 7. For sub-totals, use the document's stated total, not your own calculation.
+8. IMPORTANT for multi-tab Excel files: review ALL relevant tabs/sheets (P&L, assumptions, product hierarchy, headcount, volumes), not just the first sheet.
+9. Classify non-financial operational metrics correctly: headcount and volumes are NOT currency.
+10. Denomination can appear in title, footnote, sheet note, column header, or nearby rows (e.g., "All figures in INR Mn", "Rs. in Lakhs", "USD in millions", "Amounts in Cr."). Use TABLE CONTEXT to infer unit.
+11. Normalize denomination variants to canonical scale:
+   - Million: million, millions, mn, m, mio
+   - Billion: billion, billions, bn, b
+   - Thousand: thousand, thousands, k
+   - Crore: crore, crores, cr
+   - Lakh: lakh, lakhs, lac, lacs
 
 Required JSON structure:
 {
@@ -144,7 +209,11 @@ Required JSON structure:
       "variable_id": "revenue",
       "description": "Total revenue from operations",
       "typical_value": 53752,
-      "unit": "currency",
+      "unit": "INR Million",
+      "metric_type": "currency",
+      "source_header": "TOTAL REVENUE FROM OPERATIONS",
+      "source_column": "FY 2024-25",
+      "source_section": "REVENUE FROM OPERATIONS",
       "category": "revenue",
       "is_input": true,
       "formula": "53752",
@@ -159,61 +228,35 @@ Required JSON structure:
 Rules for financial_metrics:
 - Include 10-15 key P&L line items covering the FULL income statement hierarchy
 - MUST include: revenue, cost_of_revenue, gross_profit, operating_expenses, ebitda, depreciation_amortization, ebit/operating_profit, other_income, finance_costs, profit_before_tax, tax_expense, net_income
+- CRITICAL UNIT RULE: NOT all metrics are currency. Infer metric_type and unit from row/header semantics:
+  - currency: revenue, costs, profit, tax, depreciation, interest, capex
+  - count: headcount, employees, stores, FTE
+  - volume: units sold, volume, quantity, throughput
+  - percent: margin %, growth %, attrition %, utilization %, rates
+  - ratio: current ratio, debt-to-equity, turnover x
 - For INPUT variables (leaf items like revenue, cost_of_revenue, etc.): is_input=true, formula is the EXACT value from the document as a string, dependencies=[]
 - For CALCULATED variables (derived items like gross_profit, ebitda, net_income): is_input=false, formula uses other variable_ids (e.g. "revenue - cost_of_revenue"), dependencies list ALL referenced variable_ids
 - Use snake_case for variable_id
 - category must be one of: revenue, cost, margin, expense, income, other
 - typical_value MUST be the EXACT number from the document, not an approximation`;
 
-  const response = await callClaude({
+  const extracted = await callClaudeStructured({
     system: systemPrompt,
-    userMessage: `Here is the full document text:\n\n${chunkText}\n\nExtract company context and P&L structure from this document. Read the EXACT numbers for each line item — do NOT estimate or round. Look for TOTAL/SUMMARY rows (e.g. "TOTAL REVENUE FROM OPERATIONS", "TOTAL COST OF REVENUE", "PROFIT AFTER TAX / NET INCOME") and use those exact values. Return concise JSON only.`,
+    userMessage: `Here is the full document text:\n\n${chunkText}\n\nDenomination hints detected from context scan (may include noisy candidates):\nCurrency candidate: ${denomHints.currency || "unknown"}\nUnit candidate: ${denomHints.currency_unit || "unknown"}\nEvidence:\n- ${denomHints.evidence.slice(0, 10).join("\n- ")}\n\nExtract company context and P&L structure from this document. Read the EXACT numbers for each line item — do NOT estimate or round. Look for TOTAL/SUMMARY rows (e.g. "TOTAL REVENUE FROM OPERATIONS", "TOTAL COST OF REVENUE", "PROFIT AFTER TAX / NET INCOME") and use those exact values.`,
+    schema: contextExtractionSchema,
+    toolName: "submit_company_context",
+    toolDescription: "Submit the extracted company context and P&L structure",
     maxTokens: 4000,
     temperature: 0.1,
+    purpose: "context_build",
   });
 
-  // Robust JSON extraction — handle code fences and truncation
-  let cleaned = response.replace(/^```(?:json)?\s*/i, "").replace(/\s*```\s*$/i, "").trim();
-  // If JSON is truncated, try to repair by closing open structures
-  if (!cleaned.endsWith("}")) {
-    const lastBrace = cleaned.lastIndexOf("}");
-    if (lastBrace > 0) {
-      cleaned = cleaned.slice(0, lastBrace + 1);
-      // Count braces to see if we need more closing
-      const opens = (cleaned.match(/{/g) || []).length;
-      const closes = (cleaned.match(/}/g) || []).length;
-      for (let i = 0; i < opens - closes; i++) cleaned += "}";
-      // Close any open arrays
-      const openBrackets = (cleaned.match(/\[/g) || []).length;
-      const closeBrackets = (cleaned.match(/]/g) || []).length;
-      for (let i = 0; i < openBrackets - closeBrackets; i++) {
-        cleaned = cleaned.replace(/,\s*$/, "") + "]";
-      }
-    }
-  }
-
-  let contextData: ContextData;
-  try {
-    contextData = JSON.parse(cleaned) as ContextData;
-  } catch (parseErr) {
-    console.error("[ContextEngine] JSON parse failed, attempting repair...");
-    // Last resort: try to extract the JSON object from the response
-    const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      try {
-        contextData = JSON.parse(jsonMatch[0]) as ContextData;
-      } catch {
-        throw new Error("Failed to parse Claude response as JSON. Please try again.");
-      }
-    } else {
-      throw parseErr;
-    }
-  }
-
-  // Ensure minimum viable financial structure
-  if (!contextData.financial_metrics || contextData.financial_metrics.length === 0) {
-    throw new Error("Could not extract financial metrics from documents. Upload documents with financial data (P&L, income statements, reports).");
-  }
+  // financial_metrics.min(1) in the schema already guarantees non-empty;
+  // ContextData's optional fields (header_mapping_suggestions) are filled
+  // in below by buildHeaderMappingSuggestions / normalizeMetricSemantics.
+  const contextData: ContextData = extracted;
+  applyDenominationFallback(contextData, denomHints);
+  normalizeMetricSemantics(contextData);
 
   // 4. Store in company_context (upsert — one active context per user)
   // Deactivate any existing context
@@ -249,6 +292,41 @@ Rules for financial_metrics:
     created_at: ctx.created_at,
     updated_at: ctx.updated_at,
   };
+}
+
+function buildRepresentativeExcerpt(fullText: string, maxChars: number): string {
+  if (fullText.length <= maxChars) return fullText;
+  const docBlocks = fullText.split(/\n(?=\[Document: )/g).filter(Boolean);
+  if (docBlocks.length === 0) return fullText.slice(0, maxChars);
+
+  const perDocBudget = Math.max(4000, Math.floor(maxChars / docBlocks.length));
+  const excerpts = docBlocks.map((doc) => buildRepresentativeDocExcerpt(doc, perDocBudget));
+  const combined = excerpts.join("\n");
+  return combined.length <= maxChars ? combined : combined.slice(0, maxChars);
+}
+
+function buildRepresentativeDocExcerpt(docText: string, budget: number): string {
+  if (docText.length <= budget) return docText;
+  const sheetBlocks = docText.split(/\n(?=Sheet:\s)/g).filter(Boolean);
+
+  if (sheetBlocks.length <= 1) {
+    return takeDistributedSlices(docText, budget);
+  }
+
+  const perSheetBudget = Math.max(1200, Math.floor(budget / sheetBlocks.length));
+  const sampledSheets = sheetBlocks.map((sheet) => takeDistributedSlices(sheet, perSheetBudget));
+  const joined = sampledSheets.join("\n");
+  return joined.length <= budget ? joined : joined.slice(0, budget);
+}
+
+function takeDistributedSlices(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+  const part = Math.max(200, Math.floor(budget / 3));
+  const start = text.slice(0, part);
+  const midStart = Math.max(0, Math.floor(text.length / 2) - Math.floor(part / 2));
+  const middle = text.slice(midStart, midStart + part);
+  const end = text.slice(Math.max(0, text.length - part));
+  return `${start}\n...\n${middle}\n...\n${end}`;
 }
 
 // ── Formula Validation & Repair ──────────────────────────────────────────────
@@ -346,6 +424,9 @@ function findKnownFormula(
   variableId: string,
   availableVars: Set<string>,
 ): { formula: string; deps: string[] } | null {
+  // Hardcoded P&L formula map is demo scaffolding only — production models
+  // must come from workbook graphs or LLM extraction.
+  if (!config.DEMO_MODE) return null;
   const candidates = KNOWN_CALCULATED_FORMULAS[variableId];
   if (!candidates) return null;
   for (const c of candidates) {
@@ -398,7 +479,7 @@ function validateAndRepairMetrics(metrics: FinancialMetric[]): void {
       if (repaired) {
         m.formula = repaired.formula;
         m.dependencies = repaired.deps;
-        console.log(`[ContextEngine] Repaired formula for ${m.variable_id}: ${m.formula}`);
+        logger.info(`[ContextEngine] Repaired formula for ${m.variable_id}: ${m.formula}`);
       }
     }
 
@@ -409,7 +490,7 @@ function validateAndRepairMetrics(metrics: FinancialMetric[]): void {
         m.is_input = false;
         m.formula = repaired.formula;
         m.dependencies = repaired.deps;
-        console.log(
+        logger.info(
           `[ContextEngine] Converted ${m.variable_id} from input(${m.typical_value ?? 0}) to calculated: ${m.formula}`,
         );
       }
@@ -428,7 +509,7 @@ function validateAndRepairMetrics(metrics: FinancialMetric[]): void {
         if (repaired) {
           m.formula = repaired.formula;
           m.dependencies = repaired.deps;
-          console.log(`[ContextEngine] Fixed detached formula for ${m.variable_id}: ${m.formula}`);
+          logger.info(`[ContextEngine] Fixed detached formula for ${m.variable_id}: ${m.formula}`);
         }
       }
     }
@@ -454,9 +535,9 @@ function sanityCheckVariables(
       v.dependencies = repaired.deps;
       v.tags = v.tags.filter((t) => t !== "input" && t !== "percent_delta");
       if (!v.tags.includes("output")) v.tags.push("output");
-      console.log(`[ContextEngine] Sanity-check repaired ${v.id}: ${v.formula}`);
+      logger.info(`[ContextEngine] Sanity-check repaired ${v.id}: ${v.formula}`);
     } else if (v.dependencies.length === 0) {
-      console.warn(
+      logger.warn(
         `[ContextEngine] WARNING: output variable "${v.id}" has static formula "${v.formula}" — scenario changes won't propagate to it`,
       );
     }
@@ -517,7 +598,7 @@ function buildModelFromContext(ctx: ContextData): ModelDefinition {
       tags: ["pl_metric", "input", "percent_delta"],
     });
     varIds.add(missing);
-    console.log(`[ContextEngine] Injected missing dependency variable: ${missing} = ${value}`);
+    logger.info(`[ContextEngine] Injected missing dependency variable: ${missing} = ${value}`);
   }
   // Also ensure dependencies arrays are complete — add any formula-referenced vars to deps
   for (const v of variables) {
@@ -580,9 +661,174 @@ function buildTags(m: FinancialMetric): string[] {
   return tags;
 }
 
+function normalizeMetricSemantics(ctx: ContextData): void {
+  const normalized = (ctx.financial_metrics || []).map((m) => {
+    const inferred = inferMetricType(m);
+    let unit = (m.unit || "").trim();
+    if (!unit) {
+      if (inferred === "currency") {
+        unit = `${ctx.currency || "USD"}${ctx.currency_unit ? ` ${ctx.currency_unit}` : ""}`.trim();
+      } else if (inferred === "percent") {
+        unit = "%";
+      } else if (inferred === "count") {
+        unit = "count";
+      } else if (inferred === "volume") {
+        unit = "units";
+      } else if (inferred === "ratio") {
+        unit = "ratio";
+      } else {
+        unit = "value";
+      }
+    }
+    return { ...m, metric_type: inferred, unit };
+  });
+
+  ctx.financial_metrics = normalized;
+  ctx.header_mapping_suggestions = buildHeaderMappingSuggestions(normalized);
+}
+
+function applyDenominationFallback(ctx: ContextData, hints: DenominationHints): void {
+  ctx.currency = normalizeCurrencyCode(ctx.currency || hints.currency);
+  ctx.currency_unit = normalizeCurrencyUnit(ctx.currency_unit || hints.currency_unit);
+
+  if (!ctx.currency) ctx.currency = "USD";
+  if (!ctx.currency_unit) ctx.currency_unit = "Million";
+}
+
+function inferMetricType(m: FinancialMetric): "currency" | "count" | "percent" | "ratio" | "volume" | "unknown" {
+  const text = `${m.name} ${m.variable_id} ${m.description} ${m.unit}`.toLowerCase();
+  if (text.includes("%") || /\bmargin\b|\bgrowth\b|\battrition\b|\butilization\b|\brate\b/.test(text)) return "percent";
+  if (/\bratio\b|\bturnover\b|\bper\b.*\b(revenue|employee|store)\b|\bdebt[- ]to[- ]equity\b/.test(text)) return "ratio";
+  if (/\bheadcount\b|\bemployees?\b|\bfte\b|\bstores?\b|\boutlets?\b|\bpoints of sale\b/.test(text)) return "count";
+  if (/\bvolume\b|\bunits sold\b|\bquantity\b|\bthroughput\b|\bshipments?\b/.test(text)) return "volume";
+  if (/\binr\b|\busd\b|\beur\b|\bgbp\b|\bcrore\b|\blakh\b|\bmillion\b|\bbillion\b|\brevenue\b|\bcost\b|\bexpense\b|\bprofit\b|\bebit\b|\bebitda\b|\btax\b|\bdepreciation\b/.test(text)) return "currency";
+  return "unknown";
+}
+
+function buildHeaderMappingSuggestions(metrics: FinancialMetric[]): HeaderMappingSuggestion[] {
+  const byType = new Map<string, string[]>();
+  for (const m of metrics) {
+    const t = m.metric_type || "unknown";
+    const arr = byType.get(t) || [];
+    arr.push(m.variable_id);
+    byType.set(t, arr);
+  }
+  const suggestions: HeaderMappingSuggestion[] = [];
+  if (byType.has("currency")) {
+    suggestions.push({
+      header_pattern: "Revenue|Cost|Expense|Profit|EBITDA|EBIT|Tax|Income",
+      inferred_metric_type: "currency",
+      expected_unit: "Currency + scale (e.g. INR Million, USD Mn)",
+      mapping_guidance: "Map these headers to monetary variables and keep document currency/unit without conversion.",
+      sample_variable_ids: (byType.get("currency") || []).slice(0, 8),
+    });
+  }
+  if (byType.has("count")) {
+    suggestions.push({
+      header_pattern: "Headcount|Employees|FTE|Stores|Outlets|Points of Sale",
+      inferred_metric_type: "count",
+      expected_unit: "Count",
+      mapping_guidance: "Map to count dimensions; do not apply currency symbol.",
+      sample_variable_ids: (byType.get("count") || []).slice(0, 8),
+    });
+  }
+  if (byType.has("volume")) {
+    suggestions.push({
+      header_pattern: "Volume|Units Sold|Quantity|Shipments",
+      inferred_metric_type: "volume",
+      expected_unit: "Units",
+      mapping_guidance: "Map to operational volume drivers used for demand/throughput scenarios.",
+      sample_variable_ids: (byType.get("volume") || []).slice(0, 8),
+    });
+  }
+  if (byType.has("percent")) {
+    suggestions.push({
+      header_pattern: "Margin %|Growth %|Attrition %|Utilization %|Rate %",
+      inferred_metric_type: "percent",
+      expected_unit: "%",
+      mapping_guidance: "Store as percentage metrics; avoid currency formatting.",
+      sample_variable_ids: (byType.get("percent") || []).slice(0, 8),
+    });
+  }
+  if (byType.has("ratio")) {
+    suggestions.push({
+      header_pattern: "Current Ratio|Debt-to-Equity|Turnover (x)",
+      inferred_metric_type: "ratio",
+      expected_unit: "x or ratio",
+      mapping_guidance: "Store as ratios used for diagnostics, not monetary drivers.",
+      sample_variable_ids: (byType.get("ratio") || []).slice(0, 8),
+    });
+  }
+  return suggestions;
+}
+
+function normalizeCurrencyCode(value?: string): string | undefined {
+  if (!value) return undefined;
+  const v = value.trim().toUpperCase();
+  if (v.includes("INR") || v.includes("RS") || v.includes("RUPEE") || v.includes("₹")) return "INR";
+  if (v.includes("USD") || v.includes("US$") || v.includes("$")) return "USD";
+  if (v.includes("EUR") || v.includes("€")) return "EUR";
+  if (v.includes("GBP") || v.includes("£")) return "GBP";
+  if (v.includes("AED")) return "AED";
+  if (v.includes("SGD")) return "SGD";
+  return v.length <= 5 ? v : undefined;
+}
+
+function normalizeCurrencyUnit(value?: string): string | undefined {
+  if (!value) return undefined;
+  const v = value.trim().toLowerCase();
+  if (/\bmillion\b|\bmillions\b|\bmn\b|\bmio\b/.test(v)) return "Million";
+  if (/\bbillion\b|\bbillions\b|\bbn\b/.test(v)) return "Billion";
+  if (/\bthousand\b|\bthousands\b|\bk\b/.test(v)) return "Thousand";
+  if (/\bcrore\b|\bcrores\b|\bcr\b/.test(v)) return "Crore";
+  if (/\blakh\b|\blakhs\b|\blac\b|\blacs\b/.test(v)) return "Lakh";
+  return undefined;
+}
+
+function detectDenominationHints(text: string): DenominationHints {
+  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  const currencyScore = new Map<string, number>();
+  const unitScore = new Map<string, number>();
+  const evidence: string[] = [];
+
+  const addScore = (map: Map<string, number>, key: string, weight: number) => {
+    map.set(key, (map.get(key) || 0) + weight);
+  };
+
+  for (const line of lines) {
+    const lower = line.toLowerCase();
+    const isHintLine = /\ball figures in\b|\bfigures in\b|\bamounts? in\b|\bcurrency\b|\bdenomination\b|\bunit\b/.test(lower);
+    const weight = isHintLine ? 5 : 1;
+
+    if (/\binr\b|₹|\brupees?\b|\brs\.?\b/.test(lower)) addScore(currencyScore, "INR", weight);
+    if (/\busd\b|\bus\$\b|\$/.test(line)) addScore(currencyScore, "USD", weight);
+    if (/\beur\b|€/.test(line)) addScore(currencyScore, "EUR", weight);
+    if (/\bgbp\b|£/.test(line)) addScore(currencyScore, "GBP", weight);
+    if (/\baed\b/.test(lower)) addScore(currencyScore, "AED", weight);
+    if (/\bsgd\b/.test(lower)) addScore(currencyScore, "SGD", weight);
+
+    if (/\bmillion\b|\bmillions\b|\bmn\b|\bmio\b/.test(lower)) addScore(unitScore, "Million", weight);
+    if (/\bbillion\b|\bbillions\b|\bbn\b/.test(lower)) addScore(unitScore, "Billion", weight);
+    if (/\bthousand\b|\bthousands\b/.test(lower)) addScore(unitScore, "Thousand", weight);
+    if (/\bcrore\b|\bcrores\b|\bcr\b/.test(lower)) addScore(unitScore, "Crore", weight);
+    if (/\blakh\b|\blakhs\b|\blac\b|\blacs\b/.test(lower)) addScore(unitScore, "Lakh", weight);
+
+    if (isHintLine && evidence.length < 15) evidence.push(line);
+  }
+
+  const top = (map: Map<string, number>) =>
+    [...map.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
+
+  return {
+    currency: top(currencyScore),
+    currency_unit: top(unitScore),
+    evidence,
+  };
+}
+
 // ── Context Retrieval ──
 
-export async function getActiveContext(userIdentifier?: string): Promise<CompanyContext | null> {
+export async function getActiveContext(userIdentifier: string): Promise<CompanyContext | null> {
   const userId = await resolveUserId(userIdentifier);
   const r = await pool.query(
     "SELECT * FROM company_context WHERE created_by = $1 AND status = 'active' ORDER BY created_at DESC LIMIT 1",
@@ -592,7 +838,7 @@ export async function getActiveContext(userIdentifier?: string): Promise<Company
   return r.rows[0];
 }
 
-export async function getActiveModel(userIdentifier?: string): Promise<{ model_id: string; name: string; model_definition: ModelDefinition; is_active: boolean } | null> {
+export async function getActiveModel(userIdentifier: string): Promise<{ model_id: string; name: string; model_definition: ModelDefinition; is_active: boolean } | null> {
   const userId = await resolveUserId(userIdentifier);
   const r = await pool.query(
     "SELECT * FROM user_models WHERE created_by = $1 AND is_active = true ORDER BY created_at DESC LIMIT 1",
@@ -621,7 +867,7 @@ export async function updateModel(modelId: string, modelDefinition: ModelDefinit
   );
 }
 
-export async function deleteContext(userIdentifier?: string): Promise<void> {
+export async function deleteContext(userIdentifier: string): Promise<void> {
   const userId = await resolveUserId(userIdentifier);
   await pool.query("UPDATE company_context SET status = 'deleted' WHERE created_by = $1 AND status = 'active'", [userId]);
   await pool.query("UPDATE user_models SET is_active = false WHERE created_by = $1 AND is_active = true", [userId]);
@@ -630,7 +876,7 @@ export async function deleteContext(userIdentifier?: string): Promise<void> {
 /**
  * Build a text description of the company context for injection into LLM prompts.
  */
-export async function describeContextForLLM(userIdentifier?: string): Promise<string | null> {
+export async function describeContextForLLM(userIdentifier: string): Promise<string | null> {
   const ctx = await getActiveContext(userIdentifier);
   if (!ctx) return null;
   const d = ctx.context_data as ContextData;

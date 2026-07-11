@@ -14,6 +14,8 @@ import {
 } from "recharts";
 
 import { METRIC_ORDER, METRIC_LABELS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import { chartColors, formatCompactCurrency } from "@/lib/chartTheme";
+import { ChartDataTable } from "./ChartDataTable";
 
 interface WaterfallChartProps {
   pl: Record<string, number>;
@@ -21,12 +23,11 @@ interface WaterfallChartProps {
   title?: string;
 }
 
-// Colors from Deloitte palette
 const COLORS = {
-  positive: "#86BC25",
-  negative: "#DA291C",
-  total: "#1D1D1B",
-  base: "#97999B",
+  positive: chartColors.positive,
+  negative: chartColors.negative,
+  total: "var(--text-primary)",
+  base: "var(--text-faint)",
 };
 
 interface WaterfallItem {
@@ -136,7 +137,7 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
             />
             <YAxis
               tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-              tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
+              tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
               axisLine={false}
               tickLine={false}
             />
@@ -152,6 +153,11 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
             </Bar>
           </BarChart>
         </ResponsiveContainer>
+        <ChartDataTable
+          caption={title}
+          columns={["Metric", "Value", "Start", "End"]}
+          rows={data.map((d) => [d.name, d.value, d.start, d.end])}
+        />
       </div>
 
       {/* Delta waterfall */}
@@ -170,7 +176,7 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
                 />
                 <YAxis
                   tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-              tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
+              tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
               axisLine={false}
               tickLine={false}
             />

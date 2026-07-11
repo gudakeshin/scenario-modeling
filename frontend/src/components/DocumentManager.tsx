@@ -11,6 +11,7 @@ import {
   deleteCompanyContext,
   getActiveModel,
   updateActiveModel,
+  validateModelSchema,
   type DocumentRecord,
   type CompanyContext,
   type UserModel,
@@ -29,8 +30,10 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   const [tab, setTab] = useState<Tab>("documents");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [context, setContext] = useState<CompanyContext | null>(null);
+  const [modelValidationStatus, setModelValidationStatus] = useState<"processing" | "needs_validation" | "ready" | null>(null);
   const [model, setModel] = useState<UserModel | null>(null);
   const [building, setBuilding] = useState(false);
   const [buildError, setBuildError] = useState<string | null>(null);
@@ -44,8 +47,9 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
 
   const loadContext = useCallback(async () => {
     try {
-      const { context: ctx } = await getCompanyContext();
+      const { context: ctx, model_intelligence } = await getCompanyContext();
       setContext(ctx);
+      setModelValidationStatus(model_intelligence?.validation_status || null);
     } catch { /* ignore */ }
   }, []);
 
@@ -58,23 +62,44 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
 
   useEffect(() => { loadDocuments(); loadContext(); loadModel(); }, [loadDocuments, loadContext, loadModel]);
 
-  const handleUpload = async (file: File) => {
+  const handleUpload = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+
     setUploading(true);
     setUploadError(null);
-    try {
-      await uploadDocument(file);
-      await loadDocuments();
-    } catch (e) {
-      setUploadError((e as Error).message);
+    setUploadProgress(null);
+
+    const failures: string[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      setUploadProgress(`Uploading ${i + 1} of ${list.length}: ${file.name}`);
+      try {
+        await uploadDocument(file);
+      } catch (e) {
+        failures.push(`${file.name}: ${(e as Error).message}`);
+      }
     }
+
+    await loadDocuments();
+    setUploadProgress(null);
     setUploading(false);
+    if (failures.length > 0) {
+      setUploadError(
+        failures.length === list.length
+          ? failures.join("\n")
+          : `${failures.length} of ${list.length} failed:\n${failures.join("\n")}`
+      );
+    }
   };
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (file) handleUpload(file);
+    if (e.dataTransfer.files.length > 0) {
+      void handleUpload(e.dataTransfer.files);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- handleUpload closes over latest state setters
   }, []);
 
   const handleDelete = async (docId: string) => {
@@ -114,6 +139,16 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
     } catch { /* ignore */ }
   };
 
+  const handleValidateModel = async () => {
+    try {
+      await validateModelSchema();
+      await loadContext();
+      await loadDocuments();
+    } catch (e) {
+      setBuildError((e as Error).message);
+    }
+  };
+
   const handleUpdateVariable = async (varId: string, field: string, value: string) => {
     if (!model) return;
     const updated = {
@@ -145,6 +180,49 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
 
   const readyDocs = documents.filter((d) => d.status === "ready").length;
 
+  const validationPill = (status?: "processing" | "needs_validation" | "ready") => {
+    if (!status) return null;
+    if (status === "ready") return <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--success)]/15 text-[var(--success)] border border-[var(--success)]/20">Model Intelligence Ready</span>;
+    if (status === "needs_validation") return <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 border border-amber-500/20">Needs Validation</span>;
+    return <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent/10 text-accent border border-accent/20">Processing</span>;
+  };
+
+  const formatMetricValue = (m: {
+    typical_value?: number;
+    metric_type?: "currency" | "count" | "percent" | "ratio" | "volume" | "unknown";
+    unit: string;
+  }) => {
+    if (m.typical_value == null) return null;
+    const v = m.typical_value.toLocaleString();
+    const kind = m.metric_type || "unknown";
+    if (kind === "currency") return `${getCurrencySymbol()}${v}`;
+    if (kind === "percent") return `${v}%`;
+    if (kind === "ratio") return `${v}x`;
+    if (kind === "volume") return `${v} units`;
+    if (kind === "count") return v;
+    return `${v}${m.unit ? ` ${m.unit}` : ""}`;
+  };
+
+  const getExtractionQuality = () => {
+    const ms = context?.context_data?.model_schema;
+    if (!ms) return null;
+
+    const leverTotal = ms.scenarioLevers?.length || 0;
+    const leverSeeded = (ms.scenarioLevers || []).filter((l) => {
+      const base = Number((l as unknown as { scenarios?: { base?: number } }).scenarios?.base ?? 0);
+      return Number.isFinite(base) && Math.abs(base) > 0;
+    }).length;
+
+    const metricTotal = ms.outputMetrics?.length || 0;
+    const baseValues = (ms as unknown as { baseValues?: Record<string, number> }).baseValues || {};
+    const metricSeeded = (ms.outputMetrics || []).filter((m) => {
+      const v = Number(baseValues[m.id] ?? 0);
+      return Number.isFinite(v) && Math.abs(v) > 0;
+    }).length;
+
+    return { leverSeeded, leverTotal, metricSeeded, metricTotal };
+  };
+
   return (
     <div className="p-5 max-h-[80vh] overflow-y-auto">
       <PanelHeader
@@ -174,17 +252,33 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
               dragOver ? "border-accent bg-accent/5" : "border-[var(--border)] hover:border-accent/40"
             }`}
           >
-            <input ref={fileRef} type="file" accept=".pdf,.txt,.md,.csv,.docx" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUpload(f); e.target.value = ""; }} />
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              accept=".pdf,.txt,.md,.csv,.docx,.xlsx"
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files?.length) void handleUpload(e.target.files);
+                e.target.value = "";
+              }}
+            />
             <p className="text-sm text-[var(--text-secondary)] mb-2">
-              {uploading ? "Uploading..." : "Drag & drop a file here, or click to browse"}
+              {uploading
+                ? (uploadProgress || "Uploading...")
+                : "Drag & drop files here, or click to browse"}
             </p>
             <button type="button" onClick={() => fileRef.current?.click()} disabled={uploading} className="text-accent text-sm font-medium hover:underline">
-              Select File
+              Select Files
             </button>
-            <p className="text-xs text-[var(--text-muted)] mt-1">PDF, TXT, MD, CSV, DOCX — max 20MB</p>
+            <p className="text-xs text-[var(--text-muted)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX — max 20MB each · multiple files supported</p>
           </div>
 
-          {uploadError && <div className="text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg">{uploadError}</div>}
+          {uploadError && (
+            <div className="text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg whitespace-pre-line">
+              {uploadError}
+            </div>
+          )}
 
           {/* Document list */}
           {documents.length > 0 && (
@@ -219,6 +313,9 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                       {(doc.file_size_bytes / 1024).toFixed(0)} KB &middot; {doc.chunk_count} chunks &middot;{" "}
                       <span className={doc.status === "ready" ? "text-[var(--success)]" : "text-[var(--warning)]"}>{doc.status}</span>
                     </p>
+                    {doc.document_kind === "spreadsheet_model" && (
+                      <div className="mt-1">{validationPill(doc.validation_status)}</div>
+                    )}
                   </div>
                   <button type="button" onClick={() => handleDelete(doc.document_id)} className="ml-2 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors" title="Delete">
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
@@ -251,11 +348,23 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                 <div>
                   <h3 className="text-lg font-semibold text-[var(--text-primary)]">{context.context_data.company_name}</h3>
                   <p className="text-sm text-[var(--text-secondary)]">{context.context_data.industry}</p>
+                  {validationPill(modelValidationStatus || context.context_data.validation_status)}
                 </div>
                 <button type="button" onClick={handleResetContext} className="text-xs px-3 py-1.5 rounded-lg border border-[var(--danger)]/30 text-[var(--danger)] hover:bg-[var(--danger-bg)] transition-colors">
                   Reset
                 </button>
               </div>
+              {((modelValidationStatus || context.context_data.validation_status) === "needs_validation") && (
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleValidateModel}
+                    className="text-xs px-3 py-1.5 rounded-lg bg-accent text-white font-medium hover:bg-accent/90 transition-colors"
+                  >
+                    Mark Model Validated
+                  </button>
+                </div>
+              )}
 
               <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-3">
                 <div>
@@ -312,20 +421,69 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                     <div key={m.variable_id} className="flex items-center justify-between bg-[var(--panel-bg)] rounded-lg px-3 py-2 text-sm">
                       <div>
                         <span className="font-medium text-[var(--text-primary)]">{m.name}</span>
-                        <span className="ml-2 text-xs text-[var(--text-muted)]">{m.category} {m.is_input ? "(input)" : "(calculated)"}</span>
+                        <span className="ml-2 text-xs text-[var(--text-muted)]">
+                          {m.category} {m.is_input ? "(input)" : "(calculated)"} {m.metric_type ? `• ${m.metric_type}` : ""}
+                        </span>
                       </div>
                       {m.typical_value != null && (
-                        <span className="text-xs font-mono text-accent">{getCurrencySymbol()}{m.typical_value.toLocaleString()}</span>
+                        <span className="text-xs font-mono text-accent">{formatMetricValue(m)}</span>
                       )}
                     </div>
                   ))}
                 </div>
               </div>
 
+              {context.context_data.header_mapping_suggestions && context.context_data.header_mapping_suggestions.length > 0 && (
+                <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                  <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">Header Mapping Suggestions</span>
+                  {context.context_data.header_mapping_suggestions.map((s) => (
+                    <div key={`${s.header_pattern}-${s.inferred_metric_type}`} className="bg-[var(--panel-bg)] rounded-lg px-3 py-2">
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        <span className="font-semibold">Pattern:</span> {s.header_pattern}
+                      </p>
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        <span className="font-semibold">Type:</span> {s.inferred_metric_type} &middot; <span className="font-semibold">Unit:</span> {s.expected_unit}
+                      </p>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">{s.mapping_guidance}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <p className="text-xs text-[var(--text-muted)]">
                 Built from {context.source_document_ids.length} document{context.source_document_ids.length !== 1 ? "s" : ""} &middot;{" "}
                 {new Date(context.updated_at).toLocaleString()}
               </p>
+
+              {context.context_data.model_schema && (
+                <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                  <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">Model Schema (XLSX Structural)</span>
+                  <div className="text-xs text-[var(--text-secondary)]">
+                    <span className="font-semibold">Levers:</span> {context.context_data.model_schema.scenarioLevers?.length || 0}
+                    {" · "}
+                    <span className="font-semibold">Outputs:</span> {context.context_data.model_schema.outputMetrics?.length || 0}
+                    {" · "}
+                    <span className="font-semibold">Time:</span> {context.context_data.model_schema.timeDimension?.granularity || "unknown"}
+                  </div>
+                  {(() => {
+                    const q = getExtractionQuality();
+                    if (!q) return null;
+                    return (
+                      <div className="text-[11px] text-[var(--text-muted)] bg-[var(--panel-bg)] rounded px-2 py-1 border border-[var(--border)]">
+                        Extraction quality: <span className="font-semibold text-[var(--text-secondary)]">{q.leverSeeded}/{q.leverTotal}</span> levers seeded with non-zero base values,{" "}
+                        <span className="font-semibold text-[var(--text-secondary)]">{q.metricSeeded}/{q.metricTotal}</span> metrics seeded with non-zero base values.
+                      </div>
+                    );
+                  })()}
+                  <div className="flex flex-wrap gap-1.5">
+                    {(context.context_data.model_schema.scenarioLevers || []).slice(0, 6).map((lever) => (
+                      <span key={lever.id} className="px-2 py-0.5 bg-accent/10 text-accent text-xs rounded-full">
+                        {lever.label || lever.id}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
             </>
           )}
         </div>

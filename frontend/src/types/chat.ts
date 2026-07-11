@@ -28,4 +28,6 @@ export interface Conversation {
   messages: Message[];
   updatedAt: Date;
   scenarioId?: string | null;
+  /** Persisted conversational session for follow-ups; restored on select */
+  sessionId?: string | null;
 }

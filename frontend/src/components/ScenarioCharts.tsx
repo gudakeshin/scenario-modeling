@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useCallback } from "react";
+import { toast } from "sonner";
 import { WaterfallChart } from "./WaterfallChart";
 import { PanelHeader } from "./PanelHeader";
 import { TrendLineChart } from "./TrendLineChart";
@@ -17,6 +18,16 @@ interface ScenarioChartsProps {
 
 type Tab = "waterfall" | "trends";
 
+function chartExportBackground(): string {
+  if (typeof window === "undefined") return "#FFFFFF";
+  const styles = getComputedStyle(document.documentElement);
+  return (
+    styles.getPropertyValue("--card-bg").trim() ||
+    styles.getPropertyValue("--background").trim() ||
+    "#FFFFFF"
+  );
+}
+
 export function ScenarioCharts({ pl, basePl, periods, granularity, onClose, onMinimize }: ScenarioChartsProps) {
   const [activeTab, setActiveTab] = useState<Tab>("waterfall");
   const chartRef = useRef<HTMLDivElement>(null);
@@ -24,37 +35,50 @@ export function ScenarioCharts({ pl, basePl, periods, granularity, onClose, onMi
   const exportPNG = useCallback(async () => {
     if (!chartRef.current) return;
     try {
-      // Find the SVG inside the chart container
       const svg = chartRef.current.querySelector("svg");
-      if (!svg) return;
+      if (!svg) {
+        toast.error("No chart available to export");
+        return;
+      }
 
       const svgData = new XMLSerializer().serializeToString(svg);
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d");
-      if (!ctx) return;
+      if (!ctx) {
+        toast.error("Could not create export canvas");
+        return;
+      }
 
       const img = new Image();
       const svgBlob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
       const url = URL.createObjectURL(svgBlob);
 
       img.onload = () => {
-        canvas.width = img.width * 2;
-        canvas.height = img.height * 2;
-        ctx.scale(2, 2);
-        ctx.fillStyle = "#FFFFFF";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0);
-        URL.revokeObjectURL(url);
+        try {
+          canvas.width = img.width * 2;
+          canvas.height = img.height * 2;
+          ctx.scale(2, 2);
+          ctx.fillStyle = chartExportBackground();
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0);
+          URL.revokeObjectURL(url);
 
-        const pngUrl = canvas.toDataURL("image/png");
-        const link = document.createElement("a");
-        link.download = `scenario-${activeTab}-chart.png`;
-        link.href = pngUrl;
-        link.click();
+          const pngUrl = canvas.toDataURL("image/png");
+          const link = document.createElement("a");
+          link.download = `scenario-${activeTab}-chart.png`;
+          link.href = pngUrl;
+          link.click();
+        } catch {
+          toast.error("Failed to export chart as PNG");
+        }
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        toast.error("Failed to export chart as PNG");
       };
       img.src = url;
     } catch {
-      // Silent fail for export
+      toast.error("Failed to export chart as PNG");
     }
   }, [activeTab]);
 

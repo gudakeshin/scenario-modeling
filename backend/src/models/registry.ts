@@ -84,41 +84,12 @@ export async function getUserModelId(userId: string): Promise<string | null> {
 
 // ── Derived helpers (single source of truth) ──
 
-function topologicalSort(variables: ModelVariable[]): string[] {
-  const order: string[] = [];
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-  const byId = new Map(variables.map((v) => [v.id, v]));
-  function visit(id: string) {
-    if (visited.has(id)) return;
-    if (visiting.has(id)) throw new Error(`Circular dependency: ${id}`);
-    visiting.add(id);
-    const v = byId.get(id);
-    if (v) for (const d of v.dependencies) visit(d);
-    visiting.delete(id);
-    visited.add(id);
-    order.push(id);
-  }
-  for (const v of variables) visit(v.id);
-  return order;
-}
-
-function evaluateFormula(formula: string, ctx: Record<string, number>): number {
-  let expr = formula.trim();
-  for (const [k, v] of Object.entries(ctx)) {
-    expr = expr.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"), String(v));
-  }
-  if (!/^[\d\s+\-*/().]+$/.test(expr)) return 0;
-  try {
-    return new Function(`return (${expr})`)();
-  } catch {
-    return 0;
-  }
-}
-
 /**
  * Compute the base case P&L from a model definition.
  * Accepts a model directly, or looks it up by ID/version.
+ * Returns {} when no model exists or the model's formulas are broken —
+ * callers use this for advisory context (QA prompts, comparisons), not
+ * for the simulation itself, which surfaces formula errors properly.
  */
 export async function computeBaseCase(modelOrVersion?: string | ModelDefinition): Promise<Record<string, number>> {
   let model: ModelDefinition | null;
@@ -128,14 +99,12 @@ export async function computeBaseCase(modelOrVersion?: string | ModelDefinition)
     model = await getModelDefinition(modelOrVersion as string | undefined);
   }
   if (!model) return {};
-  const order = topologicalSort(model.variables);
-  const ctx: Record<string, number> = {};
-  for (const id of order) {
-    const v = model.variables.find((x) => x.id === id);
-    if (!v) continue;
-    ctx[id] = evaluateFormula(v.formula, ctx);
+  try {
+    const { CompiledModel } = await import("../services/expression.js");
+    return new CompiledModel(model).baseValues();
+  } catch {
+    return {};
   }
-  return ctx;
 }
 
 /**

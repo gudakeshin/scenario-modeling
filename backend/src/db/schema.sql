@@ -54,6 +54,7 @@ CREATE TABLE IF NOT EXISTS audit_trail (
     action_type VARCHAR(50) NOT NULL,
     user_id UUID NOT NULL REFERENCES users(user_id),
     action_details JSONB,
+    touched_levers_snapshot JSONB,
     timestamp TIMESTAMP DEFAULT NOW(),
     ip_address INET,
     user_agent TEXT
@@ -138,15 +139,50 @@ CREATE TABLE IF NOT EXISTS documents (
     document_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255) NOT NULL,
     original_filename VARCHAR(500) NOT NULL,
-    file_type VARCHAR(50) NOT NULL,
+    file_type VARCHAR(255) NOT NULL,
     file_size_bytes INTEGER,
     chunk_count INTEGER DEFAULT 0,
     status VARCHAR(50) DEFAULT 'processing',
+    document_kind VARCHAR(50) DEFAULT 'document_text',
+    validation_status VARCHAR(50) DEFAULT 'processing',
+    workbook_graph JSONB,
+    model_schema JSONB,
     qdrant_collection VARCHAR(255),
     created_by UUID REFERENCES users(user_id),
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+
+-- Conversational sessions (persistent companion to in-memory cache)
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id VARCHAR(255) PRIMARY KEY,
+    scenario_id UUID NOT NULL REFERENCES scenarios(scenario_id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(user_id),
+    scenario_context JSONB,
+    turns JSONB DEFAULT '[]'::jsonb,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Backward-compatible column migrations
+ALTER TABLE audit_trail
+  ADD COLUMN IF NOT EXISTS touched_levers_snapshot JSONB;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS document_kind VARCHAR(50) DEFAULT 'document_text';
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS validation_status VARCHAR(50) DEFAULT 'processing';
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS workbook_graph JSONB;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS model_schema JSONB;
+
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS scenario_context JSONB;
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_scenarios_creator ON scenarios(creator_id);
@@ -157,6 +193,9 @@ CREATE INDEX IF NOT EXISTS idx_audit_scenario ON audit_trail(scenario_id);
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_trail(timestamp);
 CREATE INDEX IF NOT EXISTS idx_mappings_term ON model_mappings(business_term);
 CREATE INDEX IF NOT EXISTS idx_mappings_variable ON model_mappings(model_variable_id);
+CREATE INDEX IF NOT EXISTS idx_documents_kind ON documents(document_kind);
+CREATE INDEX IF NOT EXISTS idx_documents_validation_status ON documents(validation_status);
+CREATE INDEX IF NOT EXISTS idx_sessions_scenario ON sessions(scenario_id);
 
 -- Seed default user for local dev / testing only.
 -- In production, users should be created via the application or SSO.

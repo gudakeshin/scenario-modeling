@@ -2,6 +2,7 @@
 
 import type { Message } from "@/types/chat";
 import { ThinkingBlock } from "./ThinkingBlock";
+import { MarkdownContent } from "./MarkdownContent";
 
 interface MessageBubbleProps {
   message: Message;
@@ -26,9 +27,13 @@ export function MessageBubble({ message }: MessageBubbleProps) {
               : "bg-[var(--message-assistant-bg)] text-[var(--message-assistant-text)] border border-[var(--border-light)]"
           }`}
         >
-          <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">
-            {message.content}
-          </p>
+          {isUser ? (
+            <p className="text-[15px] leading-relaxed whitespace-pre-wrap break-words">
+              {message.content}
+            </p>
+          ) : (
+            <MarkdownContent content={message.content} className="text-[15px]" />
+          )}
         </div>
       </div>
     </>

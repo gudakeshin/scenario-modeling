@@ -8,16 +8,18 @@
  * Sessions expire after 24 hours of inactivity.
  */
 
-import { pool, getDefaultUserId } from "../db/index.js";
-import { parseScenario } from "./parser.js";
+import { pool } from "../db/index.js";
+import { parseScenario, toTypedDelta } from "./parser.js";
 import { resolveToModelVariable } from "./mappingService.js";
 import { logAudit } from "./auditService.js";
+import { ensureScenarioContext, mergeTouchedLevers, getScenarioContext, hydrateScenarioContext } from "./scenarioContextService.js";
 
 export interface Session {
   session_id: string;
   scenario_id: string;
   user_id: string;
   turns: { role: "user" | "assistant"; content: string; timestamp: string }[];
+  scenario_context?: ReturnType<typeof getScenarioContext>;
   expires_at: string;
   created_at: string;
 }
@@ -53,14 +55,17 @@ export function getSession(sessionId: string): Session | null {
     scenario_id: s.scenario_id,
     user_id: s.user_id,
     turns: s.turns,
+    scenario_context: getScenarioContext(s.scenario_id),
     expires_at: new Date(s.expires_at).toISOString(),
     created_at: new Date(s.created_at).toISOString(),
   };
 }
 
-export function createSession(scenarioId: string, userId: string): string {
+export async function createSession(scenarioId: string, userId: string): Promise<string> {
   cleanExpired();
   const id = generateSessionId();
+  await hydrateScenarioContext(scenarioId);
+  ensureScenarioContext(scenarioId);
   sessions.set(id, {
     scenario_id: scenarioId,
     user_id: userId,
@@ -85,6 +90,7 @@ export function listSessions(userId?: string): Session[] {
       scenario_id: s.scenario_id,
       user_id: s.user_id,
       turns: s.turns,
+      scenario_context: getScenarioContext(s.scenario_id),
       expires_at: new Date(s.expires_at).toISOString(),
       created_at: new Date(s.created_at).toISOString(),
     });
@@ -99,7 +105,8 @@ export function listSessions(userId?: string): Session[] {
  */
 export async function addFollowUp(
   sessionId: string,
-  nlInput: string
+  nlInput: string,
+  userId: string
 ): Promise<{
   added_parameters: { name: string; mapped_variable_id: string; scenario_value: number }[];
   cumulative_count: number;
@@ -114,6 +121,7 @@ export async function addFollowUp(
   session.turns.push({ role: "user", content: nlInput, timestamp: new Date().toISOString() });
 
   const scenarioId = session.scenario_id;
+  await hydrateScenarioContext(scenarioId);
   // Get the scenario's creator for model lookup
   const creatorRes = await pool.query("SELECT creator_id FROM scenarios WHERE scenario_id = $1", [scenarioId]);
   const creatorId = creatorRes.rows[0]?.creator_id;
@@ -132,7 +140,7 @@ export async function addFollowUp(
     if (!variableId) {
       variableId = `extracted_${p.name.replace(/\W+/g, "_").toLowerCase()}`;
     }
-    const scenarioValue = (p.magnitude != null && !isNaN(Number(p.magnitude))) ? Number(p.magnitude) : 0;
+    const { value: scenarioValue, delta_type: deltaType } = toTypedDelta(p);
 
     // Check if parameter for this variable already exists
     const existing = await pool.query(
@@ -143,24 +151,34 @@ export async function addFollowUp(
     if (existing.rows.length > 0) {
       // Update existing parameter (additive)
       await pool.query(
-        "UPDATE scenario_parameters SET scenario_value = $1, status = 'modified', extracted_name = $2 WHERE parameter_id = $3",
-        [scenarioValue, p.name, existing.rows[0].parameter_id]
+        "UPDATE scenario_parameters SET scenario_value = $1, delta_type = $2, status = 'modified', extracted_name = $3 WHERE parameter_id = $4",
+        [scenarioValue, deltaType, p.name, existing.rows[0].parameter_id]
       );
     } else {
       // Insert new parameter
       await pool.query(
-        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, confidence_score, status)
-         VALUES ($1, $2, $3, $4, $5, 'pending')`,
-        [scenarioId, p.name, variableId, scenarioValue, p.confidence]
+        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
+        [scenarioId, p.name, variableId, scenarioValue, deltaType, p.confidence]
       );
     }
 
     added.push({ name: p.name, mapped_variable_id: variableId, scenario_value: scenarioValue });
   }
+  mergeTouchedLevers(
+    scenarioId,
+    added.map((a) => ({
+      id: a.mapped_variable_id,
+      value: a.scenario_value,
+      confidence: 1,
+      nlSource: nlInput,
+      source: "parser_extract" as const,
+    })),
+  );
 
   // Reset scenario to draft so it needs re-approval
   await pool.query("UPDATE scenarios SET status = 'draft', updated_at = NOW() WHERE scenario_id = $1", [scenarioId]);
-  await logAudit(scenarioId, "follow_up", { nl_input: nlInput, added_count: added.length });
+  await logAudit(scenarioId, "follow_up", { nl_input: nlInput, added_count: added.length }, userId);
 
   // Count cumulative params
   const countRes = await pool.query(

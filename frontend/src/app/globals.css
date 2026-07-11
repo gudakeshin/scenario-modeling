@@ -54,6 +54,7 @@
   /* Text hierarchy */
   --text-primary: #1D1D1B;
   --text-secondary: #53565A;
+  --text-tertiary: #75787B;
   --text-muted: #75787B;
   --text-faint: #97999B;
 
@@ -70,12 +71,81 @@
   /* Scrollbar */
   --scrollbar-track: transparent;
   --scrollbar-thumb: #BBBCBC;
+
+  /* Chart palette — CSS-var driven so all charts share one source of truth */
+  --chart-positive: #43B02A;
+  --chart-negative: #DA291C;
+  --chart-neutral: #0076A8;
+  --chart-accent-2: #7C4DFF;
+  --chart-accent-3: #FF6F00;
+  --chart-grid: #E5E5E2;
+  --chart-axis-text: #75787B;
+}
+
+.dark {
+  --background: #17181A;
+  --foreground: #EDEDEC;
+
+  --sidebar-bg: #101112;
+  --sidebar-border: #26272A;
+  --sidebar-text: #EDEDEC;
+  --sidebar-text-muted: #8A8D91;
+  --sidebar-hover: rgba(134, 188, 37, 0.16);
+  --sidebar-active: rgba(134, 188, 37, 0.24);
+
+  --accent: #9ED545;
+  --accent-hover: #86BC25;
+  --accent-light: rgba(158, 213, 69, 0.12);
+  --accent-muted: rgba(158, 213, 69, 0.2);
+
+  --message-user-bg: #4C7A17;
+  --message-user-text: #FFFFFF;
+  --message-assistant-bg: #232426;
+  --message-assistant-text: #EDEDEC;
+
+  --input-bg: #1E1F21;
+  --input-border: #34363A;
+  --input-focus-border: #9ED545;
+
+  --panel-bg: #1B1C1E;
+  --panel-border: #2C2D30;
+  --card-bg: #1E1F21;
+  --card-border: #2C2D30;
+
+  --border: #34363A;
+  --border-light: #2C2D30;
+
+  --text-primary: #EDEDEC;
+  --text-secondary: #B5B7BB;
+  --text-tertiary: #8A8D91;
+  --text-muted: #8A8D91;
+  --text-faint: #6D7075;
+
+  --success: #5FCB44;
+  --success-bg: rgba(95, 203, 68, 0.12);
+  --warning: #E8A73A;
+  --warning-bg: rgba(232, 167, 58, 0.12);
+  --danger: #F0564B;
+  --danger-bg: rgba(240, 86, 75, 0.12);
+  --info: #3FA9DC;
+  --info-bg: rgba(63, 169, 220, 0.12);
+
+  --scrollbar-track: transparent;
+  --scrollbar-thumb: #3A3C40;
+
+  --chart-positive: #5FCB44;
+  --chart-negative: #F0564B;
+  --chart-neutral: #3FA9DC;
+  --chart-accent-2: #9C7BFF;
+  --chart-accent-3: #FFA84D;
+  --chart-grid: #2C2D30;
+  --chart-axis-text: #8A8D91;
 }
 
 body {
   color: var(--foreground);
   background: var(--background);
-  font-family: Arial, Helvetica, sans-serif;
+  font-family: var(--font-geist-sans), Arial, Helvetica, sans-serif;
 }
 
 /* Scrollbar styling */

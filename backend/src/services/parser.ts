@@ -14,11 +14,33 @@
  *   6. Always returns structured ParsedParameter[] + optional clarification + search context
  */
 
-import { getApiKey, callClaude } from "./llmClient.js";
+import { z } from "zod";
+import { getApiKey, callClaudeStructured } from "./llmClient.js";
 import { getUserModelDefinition, describeModelForLLM, type ModelDefinition } from "../models/registry.js";
 import { describeContextForLLM } from "./contextEngine.js";
 import { needsExternalSearch, searchPerplexity, type SearchResult } from "./searchService.js";
 import { reflect, type ReflectionResult } from "./reflectionService.js";
+import { logger } from "../logger.js";
+
+const llmParseResponseSchema = z.object({
+  parameters: z.array(z.object({
+    name: z.string(),
+    variable_type: z.string(),
+    direction: z.string(),
+    magnitude: z.number().default(0),
+    unit: z.string().default("percent"),
+    scope: z.record(z.string()).default({}),
+    confidence: z.number().min(0).max(1).default(0.5),
+    suggested_variable_id: z.string().optional(),
+  })).default([]),
+  clarification_needed: z.string().nullable().optional(),
+  follow_up_questions: z.array(z.object({
+    id: z.string(),
+    question: z.string(),
+    options: z.array(z.object({ label: z.string(), value: z.string() })).default([]),
+    allow_custom: z.boolean().default(true),
+  })).nullable().optional(),
+});
 
 export interface ParsedParameter {
   name: string;
@@ -29,6 +51,36 @@ export interface ParsedParameter {
   scope: Record<string, string>;
   confidence: number;
   suggested_variable_id?: string;
+}
+
+export type DeltaType = "percent" | "absolute";
+
+const DECREASE_DIRECTION_RE = /decreas|declin|drop|reduc|cut|lower|fall|shrink|delay|contract/i;
+
+/**
+ * Convert a parsed parameter into a signed, typed delta for storage.
+ *  - direction "decrease"/"reduce"/... flips the sign (previously the sign
+ *    was dropped, so "cut costs 10%" was simulated as a 10% INCREASE)
+ *  - "set" always means an absolute value
+ *  - unit "percent" (not "set") means a relative % change
+ */
+export function toTypedDelta(p: ParsedParameter): { value: number; delta_type: DeltaType } {
+  const magnitude = p.magnitude != null && !isNaN(Number(p.magnitude)) ? Number(p.magnitude) : 0;
+  const direction = (p.direction || "").toLowerCase();
+
+  if (direction === "set") {
+    return { value: magnitude, delta_type: "absolute" };
+  }
+
+  // Respect an explicit sign from the LLM; otherwise apply direction.
+  const value = magnitude < 0 || !DECREASE_DIRECTION_RE.test(direction)
+    ? magnitude
+    : -Math.abs(magnitude);
+
+  const delta_type: DeltaType = (p.unit || "").toLowerCase().startsWith("percent")
+    ? "percent"
+    : "absolute";
+  return { value, delta_type };
 }
 
 export interface FollowUpQuestion {
@@ -110,11 +162,12 @@ FOLLOW-UP QUESTIONS:
 
 async function llmParse(
   nlInput: string,
-  userId: string,
+  userId: string | undefined,
   searchContext?: SearchResult | null,
   reflectionResult?: ReflectionResult | null
 ): Promise<ParseResult> {
   if (!getApiKey()) throw new Error("No API key");
+  if (!userId) throw new Error("No user — authentication required");
 
   const model = await getUserModelDefinition(userId);
   if (!model) throw new Error("No model — onboarding needed");
@@ -148,45 +201,19 @@ async function llmParse(
 IMPORTANT: Use the research data above to derive SPECIFIC, QUANTITATIVE parameters.
 Do NOT use generic estimates — use the actual numbers from the research.`;
   }
-  userContent += "\n\nExtract ALL parameters. For each, suggest which model variable it maps to (suggested_variable_id). Return JSON only — no markdown, no code fences.";
+  userContent += "\n\nExtract ALL parameters. For each, suggest which model variable it maps to (suggested_variable_id).";
 
-  const rawText = await callClaude({
+  const raw = await callClaudeStructured({
     system: systemPrompt,
     userMessage: userContent,
+    schema: llmParseResponseSchema,
+    toolName: "submit_scenario_parameters",
+    toolDescription: "Submit the extracted scenario parameters and any follow-up questions",
     maxTokens: 4000,
     temperature: 0.2,
+    purpose: "parse",
   });
 
-  let text = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  if (!text) throw new Error("Empty LLM response");
-
-  // Repair truncated JSON
-  if (!text.endsWith("}")) {
-    const lastBrace = text.lastIndexOf("}");
-    if (lastBrace > 0) {
-      text = text.slice(0, lastBrace + 1);
-      const opens = (text.match(/{/g) || []).length;
-      const closes = (text.match(/}/g) || []).length;
-      for (let i = 0; i < opens - closes; i++) text += "}";
-      const openBrackets = (text.match(/\[/g) || []).length;
-      const closeBrackets = (text.match(/]/g) || []).length;
-      for (let i = 0; i < openBrackets - closeBrackets; i++) {
-        text = text.replace(/,\s*$/, "") + "]";
-      }
-    }
-  }
-
-  let raw: ParseResult & { follow_up_questions?: FollowUpQuestion[] };
-  try {
-    raw = JSON.parse(text);
-  } catch {
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      raw = JSON.parse(jsonMatch[0]);
-    } else {
-      throw new Error("Could not parse LLM response as JSON");
-    }
-  }
   const parsed: ParseResult = {
     parameters: Array.isArray(raw.parameters) ? raw.parameters : [],
     clarification_needed: raw.clarification_needed ?? undefined,
@@ -217,13 +244,13 @@ Do NOT use generic estimates — use the actual numbers from the research.`;
     const before = parsed.parameters.length;
     parsed.parameters = parsed.parameters.filter((p) => {
       if (p.suggested_variable_id && outputVarIds.has(p.suggested_variable_id)) {
-        console.log(`[Parser] Filtered out parameter for calculated variable: ${p.suggested_variable_id}`);
+        logger.info(`[Parser] Filtered out parameter for calculated variable: ${p.suggested_variable_id}`);
         return false;
       }
       return true;
     });
     if (before > parsed.parameters.length) {
-      console.log(`[Parser] Removed ${before - parsed.parameters.length} parameters targeting calculated variables`);
+      logger.info(`[Parser] Removed ${before - parsed.parameters.length} parameters targeting calculated variables`);
     }
   }
 
@@ -313,15 +340,14 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
   const trimmed = nlInput.trim();
   const notices: { type: "warning" | "info"; message: string }[] = [];
 
-  // Resolve userId for model lookup
-  const effectiveUserId = userId || "system";
-
-  // Load user's model for context
+  // Load user's model for context (skip when no authenticated user id)
   let userModel: ModelDefinition | null = null;
-  try {
-    userModel = await getUserModelDefinition(effectiveUserId);
-  } catch {
-    // If model lookup fails, continue — heuristic will guide user
+  if (userId) {
+    try {
+      userModel = await getUserModelDefinition(userId);
+    } catch {
+      // If model lookup fails, continue — heuristic will guide user
+    }
   }
 
   if (!userModel) {
@@ -329,7 +355,6 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
       type: "info",
       message: "No financial model found. Please upload documents and build your company context to enable scenario modeling.",
     });
-    return { parameters: [], notices, clarification_needed: "Please upload your financial documents and build context first." };
   }
 
   const searchNeeded = needsExternalSearch(trimmed);
@@ -339,20 +364,20 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
   if (searchNeeded) {
     const perplexityKey = process.env.PERPLEXITY_API_KEY;
     if (!perplexityKey) {
-      console.warn("[Parser] Perplexity key missing — search skipped");
+      logger.warn("[Parser] Perplexity key missing — search skipped");
       notices.push({
         type: "warning",
         message: "Real-time news/macro search is unavailable — PERPLEXITY_API_KEY is not configured. The system will use its built-in knowledge instead.",
       });
     } else {
       try {
-        console.log("[Parser] External research needed — calling Perplexity...");
+        logger.info("[Parser] External research needed — calling Perplexity...");
         searchContext = await searchPerplexity(trimmed);
         if (searchContext) {
-          console.log(`[Parser] Perplexity returned ${searchContext.data_points.length} data points`);
+          logger.info(`[Parser] Perplexity returned ${searchContext.data_points.length} data points`);
         }
       } catch (e) {
-        console.warn("[Parser] Perplexity search failed:", (e as Error).message);
+        logger.warn({ detail: (e as Error).message }, "[Parser] Perplexity search failed:");
         notices.push({
           type: "warning",
           message: "Real-time search failed — proceeding with built-in knowledge.",
@@ -366,15 +391,15 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
   let llmAvailable = false;
   if (apiKey && trimmed.length >= 5) {
     try {
-      console.log("[Parser] Running reflection loop...");
-      reflectionResult = await reflect(trimmed, searchContext, effectiveUserId);
+      logger.info("[Parser] Running reflection loop...");
+      reflectionResult = await reflect(trimmed, searchContext, userId);
       if (reflectionResult) {
         llmAvailable = true;
-        console.log(`[Parser] Reflection complete (${reflectionResult.duration_ms}ms)`);
+        logger.info(`[Parser] Reflection complete (${reflectionResult.duration_ms}ms)`);
       }
     } catch (e) {
       const errMsg = (e as Error).message;
-      console.warn("[Parser] Reflection failed:", errMsg);
+      logger.warn({ detail: errMsg }, "[Parser] Reflection failed:");
       if (errMsg.includes("401") || errMsg.includes("invalid") || errMsg.includes("API key") || errMsg.includes("authentication")) {
         notices.push({
           type: "warning",
@@ -392,7 +417,7 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
   // Step 3: LLM parse (enriched with reflection + search context)
   if (apiKey && trimmed.length >= 5) {
     try {
-      const result = await llmParse(trimmed, effectiveUserId, searchContext, reflectionResult);
+      const result = await llmParse(trimmed, userId, searchContext, reflectionResult);
       llmAvailable = true;
 
       if (reflectionResult) {
@@ -412,7 +437,7 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
       }
     } catch (e) {
       const errMsg = (e as Error).message;
-      console.warn("[Parser] LLM parse failed, falling back to heuristic:", errMsg);
+      logger.warn({ detail: errMsg }, "[Parser] LLM parse failed, falling back to heuristic:");
       if ((errMsg.includes("401") || errMsg.includes("invalid") || errMsg.includes("API key") || errMsg.includes("authentication")) && !notices.some((n) => n.message.includes("Anthropic API key"))) {
         notices.push({
           type: "warning",
@@ -450,8 +475,8 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
       "1. Add specific numbers based on your model variables\n" +
       "2. Configure API keys for full AI + real-time search capabilities\n\n" +
       "**The rule-based parser works with explicit inputs like:**\n" +
-      `- "${userModel.variables[0]?.name || "Revenue"} increase 10%"\n` +
-      `- "${userModel.variables.find(v => v.tags?.includes("input"))?.name || "Costs"} decrease 5%"`;
+      `- "${userModel?.variables[0]?.name || "Revenue"} increase 10%"\n` +
+      `- "${userModel?.variables.find(v => v.tags?.includes("input"))?.name || "Costs"} decrease 5%"`;
   }
 
   if (notices.length > 0) heuristic.notices = notices;

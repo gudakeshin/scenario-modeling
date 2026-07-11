@@ -1,5 +1,135 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
 
+const ACCESS_KEY = "sm_access_token";
+const REFRESH_KEY = "sm_refresh_token";
+
+function storage(): Storage | null {
+  if (typeof window === "undefined") return null;
+  return window.localStorage;
+}
+
+export function getAccessToken(): string | null {
+  return storage()?.getItem(ACCESS_KEY) ?? null;
+}
+
+export function getRefreshToken(): string | null {
+  return storage()?.getItem(REFRESH_KEY) ?? null;
+}
+
+export function setTokens(accessToken: string, refreshToken: string): void {
+  const s = storage();
+  if (!s) return;
+  s.setItem(ACCESS_KEY, accessToken);
+  s.setItem(REFRESH_KEY, refreshToken);
+}
+
+export function clearTokens(): void {
+  const s = storage();
+  if (!s) return;
+  s.removeItem(ACCESS_KEY);
+  s.removeItem(REFRESH_KEY);
+}
+
+export function isAuthenticated(): boolean {
+  return !!getAccessToken();
+}
+
+let refreshInFlight: Promise<boolean> | null = null;
+
+async function tryRefresh(): Promise<boolean> {
+  const refresh = getRefreshToken();
+  if (!refresh) return false;
+  if (!refreshInFlight) {
+    refreshInFlight = (async () => {
+      try {
+        const res = await fetch(`${API_BASE}/api/v1/auth/refresh`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ refresh_token: refresh }),
+        });
+        if (!res.ok) {
+          clearTokens();
+          return false;
+        }
+        const data = await res.json();
+        setTokens(data.access_token, data.refresh_token);
+        return true;
+      } catch {
+        clearTokens();
+        return false;
+      } finally {
+        refreshInFlight = null;
+      }
+    })();
+  }
+  return refreshInFlight;
+}
+
+function redirectToLogin(): void {
+  if (typeof window === "undefined") return;
+  if (window.location.pathname === "/login") return;
+  const next = encodeURIComponent(window.location.pathname + window.location.search);
+  window.location.href = `/login?next=${next}`;
+}
+
+export class ApiTimeoutError extends Error {
+  constructor(ms: number) {
+    super(`Request timed out after ${ms / 1000}s`);
+    this.name = "ApiTimeoutError";
+  }
+}
+
+const DEFAULT_TIMEOUT_MS = 30_000;
+
+/** fetch with a timeout, distinguishing "server took too long" from other network errors. */
+async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: number): Promise<Response> {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  // Respect a caller-supplied signal too (e.g. component unmount cancellation).
+  if (init.signal) {
+    init.signal.addEventListener("abort", () => controller.abort(), { once: true });
+  }
+  try {
+    return await fetch(input, { ...init, signal: controller.signal });
+  } catch (e) {
+    if (controller.signal.aborted && !(init.signal?.aborted)) {
+      throw new ApiTimeoutError(timeoutMs);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+/** Authenticated fetch: Bearer token, timeout, 401 → refresh → retry → login redirect. */
+export async function apiFetch(input: string, init: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Response> {
+  const headers = new Headers(init.headers || {});
+  const token = getAccessToken();
+  if (token) headers.set("Authorization", `Bearer ${token}`);
+  if (init.body && !headers.has("Content-Type") && !(init.body instanceof FormData)) {
+    headers.set("Content-Type", "application/json");
+  }
+
+  let res = await fetchWithTimeout(input, { ...init, headers }, timeoutMs);
+  if (res.status === 401 && !input.includes("/api/v1/auth/")) {
+    const ok = await tryRefresh();
+    if (ok) {
+      const retryHeaders = new Headers(init.headers || {});
+      const access = getAccessToken();
+      if (access) retryHeaders.set("Authorization", `Bearer ${access}`);
+      if (init.body && !retryHeaders.has("Content-Type") && !(init.body instanceof FormData)) {
+        retryHeaders.set("Content-Type", "application/json");
+      }
+      res = await fetchWithTimeout(input, { ...init, headers: retryHeaders }, timeoutMs);
+    }
+    if (res.status === 401) {
+      clearTokens();
+      redirectToLogin();
+    }
+  }
+  return res;
+}
+
 export interface ParsedParameter {
   name: string;
   variable_type: string;
@@ -81,7 +211,7 @@ export interface ComparisonResult {
 // ── Scenarios ──
 
 export async function parseScenario(nlInput: string): Promise<ParseScenarioResponse> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ nl_input: nlInput }),
@@ -97,7 +227,7 @@ export async function refineScenario(
   scenarioId: string,
   answers: { question_id: string; answer: string }[]
 ): Promise<ParseScenarioResponse> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/refine`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/refine`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ answers }),
@@ -110,7 +240,7 @@ export async function refineScenario(
 }
 
 export async function getParameters(scenarioId: string): Promise<StoredParameter[]> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/parameters`);
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/parameters`);
   if (!res.ok) throw new Error("Failed to get parameters");
   const data = await res.json();
   return data.parameters;
@@ -121,7 +251,7 @@ export async function updateParameter(
   paramId: string,
   updates: { scenario_value?: number; status?: string }
 ): Promise<StoredParameter> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/parameters/${paramId}`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/parameters/${paramId}`, {
     method: "PUT",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(updates),
@@ -131,7 +261,7 @@ export async function updateParameter(
 }
 
 export async function approveScenario(scenarioId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/approve`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/approve`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -157,13 +287,13 @@ export interface SimulationResult {
 }
 
 export async function getBaseCase(): Promise<{ pl: Record<string, number>; all_variables: Record<string, number> }> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/base-case`);
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/base-case`);
   if (!res.ok) throw new Error("Failed to get base case");
   return res.json();
 }
 
 export async function runScenario(scenarioId: string): Promise<SimulationResult> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/run`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/run`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -175,7 +305,7 @@ export async function runScenario(scenarioId: string): Promise<SimulationResult>
 }
 
 export async function generateNarrative(scenarioId: string, audience: "board" | "internal" = "internal"): Promise<string> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/narrative`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/narrative`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ audience }),
@@ -189,7 +319,7 @@ export async function generateNarrative(scenarioId: string, audience: "board" | 
 }
 
 export async function compareScenarios(scenarioIds: string[]): Promise<ComparisonResult> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/compare`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/compare`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ scenario_ids: scenarioIds }),
@@ -202,7 +332,7 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
 }
 
 export async function listScenarios(): Promise<{ scenario_id: string; name: string | null; nl_input: string; status: string; created_at: string }[]> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios`);
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios`);
   if (!res.ok) throw new Error("Failed to list scenarios");
   const data = await res.json();
   return data.scenarios;
@@ -238,38 +368,82 @@ export async function getAuditTrail(params: {
   if (params.scenario_id) qs.set("scenario_id", params.scenario_id);
   if (params.limit) qs.set("limit", String(params.limit));
   if (params.offset) qs.set("offset", String(params.offset));
-  const res = await fetch(`${API_BASE}/api/v1/audit?${qs.toString()}`);
+  const res = await apiFetch(`${API_BASE}/api/v1/audit?${qs.toString()}`);
   if (!res.ok) throw new Error("Failed to get audit trail");
   return res.json();
 }
 
-// ── User Context ──
+// ── Auth ──
 
-/** Cached user identity for authenticated API calls. Falls back to /me endpoint. */
-let _cachedUserId: string | null = null;
+export interface AuthUser {
+  user_id: string;
+  email: string;
+  name: string | null;
+  role: string;
+}
 
-async function getUserId(): Promise<string> {
-  if (_cachedUserId) return _cachedUserId;
+export interface AuthResponse {
+  user: AuthUser;
+  access_token: string;
+  refresh_token: string;
+  expires_in: number;
+}
+
+export async function login(email: string, password: string): Promise<AuthResponse> {
+  const res = await fetch(`${API_BASE}/api/v1/auth/login`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Login failed");
+  }
+  const data = await res.json();
+  setTokens(data.access_token, data.refresh_token);
+  return data;
+}
+
+export async function register(email: string, password: string, name?: string): Promise<AuthResponse> {
+  const res = await fetch(`${API_BASE}/api/v1/auth/register`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ email, password, name }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Registration failed");
+  }
+  const data = await res.json();
+  if (data.access_token) setTokens(data.access_token, data.refresh_token);
+  return data;
+}
+
+export async function logout(): Promise<void> {
+  const refresh = getRefreshToken();
   try {
-    const user = await getCurrentUser();
-    _cachedUserId = user.email; // Use email as the portable identifier
-    return _cachedUserId;
-  } catch {
-    return ""; // Let the backend use its own default
+    if (refresh) {
+      await fetch(`${API_BASE}/api/v1/auth/logout`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ refresh_token: refresh }),
+      });
+    }
+  } finally {
+    clearTokens();
   }
 }
 
-function authHeaders(extra?: Record<string, string>): Record<string, string> {
-  // Use cached value synchronously; the initial call populates it
-  const headers: Record<string, string> = {};
-  if (_cachedUserId) headers["x-user-id"] = _cachedUserId;
-  if (extra) Object.assign(headers, extra);
-  return headers;
+/** @deprecated use isAuthenticated — kept for ChatWindow boot */
+export async function initUserContext(): Promise<void> {
+  if (!getAccessToken()) redirectToLogin();
 }
 
-/** Initialize user context — call once at app boot */
-export async function initUserContext(): Promise<void> {
-  await getUserId();
+function authHeaders(extra?: Record<string, string>): Record<string, string> {
+  const headers: Record<string, string> = { ...(extra || {}) };
+  const token = getAccessToken();
+  if (token) headers["Authorization"] = `Bearer ${token}`;
+  return headers;
 }
 
 // ── Users ──
@@ -283,38 +457,37 @@ export interface UserProfile {
 }
 
 export async function getCurrentUser(): Promise<UserProfile> {
-  const res = await fetch(`${API_BASE}/api/v1/users/me`);
+  const res = await apiFetch(`${API_BASE}/api/v1/users/me`);
   if (!res.ok) throw new Error("Failed to get user profile");
   return res.json();
 }
 
+export interface RoleDescriptor {
+  id: string;
+  label: string;
+  description: string;
+}
+
+export async function getRoles(): Promise<RoleDescriptor[]> {
+  const res = await apiFetch(`${API_BASE}/api/v1/users/roles`);
+  if (!res.ok) throw new Error("Failed to get roles");
+  const data = await res.json();
+  return data.roles ?? [];
+}
+
 export async function listUsers(): Promise<UserProfile[]> {
-  const userId = await getUserId();
-  const res = await fetch(`${API_BASE}/api/v1/users`, {
-    headers: { "x-user-id": userId },
-  });
+  const res = await apiFetch(`${API_BASE}/api/v1/users`);
   if (!res.ok) throw new Error("Failed to list users");
   return res.json();
 }
 
 export async function updateUserRole(userId: string, role: string): Promise<UserProfile> {
-  const currentUser = await getUserId();
-  const res = await fetch(`${API_BASE}/api/v1/users/${userId}/role`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/users/${userId}/role`, {
     method: "PUT",
-    headers: { "Content-Type": "application/json", "x-user-id": currentUser },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ role }),
   });
   if (!res.ok) throw new Error("Failed to update role");
-  return res.json();
-}
-
-export async function switchMyRole(role: string): Promise<UserProfile> {
-  const res = await fetch(`${API_BASE}/api/v1/users/me/role`, {
-    method: "PUT",
-    headers: authHeaders({ "Content-Type": "application/json" }),
-    body: JSON.stringify({ role }),
-  });
-  if (!res.ok) throw new Error("Failed to switch role");
   return res.json();
 }
 
@@ -330,10 +503,9 @@ export interface SharingRecord {
 }
 
 export async function shareScenario(scenarioId: string, sharedWith: string, permission: "view" | "edit" = "view"): Promise<SharingRecord> {
-  const currentUser = await getUserId();
-  const res = await fetch(`${API_BASE}/api/v1/users/share`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/users/share`, {
     method: "POST",
-    headers: { "Content-Type": "application/json", "x-user-id": currentUser },
+    headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ scenario_id: scenarioId, shared_with: sharedWith, permission }),
   });
   if (!res.ok) throw new Error("Failed to share scenario");
@@ -341,19 +513,14 @@ export async function shareScenario(scenarioId: string, sharedWith: string, perm
 }
 
 export async function getShares(scenarioId: string): Promise<SharingRecord[]> {
-  const currentUser = await getUserId();
-  const res = await fetch(`${API_BASE}/api/v1/users/shares/${scenarioId}`, {
-    headers: { "x-user-id": currentUser },
-  });
+  const res = await apiFetch(`${API_BASE}/api/v1/users/shares/${scenarioId}`);
   if (!res.ok) throw new Error("Failed to list shares");
   return res.json();
 }
 
 export async function revokeShare(sharingId: string): Promise<void> {
-  const currentUser = await getUserId();
-  const res = await fetch(`${API_BASE}/api/v1/users/share/${sharingId}`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/users/share/${sharingId}`, {
     method: "DELETE",
-    headers: { "x-user-id": currentUser },
   });
   if (!res.ok) throw new Error("Failed to revoke share");
 }
@@ -366,10 +533,10 @@ export function getPptxExportUrl(scenarioId: string): string {
 
 /**
  * Download a file via fetch (sends auth headers), then trigger browser download.
- * Works for Excel, CSV, and PPTX exports that require x-user-id header.
+ * Works for Excel, CSV, and PPTX exports that require Bearer header.
  */
 export async function downloadWithAuth(url: string, filename: string): Promise<void> {
-  const res = await fetch(url, { headers: authHeaders() });
+  const res = await apiFetch(url, { headers: authHeaders() });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
     throw new Error((err as { error?: string }).error || `Download failed: ${res.status}`);
@@ -388,31 +555,61 @@ export async function downloadWithAuth(url: string, filename: string): Promise<v
 // ── Monte Carlo ──
 
 export interface PercentileResult {
+  p5: number;
   p10: number;
+  p25: number;
   p50: number;
+  p75: number;
   p90: number;
+  p95: number;
   mean: number;
   stddev: number;
   min: number;
   max: number;
+  var_5: number;
+  cvar_5: number;
+  prob_negative: number;
+  mean_ci_95: [number, number];
+}
+
+export interface FanChartBand {
+  p5: number;
+  p10: number;
+  p25: number;
+  p50: number;
+  p75: number;
+  p90: number;
+  p95: number;
 }
 
 export interface MonteCarloResult {
   iterations: number;
+  requested_iterations: number;
+  seed: number;
   metrics: Record<string, PercentileResult>;
   distributions: Record<string, number[]>;
-  fan_chart: Record<string, { p10: number; p25: number; p50: number; p75: number; p90: number }>;
+  fan_chart: Record<string, FanChartBand>;
+  correlations_applied: boolean;
+  notices?: string[];
+}
+
+export interface CorrelationSpec {
+  a: string;
+  b: string;
+  rho: number;
 }
 
 export async function runMonteCarlo(
   scenarioId: string,
-  iterations = 1000,
-  distributions: { variable_id: string; type: string; base_value: number; stddev?: number; min?: number; max?: number }[] = []
+  iterations = 5000,
+  distributions: { variable_id: string; type: string; base_value: number; stddev?: number; min?: number; max?: number; delta_type?: "percent" | "absolute" }[] = [],
+  correlations: CorrelationSpec[] = [],
+  seed?: number
 ): Promise<MonteCarloResult> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/monte-carlo`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/monte-carlo`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ iterations, distributions }),
+    body: JSON.stringify({ iterations, distributions, correlations, seed }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -432,13 +629,16 @@ export interface TornadoBar {
   low_delta: number;
   high_delta: number;
   spread: number;
+  absolute_step?: boolean;
 }
 
 export interface SensitivityResult {
   target_metric: string;
   swing_pct: number;
   base_metric_value: number;
+  scenario_applied?: boolean;
   bars: TornadoBar[];
+  notices?: string[];
 }
 
 export async function runSensitivity(
@@ -446,7 +646,7 @@ export async function runSensitivity(
   targetMetric = "net_income",
   swingPct = 20
 ): Promise<SensitivityResult> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/sensitivity`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/sensitivity`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ target_metric: targetMetric, swing_pct: swingPct }),
@@ -473,7 +673,7 @@ export interface Template {
 
 export async function listTemplates(scope?: string): Promise<Template[]> {
   const qs = scope ? `?scope=${scope}` : "";
-  const res = await fetch(`${API_BASE}/api/v1/templates${qs}`);
+  const res = await apiFetch(`${API_BASE}/api/v1/templates${qs}`);
   if (!res.ok) throw new Error("Failed to list templates");
   const data = await res.json();
   return data.templates;
@@ -485,7 +685,7 @@ export async function saveAsTemplate(
   description?: string,
   isShared = false
 ): Promise<Template> {
-  const res = await fetch(`${API_BASE}/api/v1/templates/from-scenario/${scenarioId}`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/templates/from-scenario/${scenarioId}`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ name, description, is_shared: isShared }),
@@ -498,7 +698,7 @@ export async function saveAsTemplate(
 }
 
 export async function cloneTemplate(templateId: string, nlInput?: string): Promise<{ scenario_id: string }> {
-  const res = await fetch(`${API_BASE}/api/v1/templates/${templateId}/clone`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/templates/${templateId}/clone`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ nl_input: nlInput }),
@@ -541,6 +741,8 @@ export interface QAReport {
   improvement_guidance: string;
   summary: string;
   iterations: number;
+  /** "not_assessed" when QA could not run (no API key / LLM failure) */
+  status?: "assessed" | "not_assessed";
 }
 
 export interface ReflectionStep {
@@ -564,7 +766,7 @@ export interface BusinessInsight {
 }
 
 export async function generateBusinessAnalysis(scenarioId: string): Promise<BusinessInsight> {
-  const res = await fetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/business-analysis`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/business-analysis`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
   });
@@ -582,6 +784,10 @@ export interface DocumentRecord {
   name: string;
   original_filename: string;
   file_type: string;
+  document_kind?: "spreadsheet_model" | "document_text";
+  validation_status?: "processing" | "needs_validation" | "ready";
+  workbook_graph?: Record<string, unknown> | null;
+  model_schema?: Record<string, unknown> | null;
   file_size_bytes: number;
   chunk_count: number;
   status: string;
@@ -604,7 +810,7 @@ export interface RAGResponse {
 export async function uploadDocument(file: File): Promise<DocumentRecord> {
   const formData = new FormData();
   formData.append("file", file);
-  const res = await fetch(`${API_BASE}/api/v1/documents/upload`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/documents/upload`, {
     method: "POST",
     headers: authHeaders(),
     body: formData,
@@ -617,14 +823,14 @@ export async function uploadDocument(file: File): Promise<DocumentRecord> {
 }
 
 export async function listDocuments(): Promise<DocumentRecord[]> {
-  const res = await fetch(`${API_BASE}/api/v1/documents`);
+  const res = await apiFetch(`${API_BASE}/api/v1/documents`);
   if (!res.ok) throw new Error("Failed to list documents");
   const data = await res.json();
   return data.documents;
 }
 
 export async function queryDocument(documentId: string, question: string): Promise<RAGResponse> {
-  const res = await fetch(`${API_BASE}/api/v1/documents/${documentId}/query`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/documents/${documentId}/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ question }),
@@ -637,7 +843,7 @@ export async function queryDocument(documentId: string, question: string): Promi
 }
 
 export async function queryAllDocuments(question: string): Promise<RAGResponse> {
-  const res = await fetch(`${API_BASE}/api/v1/documents/query`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/documents/query`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ question }),
@@ -650,16 +856,28 @@ export async function queryAllDocuments(question: string): Promise<RAGResponse> 
 }
 
 export async function deleteDocument(documentId: string): Promise<void> {
-  const res = await fetch(`${API_BASE}/api/v1/documents/${documentId}`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/documents/${documentId}`, {
     method: "DELETE",
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to delete document");
 }
 
-export async function checkQdrantHealth(): Promise<{ qdrant: string; url: string }> {
-  const res = await fetch(`${API_BASE}/api/v1/documents/health/qdrant`);
-  if (!res.ok) throw new Error("Qdrant health check failed");
+export async function checkParserHealth(): Promise<{
+  parser: string;
+  configured: boolean;
+  status: string;
+  fallback: string;
+}> {
+  const res = await apiFetch(`${API_BASE}/api/v1/documents/health/parser`);
+  if (!res.ok) throw new Error("Parser health check failed");
+  return res.json();
+}
+
+/** @deprecated use checkParserHealth */
+export async function checkQdrantHealth(): Promise<{ qdrant: string; parser?: string; configured?: boolean }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/documents/health/qdrant`);
+  if (!res.ok) throw new Error("Parser health check failed");
   return res.json();
 }
 
@@ -678,14 +896,34 @@ export interface CompanyContextData {
     description: string;
     typical_value?: number;
     unit: string;
+    metric_type?: "currency" | "count" | "percent" | "ratio" | "volume" | "unknown";
+    source_header?: string;
+    source_column?: string;
+    source_section?: string;
     category: string;
     is_input: boolean;
     formula?: string;
     dependencies?: string[];
   }[];
+  header_mapping_suggestions?: {
+    header_pattern: string;
+    inferred_metric_type: "currency" | "count" | "percent" | "ratio" | "volume" | "unknown";
+    expected_unit: string;
+    mapping_guidance: string;
+    sample_variable_ids: string[];
+  }[];
   competitive_landscape: string;
   key_risks: string[];
   benchmarks: Record<string, string>;
+  model_schema?: {
+    company?: string;
+    industry?: string;
+    scenarioLevers?: { id: string; label: string; type?: string }[];
+    outputMetrics?: { id: string; label: string; isKPI?: boolean }[];
+    timeDimension?: { granularity?: string; periods?: number; columns?: string[] };
+  };
+  workbook_graph?: Record<string, unknown>;
+  validation_status?: "processing" | "needs_validation" | "ready";
 }
 
 export interface CompanyContext {
@@ -723,13 +961,13 @@ export interface OnboardingStatus {
 }
 
 export async function getOnboardingStatus(): Promise<OnboardingStatus> {
-  const res = await fetch(`${API_BASE}/api/v1/context/status`, { headers: authHeaders() });
+  const res = await apiFetch(`${API_BASE}/api/v1/context/status`, { headers: authHeaders() });
   if (!res.ok) throw new Error("Failed to check status");
   return res.json();
 }
 
 export async function buildContext(): Promise<CompanyContext> {
-  const res = await fetch(`${API_BASE}/api/v1/context/build`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/context/build`, {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
   });
@@ -740,14 +978,18 @@ export async function buildContext(): Promise<CompanyContext> {
   return res.json();
 }
 
-export async function getCompanyContext(): Promise<{ context: CompanyContext | null; message?: string }> {
-  const res = await fetch(`${API_BASE}/api/v1/context`, { headers: authHeaders() });
+export async function getCompanyContext(): Promise<{
+  context: CompanyContext | null;
+  message?: string;
+  model_intelligence?: { document_id: string; validation_status: "processing" | "needs_validation" | "ready" } | null;
+}> {
+  const res = await apiFetch(`${API_BASE}/api/v1/context`, { headers: authHeaders() });
   if (!res.ok) throw new Error("Failed to get context");
   return res.json();
 }
 
 export async function updateCompanyContext(updates: Partial<CompanyContextData>): Promise<CompanyContext> {
-  const res = await fetch(`${API_BASE}/api/v1/context`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/context`, {
     method: "PUT",
     headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify(updates),
@@ -757,20 +999,20 @@ export async function updateCompanyContext(updates: Partial<CompanyContextData>)
 }
 
 export async function deleteCompanyContext(): Promise<void> {
-  await fetch(`${API_BASE}/api/v1/context`, {
+  await apiFetch(`${API_BASE}/api/v1/context`, {
     method: "DELETE",
     headers: authHeaders(),
   });
 }
 
 export async function getActiveModel(): Promise<{ model: UserModel | null; message?: string }> {
-  const res = await fetch(`${API_BASE}/api/v1/context/model`, { headers: authHeaders() });
+  const res = await apiFetch(`${API_BASE}/api/v1/context/model`, { headers: authHeaders() });
   if (!res.ok) throw new Error("Failed to get model");
   return res.json();
 }
 
 export async function updateActiveModel(modelDefinition: UserModel["model_definition"]): Promise<{ model: UserModel }> {
-  const res = await fetch(`${API_BASE}/api/v1/context/model`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/context/model`, {
     method: "PUT",
     headers: authHeaders({ "Content-Type": "application/json" }),
     body: JSON.stringify({ model_definition: modelDefinition }),
@@ -779,10 +1021,23 @@ export async function updateActiveModel(modelDefinition: UserModel["model_defini
   return res.json();
 }
 
+export async function validateModelSchema(documentId?: string): Promise<{ validated: boolean; document_id: string; validation_status: "ready" }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/context/model/validate`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(documentId ? { document_id: documentId } : {}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Validation failed");
+  }
+  return res.json();
+}
+
 // ── Sessions (Conversational Follow-up) ──
 
 export async function createSession(scenarioId: string): Promise<{ session_id: string; scenario_id: string }> {
-  const res = await fetch(`${API_BASE}/api/v1/sessions`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/sessions`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ scenario_id: scenarioId }),
@@ -799,7 +1054,7 @@ export async function addFollowUp(
   cumulative_count: number;
   clarification_needed?: string;
 }> {
-  const res = await fetch(`${API_BASE}/api/v1/sessions/${sessionId}/follow-up`, {
+  const res = await apiFetch(`${API_BASE}/api/v1/sessions/${sessionId}/follow-up`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ nl_input: nlInput }),

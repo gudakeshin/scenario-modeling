@@ -12,6 +12,7 @@ import {
   type RAGSource,
 } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
+import { MarkdownContent } from "./MarkdownContent";
 
 interface DocumentPanelProps {
   onClose: () => void;
@@ -29,6 +30,7 @@ interface ChatMessage {
 export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -58,40 +60,69 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
     }
   };
 
-  const handleUpload = async (file: File) => {
+  const handleUpload = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+
     setUploading(true);
     setUploadError(null);
-    try {
-      const doc = await uploadDocument(file);
-      setDocuments((prev) => [doc, ...prev]);
-      setSelectedDocId(doc.document_id);
+    setUploadProgress(null);
+
+    const failures: string[] = [];
+    let lastDoc: DocumentRecord | null = null;
+
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      setUploadProgress(`Uploading ${i + 1} of ${list.length}: ${file.name}`);
+      try {
+        const doc = await uploadDocument(file);
+        lastDoc = doc;
+        setDocuments((prev) => [doc, ...prev.filter((d) => d.document_id !== doc.document_id)]);
+      } catch (e) {
+        failures.push(`${file.name}: ${(e as Error).message}`);
+      }
+    }
+
+    if (lastDoc) {
+      setSelectedDocId(lastDoc.document_id);
+      const okCount = list.length - failures.length;
       setChatMessages((prev) => [
         ...prev,
         {
           id: `sys-${Date.now()}`,
           role: "assistant",
-          content: `Document **"${doc.name}"** uploaded and processed successfully! It has been split into ${doc.chunk_count} chunks and vectorized. You can now ask questions about it.`,
+          content:
+            okCount === 1
+              ? `Document **"${lastDoc.name}"** uploaded and processed successfully! It has been split into ${lastDoc.chunk_count} chunks and vectorized. You can now ask questions about it.`
+              : `Uploaded **${okCount}** documents successfully. You can now ask questions about them.`,
           timestamp: new Date(),
         },
       ]);
-    } catch (e) {
-      setUploadError((e as Error).message);
     }
+
+    setUploadProgress(null);
     setUploading(false);
+    if (failures.length > 0) {
+      setUploadError(
+        failures.length === list.length
+          ? failures.join("\n")
+          : `${failures.length} of ${list.length} failed:\n${failures.join("\n")}`
+      );
+    }
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) handleUpload(file);
+    if (e.target.files?.length) void handleUpload(e.target.files);
     if (e.target) e.target.value = "";
   };
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (file) handleUpload(file);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (e.dataTransfer.files.length > 0) {
+      void handleUpload(e.dataTransfer.files);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleDelete = async (docId: string) => {
@@ -182,7 +213,8 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
         <input
           ref={fileInputRef}
           type="file"
-          accept=".pdf,.txt,.md,.csv"
+          multiple
+          accept=".pdf,.txt,.md,.csv,.docx,.xlsx"
           onChange={handleFileSelect}
           className="hidden"
         />
@@ -192,7 +224,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
-            Processing document...
+            {uploadProgress || "Processing documents..."}
           </div>
         ) : (
           <div>
@@ -200,14 +232,14 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
               <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
             </svg>
             <p className="text-sm text-[var(--text-secondary)]">
-              Drop a file here or <span className="text-accent font-medium">browse</span>
+              Drop files here or <span className="text-accent font-medium">browse</span>
             </p>
-            <p className="text-xs text-[var(--text-faint)] mt-1">Supports PDF, TXT, MD, CSV (max 20MB)</p>
+            <p className="text-xs text-[var(--text-faint)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX — max 20MB each · multiple files supported</p>
           </div>
         )}
       </div>
       {uploadError && (
-        <div className="mb-3 p-2 rounded-lg bg-[var(--danger-bg)] text-[var(--danger)] text-xs">
+        <div className="mb-3 p-2 rounded-lg bg-[var(--danger-bg)] text-[var(--danger)] text-xs whitespace-pre-line">
           {uploadError}
         </div>
       )}
@@ -304,7 +336,11 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
                     : "bg-[var(--panel-bg)] border border-[var(--border)] text-[var(--text-primary)]"
                 }`}
               >
-                <div className="whitespace-pre-wrap">{msg.content}</div>
+                {msg.role === "user" ? (
+                  <div className="whitespace-pre-wrap">{msg.content}</div>
+                ) : (
+                  <MarkdownContent content={msg.content} />
+                )}
                 {msg.sources && msg.sources.length > 0 && (
                   <div className="mt-2 pt-2 border-t border-[var(--border)]/30">
                     <button

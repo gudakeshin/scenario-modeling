@@ -1,0 +1,38 @@
+export const strings = {
+  app: {
+    name: "Scenario Modeling",
+    skipToContent: "Skip to main content",
+  },
+  sidebar: {
+    newChat: "New scenario",
+    search: "Search scenarios…",
+    searchLabel: "Search conversations",
+    rename: "Rename",
+    delete: "Delete",
+    deleteConfirm: "Delete this conversation? This cannot be undone.",
+    collapse: "Collapse sidebar",
+    expand: "Expand sidebar",
+    openMenu: "Open sidebar",
+    closeMenu: "Close sidebar",
+    empty: "No scenarios yet.",
+    emptyHint: "Start by describing a scenario above.",
+    noResults: "No matching scenarios.",
+    untitled: "Untitled",
+    brand: "Deloitte",
+    footer: "Scenario Modeling Platform",
+  },
+  chat: {
+    placeholder: "Describe your scenario in plain English…",
+    placeholderFollowUp: "Type a follow-up adjustment (e.g. \"also increase marketing 10%\")…",
+    placeholderOnboarding: "Upload documents and build context first, then describe scenarios here…",
+    send: "Send",
+    thinking: "Thinking…",
+  },
+  qa: {
+    notAssessed: "QA not assessed",
+    passed: "QA passed",
+    failed: "QA did not pass",
+    error: "Quality Assurance: Error",
+    label: "Quality Assurance",
+  },
+} as const;

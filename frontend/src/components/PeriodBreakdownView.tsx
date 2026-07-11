@@ -1,9 +1,11 @@
 "use client";
 
-import { useState } from "react";
+import { useState, useMemo } from "react";
+import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from "recharts";
 import type { PeriodResult } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
-import { METRIC_LABELS, fmtCurrency } from "@/lib/metrics";
+import { METRIC_LABELS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface PeriodBreakdownViewProps {
   periods: PeriodResult[];
@@ -23,13 +25,25 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
   const [viewMode, setViewMode] = useState<ViewMode>("chart");
   const [selectedMetric, setSelectedMetric] = useState("net_income");
 
+  const metricKeys = periods && periods.length > 0 ? Object.keys(periods[0].pl) : [];
+
+  const chartData = useMemo(
+    () => (periods ?? []).map((p) => ({ period: p.period, value: p.pl[selectedMetric] || 0 })),
+    [periods, selectedMetric],
+  );
+
+  const trendData = useMemo(
+    () =>
+      (periods ?? []).map((p, i) => {
+        const val = p.pl[selectedMetric] || 0;
+        const prev = i > 0 ? (periods[i - 1].pl[selectedMetric] || 0) : val;
+        const changePct = i > 0 && prev !== 0 ? ((val - prev) / Math.abs(prev)) * 100 : null;
+        return { period: p.period.replace(/^\d{4}-/, ""), value: val, changePct };
+      }),
+    [periods, selectedMetric],
+  );
+
   if (!periods || periods.length === 0) return null;
-
-  const metricKeys = Object.keys(periods[0].pl);
-
-  // Get the max value for chart scaling
-  const selectedValues = periods.map((p) => p.pl[selectedMetric] || 0);
-  const maxVal = Math.max(...selectedValues.map(Math.abs), 1);
 
   return (
     <div className="border border-[var(--panel-border)] rounded-2xl bg-[var(--card-bg)] p-4 mx-4 mb-3 overflow-auto max-h-[60vh] shadow-panel">
@@ -85,31 +99,41 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
 
       {viewMode === "chart" ? (
         /* Bar chart view */
-        <div className="space-y-1.5">
+        <div>
           <p className="text-[10px] text-[var(--text-faint)] uppercase tracking-wider font-medium mb-2">
             {METRIC_LABELS[selectedMetric] || selectedMetric} by period
           </p>
-          {periods.map((p) => {
-            const val = p.pl[selectedMetric] || 0;
-            const width = Math.max(Math.abs(val) / maxVal * 100, 2);
-            const isNeg = val < 0;
-            return (
-              <div key={p.period} className="flex items-center gap-2 group">
-                <span className="text-[10px] text-[var(--text-faint)] w-14 text-right shrink-0 font-mono">{p.period}</span>
-                <div className="flex-1 h-6 bg-[var(--panel-bg)] rounded-md overflow-hidden relative">
-                  <div
-                    className={`h-full rounded-md transition-all group-hover:opacity-90 ${
-                      isNeg ? "bg-[var(--danger)]/40" : "bg-accent/40"
-                    }`}
-                    style={{ width: `${width}%` }}
-                  />
-                  <span className="absolute inset-y-0 flex items-center px-2 text-[10px] font-medium text-[var(--text-primary)]">
-                    {fmt(val)}
-                  </span>
-                </div>
-              </div>
-            );
-          })}
+          <div style={{ height: Math.max(periods.length * 32 + 20, 100) }}>
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={chartData} layout="vertical" margin={{ left: 8, right: 16 }}>
+                <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" horizontal={false} />
+                <XAxis
+                  type="number"
+                  tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
+                  tick={{ fontSize: 10, fill: "var(--text-faint)" }}
+                  axisLine={{ stroke: "var(--border)" }}
+                  tickLine={false}
+                />
+                <YAxis
+                  type="category"
+                  dataKey="period"
+                  width={64}
+                  tick={{ fontSize: 10, fill: "var(--text-faint)", fontFamily: "var(--font-geist-mono)" }}
+                  axisLine={false}
+                  tickLine={false}
+                />
+                <Tooltip
+                  formatter={(v) => fmt(Number(v))}
+                  contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--card-border)", borderRadius: 8, fontSize: 12 }}
+                />
+                <Bar dataKey="value" radius={[0, 3, 3, 0]}>
+                  {chartData.map((d, i) => (
+                    <Cell key={i} fill={d.value < 0 ? "var(--danger)" : "var(--accent)"} fillOpacity={0.6} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
+          </div>
         </div>
       ) : (
         /* Table view */
@@ -158,25 +182,31 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
           <p className="text-[10px] text-[var(--text-faint)] uppercase tracking-wider font-medium mb-1.5">
             {METRIC_LABELS[selectedMetric] || selectedMetric} trend
           </p>
-          <div className="flex items-end gap-1 h-16">
-            {periods.map((p, i) => {
-              const val = p.pl[selectedMetric] || 0;
-              const prev = i > 0 ? (periods[i - 1].pl[selectedMetric] || 0) : val;
-              const change = i > 0 && prev !== 0 ? ((val - prev) / Math.abs(prev)) * 100 : 0;
-              const barH = Math.max((Math.abs(val) / maxVal) * 100, 8);
-              return (
-                <div key={p.period} className="flex-1 flex flex-col items-center gap-0.5">
-                  <span className={`text-[8px] font-medium ${change >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
-                    {i > 0 ? `${change >= 0 ? "+" : ""}${change.toFixed(1)}%` : ""}
-                  </span>
-                  <div
-                    className={`w-full rounded-t-md transition-all ${val >= 0 ? "bg-accent/50" : "bg-[var(--danger)]/40"}`}
-                    style={{ height: `${barH}%` }}
-                  />
-                  <span className="text-[8px] text-[var(--text-faint)]">{p.period.replace(/^\d{4}-/, "")}</span>
-                </div>
-              );
-            })}
+          <div className="h-24">
+            <ResponsiveContainer width="100%" height="100%">
+              <BarChart data={trendData} barCategoryGap="20%">
+                <XAxis
+                  dataKey="period"
+                  tick={{ fontSize: 9, fill: "var(--text-faint)" }}
+                  axisLine={{ stroke: "var(--border)" }}
+                  tickLine={false}
+                />
+                <YAxis hide />
+                <Tooltip
+                  formatter={(v, _name, item) => {
+                    const changePct = (item?.payload as { changePct: number | null } | undefined)?.changePct;
+                    const val = Number(v);
+                    return [`${fmt(val)}${changePct != null ? ` (${changePct >= 0 ? "+" : ""}${changePct.toFixed(1)}%)` : ""}`, METRIC_LABELS[selectedMetric] || selectedMetric];
+                  }}
+                  contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--card-border)", borderRadius: 8, fontSize: 12 }}
+                />
+                <Bar dataKey="value" radius={[3, 3, 0, 0]}>
+                  {trendData.map((d, i) => (
+                    <Cell key={i} fill={d.value < 0 ? "var(--danger)" : "var(--accent)"} fillOpacity={0.55} />
+                  ))}
+                </Bar>
+              </BarChart>
+            </ResponsiveContainer>
           </div>
         </div>
       )}

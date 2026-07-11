@@ -1,9 +1,22 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useMemo } from "react";
+import {
+  BarChart,
+  Bar,
+  XAxis,
+  YAxis,
+  CartesianGrid,
+  Tooltip,
+  ResponsiveContainer,
+  ReferenceLine,
+  Cell,
+} from "recharts";
 import { PanelHeader } from "./PanelHeader";
+import { ChartDataTable } from "./ChartDataTable";
 import { runMonteCarlo, type MonteCarloResult, type PercentileResult } from "@/lib/api";
-import { METRIC_LABELS, fmtCurrency } from "@/lib/metrics";
+import { METRIC_LABELS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface MonteCarloViewProps {
   scenarioId: string;
@@ -15,70 +28,193 @@ function fmt(n: number) {
   return n < 0 ? `-${fmtCurrency(n)}` : fmtCurrency(n);
 }
 
-function DistributionBar({ metric, data }: { metric: string; data: PercentileResult }) {
-  const range = data.max - data.min || 1;
-  const p10Pct = ((data.p10 - data.min) / range) * 100;
-  const p90Pct = ((data.p90 - data.min) / range) * 100;
-  const p50Pct = ((data.p50 - data.min) / range) * 100;
+// ── Fan band: horizontal floating-bar chart, one row per metric ──
+// P5-P95 (light) and P25-P75 (dark) bands around the P50 marker. There is
+// no time dimension in the backend result (periods repeat the same
+// evaluation — see simulationService's documented "no compounding"
+// design), so this shows the distribution's spread rather than a fake
+// time-series fan.
+
+interface FanRow {
+  metric: string;
+  label: string;
+  p5: number;
+  p25: number;
+  p50: number;
+  p75: number;
+  p95: number;
+  outerBase: number;
+  outerSpan: number;
+  innerBase: number;
+  innerSpan: number;
+}
+
+function FanBandTooltip({ active, payload }: { active?: boolean; payload?: Array<{ payload: FanRow }> }) {
+  if (!active || !payload?.length) return null;
+  const d = payload[0].payload;
+  return (
+    <div className="bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg shadow-panel px-3 py-2">
+      <p className="text-xs font-semibold text-[var(--text-primary)] mb-1">{d.label}</p>
+      <p className="text-[11px] text-[var(--text-secondary)]">P5: {fmt(d.p5)}</p>
+      <p className="text-[11px] text-[var(--text-secondary)]">P25: {fmt(d.p25)}</p>
+      <p className="text-[11px] font-semibold text-[var(--text-primary)]">P50: {fmt(d.p50)}</p>
+      <p className="text-[11px] text-[var(--text-secondary)]">P75: {fmt(d.p75)}</p>
+      <p className="text-[11px] text-[var(--text-secondary)]">P95: {fmt(d.p95)}</p>
+    </div>
+  );
+}
+
+function FanBandChart({ result }: { result: MonteCarloResult }) {
+  const rows: FanRow[] = useMemo(
+    () =>
+      Object.entries(result.fan_chart).map(([metric, fc]) => ({
+        metric,
+        label: METRIC_LABELS[metric] || metric,
+        p5: fc.p5,
+        p25: fc.p25,
+        p50: fc.p50,
+        p75: fc.p75,
+        p95: fc.p95,
+        outerBase: fc.p5,
+        outerSpan: fc.p95 - fc.p5,
+        innerBase: fc.p25,
+        innerSpan: fc.p75 - fc.p25,
+      })),
+    [result],
+  );
+  const height = Math.max(rows.length * 44 + 30, 100);
 
   return (
-    <div className="mb-3">
-      <div className="flex items-center justify-between text-xs mb-1">
-        <span className="font-medium text-[var(--text-primary)]">{METRIC_LABELS[metric] || metric}</span>
-        <span className="text-[var(--text-faint)]">
-          P50: {fmt(data.p50)} | Mean: {fmt(data.mean)}
-        </span>
+    <div style={{ height }}>
+      <ResponsiveContainer width="100%" height="100%">
+        <BarChart data={rows} layout="vertical" margin={{ left: 8, right: 16 }}>
+          <CartesianGrid strokeDasharray="3 3" stroke="var(--border-light)" horizontal={false} />
+          <XAxis
+            type="number"
+            tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
+            tick={{ fontSize: 10, fill: "var(--text-faint)" }}
+            axisLine={{ stroke: "var(--border)" }}
+            tickLine={false}
+          />
+          <YAxis
+            type="category"
+            dataKey="label"
+            width={90}
+            tick={{ fontSize: 11, fill: "var(--text-primary)" }}
+            axisLine={false}
+            tickLine={false}
+          />
+          <Tooltip content={<FanBandTooltip />} />
+          {/* Outer band: P5-P95 */}
+          <Bar dataKey="outerBase" stackId="outer" fill="transparent" />
+          <Bar dataKey="outerSpan" stackId="outer" fill="var(--accent)" fillOpacity={0.2} radius={[3, 3, 3, 3]} barSize={22} />
+          {/* Inner band: P25-P75 */}
+          <Bar dataKey="innerBase" stackId="inner" fill="transparent" />
+          <Bar dataKey="innerSpan" stackId="inner" fill="var(--accent)" fillOpacity={0.55} radius={[3, 3, 3, 3]} barSize={22}>
+            {rows.map((r) => (
+              <Cell key={r.metric} />
+            ))}
+          </Bar>
+          {rows.map((r) => (
+            <ReferenceLine key={r.metric} segment={[{ x: r.p50, y: r.label }, { x: r.p50, y: r.label }]} stroke="var(--accent)" />
+          ))}
+        </BarChart>
+      </ResponsiveContainer>
+      <ChartDataTable
+        caption="Monte Carlo fan chart percentiles"
+        columns={["Metric", "P5", "P25", "P50", "P75", "P95"]}
+        rows={rows.map((r) => [r.label, r.p5, r.p25, r.p50, r.p75, r.p95])}
+      />
+    </div>
+  );
+}
+
+// ── Histogram (Recharts) ──
+
+function Histogram({ values, label }: { values: number[]; label: string }) {
+  const buckets = useMemo(() => {
+    if (values.length === 0) return [];
+    const min = values[0];
+    const max = values[values.length - 1];
+    const bucketCount = 24;
+    const bucketSize = (max - min) / bucketCount || 1;
+    const counts = new Array(bucketCount).fill(0);
+    for (const v of values) {
+      const idx = Math.min(Math.floor((v - min) / bucketSize), bucketCount - 1);
+      counts[idx]++;
+    }
+    return counts.map((count, i) => ({
+      rangeStart: min + i * bucketSize,
+      rangeEnd: min + (i + 1) * bucketSize,
+      count,
+      mid: min + (i + 0.5) * bucketSize,
+    }));
+  }, [values]);
+
+  if (buckets.length === 0) return null;
+
+  const HistTooltip = ({ active, payload }: { active?: boolean; payload?: Array<{ payload: (typeof buckets)[number] }> }) => {
+    if (!active || !payload?.length) return null;
+    const b = payload[0].payload;
+    return (
+      <div className="bg-[var(--card-bg)] border border-[var(--card-border)] rounded-lg shadow-panel px-2.5 py-1.5">
+        <p className="text-[11px] text-[var(--text-secondary)]">{fmt(b.rangeStart)} – {fmt(b.rangeEnd)}</p>
+        <p className="text-[11px] font-semibold text-[var(--text-primary)]">{b.count} iterations</p>
       </div>
-      <div className="relative h-7 bg-[var(--panel-bg)] border border-[var(--border-light)] rounded-full overflow-hidden">
-        {/* P10-P90 band */}
-        <div
-          className="absolute top-0 h-full bg-accent/25 rounded-full"
-          style={{ left: `${p10Pct}%`, width: `${p90Pct - p10Pct}%` }}
+    );
+  };
+
+  return (
+    <div className="mb-4">
+      <p className="text-xs font-medium mb-1.5 text-[var(--text-primary)]">{label} Distribution</p>
+      <div className="h-32">
+        <ResponsiveContainer width="100%" height="100%">
+          <BarChart data={buckets} barCategoryGap={1}>
+            <XAxis
+              dataKey="mid"
+              tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
+              tick={{ fontSize: 9, fill: "var(--text-faint)" }}
+              axisLine={{ stroke: "var(--border)" }}
+              tickLine={false}
+              interval="preserveStartEnd"
+            />
+            <YAxis hide />
+            <Tooltip content={<HistTooltip />} />
+            <Bar dataKey="count" fill="var(--accent)" fillOpacity={0.6} radius={[2, 2, 0, 0]} />
+          </BarChart>
+        </ResponsiveContainer>
+        <ChartDataTable
+          caption={`${label} histogram`}
+          columns={["Range start", "Range end", "Count"]}
+          rows={buckets.map((b) => [b.rangeStart, b.rangeEnd, b.count])}
         />
-        {/* P50 line */}
-        <div
-          className="absolute top-0 h-full w-0.5 bg-accent"
-          style={{ left: `${p50Pct}%` }}
-        />
-      </div>
-      <div className="flex justify-between text-[10px] text-[var(--text-faint)] mt-0.5">
-        <span>P10: {fmt(data.p10)}</span>
-        <span>P90: {fmt(data.p90)}</span>
       </div>
     </div>
   );
 }
 
-function Histogram({ values, label }: { values: number[]; label: string }) {
-  if (values.length === 0) return null;
-  const min = values[0];
-  const max = values[values.length - 1];
-  const bucketCount = 20;
-  const bucketSize = (max - min) / bucketCount || 1;
-  const buckets = new Array(bucketCount).fill(0);
-  for (const v of values) {
-    const idx = Math.min(Math.floor((v - min) / bucketSize), bucketCount - 1);
-    buckets[idx]++;
-  }
-  const maxBucket = Math.max(...buckets);
+// ── Stat readout: VaR/CVaR/prob-negative/CI ──
 
+function RiskStats({ metric, data }: { metric: string; data: PercentileResult }) {
   return (
-    <div className="mb-4">
-      <p className="text-xs font-medium mb-1.5 text-[var(--text-primary)]">{label} Distribution</p>
-      <div className="flex items-end gap-px h-20 bg-[var(--panel-bg)] rounded-xl border border-[var(--border-light)] p-2">
-        {buckets.map((count, i) => (
-          <div
-            key={i}
-            className="flex-1 bg-accent/50 hover:bg-accent/70 rounded-t-sm min-w-[2px] transition-colors"
-            style={{ height: `${maxBucket > 0 ? (count / maxBucket) * 100 : 0}%` }}
-            title={`${fmt(min + i * bucketSize)} \u2013 ${fmt(min + (i + 1) * bucketSize)}: ${count}`}
-          />
-        ))}
+    <div className="grid grid-cols-2 sm:grid-cols-4 gap-2 mb-3 p-2.5 rounded-lg bg-[var(--panel-bg)] border border-[var(--border-light)]">
+      <div>
+        <p className="text-[9px] uppercase tracking-wider text-[var(--text-faint)]">VaR (5%)</p>
+        <p className="text-xs font-semibold text-[var(--text-primary)]">{fmt(data.var_5)}</p>
       </div>
-      <div className="flex justify-between text-[10px] text-[var(--text-faint)] mt-0.5">
-        <span>{fmt(min)}</span>
-        <span>{fmt(max)}</span>
+      <div>
+        <p className="text-[9px] uppercase tracking-wider text-[var(--text-faint)]">CVaR (5%)</p>
+        <p className="text-xs font-semibold text-[var(--danger)]">{fmt(data.cvar_5)}</p>
       </div>
+      <div>
+        <p className="text-[9px] uppercase tracking-wider text-[var(--text-faint)]">P(Negative)</p>
+        <p className="text-xs font-semibold text-[var(--text-primary)]">{(data.prob_negative * 100).toFixed(1)}%</p>
+      </div>
+      <div>
+        <p className="text-[9px] uppercase tracking-wider text-[var(--text-faint)]">95% CI (mean)</p>
+        <p className="text-xs font-semibold text-[var(--text-primary)]">{fmt(data.mean_ci_95[0])} – {fmt(data.mean_ci_95[1])}</p>
+      </div>
+      <p className="text-[9px] text-[var(--text-primary)] col-span-2 sm:col-span-4">{METRIC_LABELS[metric] || metric}</p>
     </div>
   );
 }
@@ -87,7 +223,7 @@ export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloVi
   const [result, setResult] = useState<MonteCarloResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [iterations, setIterations] = useState(1000);
+  const [iterations, setIterations] = useState(5000);
   const [selectedMetric, setSelectedMetric] = useState("net_income");
 
   const run = useCallback(async () => {
@@ -96,11 +232,13 @@ export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloVi
     try {
       const data = await runMonteCarlo(scenarioId, iterations);
       setResult(data);
+      const keys = Object.keys(data.metrics);
+      if (keys.length > 0 && !keys.includes(selectedMetric)) setSelectedMetric(keys[0]);
     } catch (e) {
       setError((e as Error).message);
     }
     setLoading(false);
-  }, [scenarioId, iterations]);
+  }, [scenarioId, iterations, selectedMetric]);
 
   return (
     <div className="border-t border-[var(--border)] bg-background p-4 max-h-[60vh] overflow-auto">
@@ -118,8 +256,8 @@ export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloVi
           <input
             type="number"
             min={100}
-            max={10000}
-            step={100}
+            max={20000}
+            step={500}
             value={iterations}
             onChange={(e) => setIterations(Number(e.target.value))}
             className="ml-1.5 w-20 rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)] px-2 py-1 text-xs focus:outline-none focus:border-[var(--input-focus-border)] focus:ring-1 focus:ring-accent/20"
@@ -138,19 +276,30 @@ export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloVi
 
       {result && (
         <>
-          <p className="text-xs text-[var(--text-faint)] mb-3">{result.iterations} iterations completed</p>
+          <p className="text-xs text-[var(--text-faint)] mb-1">
+            {result.iterations.toLocaleString()} iterations completed
+            {result.iterations < result.requested_iterations ? ` (of ${result.requested_iterations.toLocaleString()} requested)` : ""}
+            {" · "}seed {result.seed} — reproducible
+          </p>
+          {result.notices && result.notices.length > 0 && (
+            <div className="mb-3 space-y-1">
+              {result.notices.map((n, i) => (
+                <p key={i} className="text-[11px] text-[var(--warning)] bg-[var(--warning-bg)] px-2.5 py-1 rounded-lg">{n}</p>
+              ))}
+            </div>
+          )}
 
-          {/* Confidence intervals */}
+          {/* Distribution overview (fan band) */}
           <div className="mb-4">
-            <h4 className="text-[11px] font-semibold mb-2.5 text-[var(--text-muted)] uppercase tracking-wider">Confidence Intervals (P10 / P50 / P90)</h4>
-            {Object.entries(result.metrics).map(([metric, data]) => (
-              <DistributionBar key={metric} metric={metric} data={data} />
-            ))}
+            <h4 className="text-[11px] font-semibold mb-2.5 text-[var(--text-muted)] uppercase tracking-wider">
+              Distribution Overview (P5–P95 outer, P25–P75 inner, P50 marker)
+            </h4>
+            <FanBandChart result={result} />
           </div>
 
-          {/* Histogram for selected metric */}
+          {/* Histogram + risk stats for selected metric */}
           <div className="mb-3">
-            <label className="text-xs text-[var(--text-muted)] mr-2">Histogram:</label>
+            <label className="text-xs text-[var(--text-muted)] mr-2">Metric detail:</label>
             <select
               value={selectedMetric}
               onChange={(e) => setSelectedMetric(e.target.value)}
@@ -161,41 +310,13 @@ export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloVi
               ))}
             </select>
           </div>
+          {result.metrics[selectedMetric] && <RiskStats metric={selectedMetric} data={result.metrics[selectedMetric]} />}
           {result.distributions[selectedMetric] && (
             <Histogram
               values={[...result.distributions[selectedMetric]].sort((a, b) => a - b)}
               label={METRIC_LABELS[selectedMetric] || selectedMetric}
             />
           )}
-
-          {/* Fan chart summary table */}
-          <h4 className="text-[11px] font-semibold mb-2 text-[var(--text-muted)] uppercase tracking-wider">Fan Chart Summary</h4>
-          <div className="rounded-xl border border-[var(--card-border)] overflow-hidden mb-2">
-            <table className="w-full text-xs">
-              <thead>
-                <tr className="bg-[var(--panel-bg)]">
-                  <th className="py-2 px-3 text-left font-medium text-[var(--text-secondary)]">Metric</th>
-                  <th className="py-2 px-3 text-right font-medium text-[var(--text-secondary)]">P10</th>
-                  <th className="py-2 px-3 text-right font-medium text-[var(--text-secondary)]">P25</th>
-                  <th className="py-2 px-3 text-right font-medium text-[var(--text-secondary)]">P50</th>
-                  <th className="py-2 px-3 text-right font-medium text-[var(--text-secondary)]">P75</th>
-                  <th className="py-2 px-3 text-right font-medium text-[var(--text-secondary)]">P90</th>
-                </tr>
-              </thead>
-              <tbody>
-                {Object.entries(result.fan_chart).map(([m, fc]) => (
-                  <tr key={m} className="border-t border-[var(--border-light)] hover:bg-[var(--panel-bg)] transition-colors">
-                    <td className="py-1.5 px-3 font-medium text-[var(--text-primary)]">{METRIC_LABELS[m] || m}</td>
-                    <td className="py-1.5 px-3 text-right text-[var(--text-secondary)]">{fmt(fc.p10)}</td>
-                    <td className="py-1.5 px-3 text-right text-[var(--text-secondary)]">{fmt(fc.p25)}</td>
-                    <td className="py-1.5 px-3 text-right font-semibold text-[var(--text-primary)]">{fmt(fc.p50)}</td>
-                    <td className="py-1.5 px-3 text-right text-[var(--text-secondary)]">{fmt(fc.p75)}</td>
-                    <td className="py-1.5 px-3 text-right text-[var(--text-secondary)]">{fmt(fc.p90)}</td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
-          </div>
         </>
       )}
     </div>
