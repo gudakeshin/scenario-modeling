@@ -163,15 +163,29 @@ export async function addFollowUp(
     if (existing.rows.length > 0) {
       // Update existing parameter (additive)
       await pool.query(
-        "UPDATE scenario_parameters SET scenario_value = $1, delta_type = $2, status = 'modified', extracted_name = $3 WHERE parameter_id = $4",
-        [scenarioValue, deltaType, p.name, existing.rows[0].parameter_id]
+        "UPDATE scenario_parameters SET scenario_value = $1, delta_type = $2, status = 'modified', extracted_name = $3, member_scope = $4 WHERE parameter_id = $5",
+        [
+          scenarioValue,
+          deltaType,
+          p.name,
+          p.member_scope ? JSON.stringify(p.member_scope) : null,
+          existing.rows[0].parameter_id,
+        ]
       );
     } else {
       // Insert new parameter
       await pool.query(
-        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-        [scenarioId, p.name, variableId, scenarioValue, deltaType, p.confidence]
+        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status, member_scope)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)`,
+        [
+          scenarioId,
+          p.name,
+          variableId,
+          scenarioValue,
+          deltaType,
+          p.confidence,
+          p.member_scope ? JSON.stringify(p.member_scope) : null,
+        ]
       );
     }
 

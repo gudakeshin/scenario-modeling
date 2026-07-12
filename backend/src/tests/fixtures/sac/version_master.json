@@ -1,0 +1,6 @@
+{
+  "value": [
+    { "ID": "Actual", "Description": "Actual" },
+    { "ID": "Budget", "Description": "Budget" }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "value": [
+    { "Region": "UK", "Account": "Revenue", "Time": "2024.01", "Version": "Actual", "SignedData": 100 },
+    { "Region": "DE", "Account": "Revenue", "Time": "2024.01", "Version": "Actual", "SignedData": 80 },
+    { "Region": "US", "Account": "Revenue", "Time": "2024.01", "Version": "Actual", "SignedData": 200 },
+    { "Region": "UK", "Account": "COGS", "Time": "2024.01", "Version": "Actual", "SignedData": 30 },
+    { "Region": "EMEA", "Account": "Revenue", "Time": "2024.01", "Version": "Actual", "SignedData": 180 }
+  ],
+  "@odata.nextLink": "FactData?$skiptoken=page2"
+}

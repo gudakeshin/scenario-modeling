@@ -15,10 +15,13 @@ import { RoleManagement } from "./RoleManagement";
 import { FollowUpQuestions } from "./FollowUpQuestions";
 import { DocumentPanel } from "./DocumentPanel";
 import { DocumentManager } from "./DocumentManager";
+import { ConnectionsPanel } from "./ConnectionsPanel";
+import { ModelImportWizard } from "./ModelImportWizard";
 import { AnalysisModal } from "./AnalysisModal";
 import { getOnboardingStatus } from "@/lib/api";
 import { setCurrency } from "@/lib/metrics";
 import { useUiStore } from "@/stores/uiStore";
+import { usePlanningConnectorsEnabled } from "@/lib/features";
 
 const CARD_COLORS: Record<string, string> = {
   review: "bg-accent", comparison: "bg-[var(--info)]", monteCarlo: "bg-accent",
@@ -28,6 +31,8 @@ const CARD_COLORS: Record<string, string> = {
   insights: "bg-[var(--success)]", followUp: "bg-accent",
   documents: "bg-[var(--info)]",
   docManager: "bg-accent",
+  connections: "bg-[var(--info)]",
+  importWizard: "bg-accent",
 };
 
 interface AnalysisPanelStripProps {
@@ -45,16 +50,18 @@ export function AnalysisPanelStrip({
   onFollowUpAnswers,
   onTemplateCloned,
 }: AnalysisPanelStripProps) {
+  const planningConnectorsEnabled = usePlanningConnectorsEnabled();
   const {
     showReview, showComparison, showAudit, showMonteCarlo, showTornado,
     showTemplates, showInsights, showPeriods, showCharts, showSharing,
-    showRoles, showDocuments, showDocManager,
+    showRoles, showDocuments, showDocManager, showConnections, showImportWizard,
     preloadedInsight, periodData, chartData, pendingQuestions,
-    refineKey, expandedPanel,
+    refineKey, expandedPanel, importConnectionId,
     setShowReview, setShowComparison, setShowAudit, setShowMonteCarlo,
     setShowTornado, setShowTemplates, setShowInsights, setShowPeriods,
     setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
-    setShowDocManager, setPreloadedInsight, setPendingQuestions,
+    setShowDocManager, setShowConnections, setShowImportWizard, setImportConnectionId,
+    setPreloadedInsight, setPendingQuestions,
     setOnboardingStatus, setExpandedPanel,
   } = useUiStore();
 
@@ -81,14 +88,17 @@ export function AnalysisPanelStrip({
     if (pendingQuestions && pendingQuestions.length > 0 && scenarioId) cards.push({ id: "followUp", title: "Refine Scenario", close: () => setPendingQuestions(null) });
     if (showDocuments) cards.push({ id: "documents", title: "Documents", close: () => setShowDocuments(false) });
     if (showDocManager) cards.push({ id: "docManager", title: "Document Manager", close: () => setShowDocManager(false) });
+    if (planningConnectorsEnabled && showConnections) cards.push({ id: "connections", title: "Connections", close: () => setShowConnections(false) });
+    if (planningConnectorsEnabled && showImportWizard) cards.push({ id: "importWizard", title: "Import Model", close: () => setShowImportWizard(false) });
     return cards;
   }, [
     showReview, showComparison, showMonteCarlo, showTornado, showPeriods, showCharts,
     showSharing, showAudit, showTemplates, showRoles, showInsights, pendingQuestions,
-    showDocuments, showDocManager, scenarioId, periodData, chartData,
+    showDocuments, showDocManager, showConnections, showImportWizard, scenarioId, periodData, chartData, planningConnectorsEnabled,
     setShowReview, setShowComparison, setShowMonteCarlo, setShowTornado, setShowPeriods,
     setShowCharts, setShowSharing, setShowAudit, setShowTemplates, setShowRoles,
     setShowInsights, setPreloadedInsight, setPendingQuestions, setShowDocuments, setShowDocManager,
+    setShowConnections, setShowImportWizard,
   ]);
 
   const closePanel = (id: string, closeFn: () => void) => {
@@ -112,7 +122,7 @@ export function AnalysisPanelStrip({
       case "periods":
         return periodData ? <PeriodBreakdownView periods={periodData.periods} granularity={periodData.granularity} totalPl={periodData.pl} onClose={() => closePanel("periods", () => setShowPeriods(false))} onMinimize={collapseModal} /> : null;
       case "charts":
-        return chartData ? <ScenarioCharts pl={chartData.pl} basePl={chartData.basePl} periods={chartData.periods} granularity={chartData.granularity} onClose={() => closePanel("charts", () => setShowCharts(false))} onMinimize={collapseModal} /> : null;
+        return chartData ? <ScenarioCharts scenarioId={chartData.scenarioId ?? sid} pl={chartData.pl} basePl={chartData.basePl} periods={chartData.periods} granularity={chartData.granularity} dimensional={chartData.dimensional} onClose={() => closePanel("charts", () => setShowCharts(false))} onMinimize={collapseModal} /> : null;
       case "sharing":
         return sid ? <SharingPanel scenarioId={sid} onClose={() => closePanel("sharing", () => setShowSharing(false))} onMinimize={collapseModal} /> : null;
       case "audit":
@@ -129,6 +139,31 @@ export function AnalysisPanelStrip({
         return <DocumentPanel onClose={() => closePanel("documents", () => setShowDocuments(false))} onMinimize={collapseModal} />;
       case "docManager":
         return <DocumentManager onClose={() => closePanel("docManager", () => setShowDocManager(false))} onMinimize={collapseModal} onContextBuilt={() => { getOnboardingStatus().then((s) => { setOnboardingStatus(s); if (s.currency) setCurrency(s.currency, s.currency_unit); }).catch(() => {}); }} />;
+      case "connections":
+        if (!planningConnectorsEnabled) return null;
+        return (
+          <ConnectionsPanel
+            onClose={() => closePanel("connections", () => setShowConnections(false))}
+            onMinimize={collapseModal}
+            onOpenImport={(cid) => {
+              setImportConnectionId(cid);
+              setShowImportWizard(true);
+              setExpandedPanel("importWizard");
+            }}
+          />
+        );
+      case "importWizard":
+        if (!planningConnectorsEnabled) return null;
+        return (
+          <ModelImportWizard
+            onClose={() => closePanel("importWizard", () => { setShowImportWizard(false); setImportConnectionId(null); })}
+            onMinimize={collapseModal}
+            initialConnectionId={importConnectionId}
+            onImported={() => {
+              getOnboardingStatus().then((s) => { setOnboardingStatus(s); if (s.currency) setCurrency(s.currency, s.currency_unit); }).catch(() => {});
+            }}
+          />
+        );
       default:
         return null;
     }

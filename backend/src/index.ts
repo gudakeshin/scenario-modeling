@@ -22,6 +22,8 @@ import { authenticate } from "./auth/middleware.js";
 import { requireRole } from "./middleware/rbac.js";
 import { resolveWorkspace } from "./middleware/workspace.js";
 import { workspacesRouter } from "./routes/workspaces.js";
+import { connectionsRouter } from "./routes/connections.js";
+import { configRouter } from "./routes/config.js";
 import { startServer } from "./server.js";
 
 const app = express();
@@ -76,7 +78,7 @@ const authLimiter = rateLimit({
 
 const apiLimiter = rateLimit({
   windowMs: config.RATE_LIMIT_WINDOW_MS,
-  max: config.RATE_LIMIT_MAX_REQUESTS,
+  max: config.NODE_ENV === "test" ? 10_000 : config.RATE_LIMIT_MAX_REQUESTS,
   standardHeaders: true,
   legacyHeaders: false,
   keyGenerator: (req) => req.user?.userId || req.ip || "anon",
@@ -119,6 +121,8 @@ app.use("/api/v1/templates", templatesRouter);
 app.use("/api/v1/sessions", sessionsRouter);
 app.use("/api/v1/documents", documentsRouter);
 app.use("/api/v1/context", contextRouter);
+app.use("/api/v1/config", configRouter);
+app.use("/api/v1/connections", connectionsRouter);
 
 export { app };
 

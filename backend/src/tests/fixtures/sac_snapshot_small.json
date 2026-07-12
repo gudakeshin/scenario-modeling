@@ -1,0 +1,145 @@
+{
+  "modelId": "Pnl_Small",
+  "modelName": "P&L Small Demo",
+  "dimensions": [
+    {
+      "id": "region",
+      "source_id": "Region",
+      "name": "Region",
+      "type": "generic",
+      "defaultHierarchyId": "default",
+      "hierarchies": [
+        { "id": "default", "name": "Default", "rootMemberIds": ["world"] }
+      ],
+      "members": [
+        { "id": "world", "source_id": "World", "name": "World", "parentId": null, "isLeaf": false, "sign": 1, "ordinal": 0 },
+        { "id": "emea", "source_id": "EMEA", "name": "EMEA", "parentId": "world", "isLeaf": false, "sign": 1, "ordinal": 1 },
+        { "id": "amer", "source_id": "AMER", "name": "AMER", "parentId": "world", "isLeaf": false, "sign": 1, "ordinal": 2 },
+        { "id": "apac", "source_id": "APAC", "name": "APAC", "parentId": "world", "isLeaf": false, "sign": 1, "ordinal": 3 },
+        { "id": "uk", "source_id": "UK", "name": "UK", "parentId": "emea", "isLeaf": true, "sign": 1, "ordinal": 4 },
+        { "id": "de", "source_id": "DE", "name": "Germany", "parentId": "emea", "isLeaf": true, "sign": 1, "ordinal": 5 },
+        { "id": "fr", "source_id": "FR", "name": "France", "parentId": "emea", "isLeaf": true, "sign": 1, "ordinal": 6 },
+        { "id": "us", "source_id": "US", "name": "United States", "parentId": "amer", "isLeaf": true, "sign": 1, "ordinal": 7 },
+        { "id": "ca", "source_id": "CA", "name": "Canada", "parentId": "amer", "isLeaf": true, "sign": 1, "ordinal": 8 },
+        { "id": "jp", "source_id": "JP", "name": "Japan", "parentId": "apac", "isLeaf": true, "sign": 1, "ordinal": 9 },
+        { "id": "au", "source_id": "AU", "name": "Australia", "parentId": "apac", "isLeaf": true, "sign": 1, "ordinal": 10 }
+      ]
+    },
+    {
+      "id": "product",
+      "source_id": "Product",
+      "name": "Product",
+      "type": "generic",
+      "defaultHierarchyId": "default",
+      "hierarchies": [
+        { "id": "default", "name": "Default", "rootMemberIds": ["all_products"] }
+      ],
+      "members": [
+        { "id": "all_products", "source_id": "AllProducts", "name": "All Products", "parentId": null, "isLeaf": false, "sign": 1, "ordinal": 0 },
+        { "id": "hardware", "source_id": "Hardware", "name": "Hardware", "parentId": "all_products", "isLeaf": false, "sign": 1, "ordinal": 1 },
+        { "id": "software", "source_id": "Software", "name": "Software", "parentId": "all_products", "isLeaf": false, "sign": 1, "ordinal": 2 },
+        { "id": "laptops", "source_id": "Laptops", "name": "Laptops", "parentId": "hardware", "isLeaf": true, "sign": 1, "ordinal": 3 },
+        { "id": "servers", "source_id": "Servers", "name": "Servers", "parentId": "hardware", "isLeaf": true, "sign": 1, "ordinal": 4 },
+        { "id": "saas", "source_id": "SaaS", "name": "SaaS", "parentId": "software", "isLeaf": true, "sign": 1, "ordinal": 5 },
+        { "id": "licenses", "source_id": "Licenses", "name": "Licenses", "parentId": "software", "isLeaf": true, "sign": 1, "ordinal": 6 }
+      ]
+    },
+    {
+      "id": "account",
+      "source_id": "Account",
+      "name": "Account",
+      "type": "account",
+      "defaultHierarchyId": "default",
+      "hierarchies": [
+        { "id": "default", "name": "Default", "rootMemberIds": ["net_income"] }
+      ],
+      "members": [
+        { "id": "net_income", "source_id": "NetIncome", "name": "Net Income", "parentId": null, "isLeaf": false, "sign": 1, "ordinal": 0 },
+        { "id": "gross_profit", "source_id": "GrossProfit", "name": "Gross Profit", "parentId": "net_income", "isLeaf": false, "sign": 1, "ordinal": 1 },
+        { "id": "revenue", "source_id": "Revenue", "name": "Revenue", "parentId": "gross_profit", "isLeaf": true, "sign": 1, "ordinal": 2 },
+        { "id": "cogs", "source_id": "COGS", "name": "Cost of Goods Sold", "parentId": "gross_profit", "isLeaf": true, "sign": -1, "ordinal": 3 },
+        { "id": "opex", "source_id": "OpEx", "name": "Operating Expenses", "parentId": "net_income", "isLeaf": true, "sign": -1, "ordinal": 4 }
+      ]
+    },
+    {
+      "id": "time",
+      "source_id": "Time",
+      "name": "Time",
+      "type": "time",
+      "defaultHierarchyId": "default",
+      "hierarchies": [
+        { "id": "default", "name": "Default", "rootMemberIds": ["fy2024"] }
+      ],
+      "members": [
+        { "id": "fy2024", "source_id": "FY2024", "name": "FY2024", "parentId": null, "isLeaf": false, "sign": 1, "ordinal": 0 },
+        { "id": "2024_01", "source_id": "2024.01", "name": "2024-01", "parentId": "fy2024", "isLeaf": true, "sign": 1, "ordinal": 1 },
+        { "id": "2024_02", "source_id": "2024.02", "name": "2024-02", "parentId": "fy2024", "isLeaf": true, "sign": 1, "ordinal": 2 },
+        { "id": "2024_03", "source_id": "2024.03", "name": "2024-03", "parentId": "fy2024", "isLeaf": true, "sign": 1, "ordinal": 3 },
+        { "id": "2024_q1", "source_id": "2024.Q1", "name": "2024-Q1", "parentId": "fy2024", "isLeaf": false, "sign": 1, "ordinal": 4 },
+        { "id": "2024_04", "source_id": "2024.04", "name": "2024-04", "parentId": "fy2024", "isLeaf": true, "sign": 1, "ordinal": 5 },
+        { "id": "2024_05", "source_id": "2024.05", "name": "2024-05", "parentId": "fy2024", "isLeaf": true, "sign": 1, "ordinal": 6 },
+        { "id": "2024_06", "source_id": "2024.06", "name": "2024-06", "parentId": "fy2024", "isLeaf": true, "sign": 1, "ordinal": 7 }
+      ]
+    },
+    {
+      "id": "version",
+      "source_id": "Version",
+      "name": "Version",
+      "type": "version",
+      "defaultHierarchyId": "default",
+      "hierarchies": [
+        { "id": "default", "name": "Default", "rootMemberIds": ["actual"] }
+      ],
+      "members": [
+        { "id": "actual", "source_id": "Actual", "name": "Actual", "parentId": null, "isLeaf": true, "sign": 1, "ordinal": 0 },
+        { "id": "plan", "source_id": "Plan", "name": "Plan", "parentId": null, "isLeaf": true, "sign": 1, "ordinal": 1 }
+      ]
+    }
+  ],
+  "measures": [
+    {
+      "id": "amount",
+      "source_id": "Amount",
+      "name": "Amount",
+      "aggregation": "sum",
+      "unit": "USD"
+    },
+    {
+      "id": "units",
+      "source_id": "Units",
+      "name": "Units",
+      "aggregation": "sum"
+    }
+  ],
+  "source_aggregates": [
+    { "measure_id": "amount", "member_key": "emea|all_products|revenue|fy2024|actual", "value": 450000 },
+    { "measure_id": "amount", "member_key": "world|all_products|revenue|fy2024|actual", "value": 1200000 }
+  ],
+  "facts": [
+    { "measureId": "amount", "memberKey": "uk|laptops|revenue|2024_01|actual", "value": 50000 },
+    { "measureId": "amount", "memberKey": "uk|saas|revenue|2024_01|actual", "value": 30000 },
+    { "measureId": "amount", "memberKey": "de|laptops|revenue|2024_01|actual", "value": 40000 },
+    { "measureId": "amount", "memberKey": "de|servers|revenue|2024_01|actual", "value": 35000 },
+    { "measureId": "amount", "memberKey": "fr|licenses|revenue|2024_01|actual", "value": 25000 },
+    { "measureId": "amount", "memberKey": "us|laptops|revenue|2024_01|actual", "value": 80000 },
+    { "measureId": "amount", "memberKey": "us|saas|revenue|2024_01|actual", "value": 60000 },
+    { "measureId": "amount", "memberKey": "ca|servers|revenue|2024_01|actual", "value": 20000 },
+    { "measureId": "amount", "memberKey": "jp|saas|revenue|2024_01|actual", "value": 45000 },
+    { "measureId": "amount", "memberKey": "au|licenses|revenue|2024_01|actual", "value": 15000 },
+    { "measureId": "amount", "memberKey": "uk|laptops|cogs|2024_01|actual", "value": 20000 },
+    { "measureId": "amount", "memberKey": "de|laptops|cogs|2024_01|actual", "value": 16000 },
+    { "measureId": "amount", "memberKey": "us|laptops|cogs|2024_01|actual", "value": 32000 },
+    { "measureId": "amount", "memberKey": "uk|laptops|opex|2024_01|actual", "value": 8000 },
+    { "measureId": "amount", "memberKey": "us|saas|opex|2024_01|actual", "value": 12000 },
+    { "measureId": "amount", "memberKey": "uk|laptops|revenue|2024_02|actual", "value": 52000 },
+    { "measureId": "amount", "memberKey": "de|saas|revenue|2024_02|actual", "value": 28000 },
+    { "measureId": "amount", "memberKey": "us|laptops|revenue|2024_02|actual", "value": 85000 },
+    { "measureId": "amount", "memberKey": "jp|saas|revenue|2024_02|actual", "value": 48000 },
+    { "measureId": "amount", "memberKey": "uk|laptops|revenue|2024_03|actual", "value": 55000 },
+    { "measureId": "amount", "memberKey": "us|saas|revenue|2024_03|actual", "value": 65000 },
+    { "measureId": "amount", "memberKey": "de|servers|revenue|2024_03|actual", "value": 38000 },
+    { "measureId": "units", "memberKey": "uk|laptops|revenue|2024_01|actual", "value": 100 },
+    { "measureId": "units", "memberKey": "us|laptops|revenue|2024_01|actual", "value": 200 },
+    { "measureId": "units", "memberKey": "de|servers|revenue|2024_01|actual", "value": 50 }
+  ]
+}

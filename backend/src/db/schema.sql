@@ -148,6 +148,62 @@ CREATE TABLE IF NOT EXISTS user_models (
     updated_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Planning-system connections (SAP SAC / Anaplan / Oracle PBCS)
+CREATE TABLE IF NOT EXISTS planning_connections (
+    connection_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    created_by UUID NOT NULL REFERENCES users(user_id),
+    provider VARCHAR(30) NOT NULL CHECK (provider IN ('sap_sac', 'anaplan', 'oracle_pbcs', 'mock')),
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    auth_kind VARCHAR(40) NOT NULL CHECK (auth_kind IN ('oauth2_client_credentials', 'api_key')),
+    auth_public JSONB NOT NULL DEFAULT '{}'::jsonb,
+    secret_ciphertext TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+    last_test_at TIMESTAMP,
+    last_test_ok BOOLEAN,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS integration_events (
+    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    connection_id UUID REFERENCES planning_connections(connection_id) ON DELETE SET NULL,
+    user_id UUID REFERENCES users(user_id),
+    event_type VARCHAR(80) NOT NULL,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    request_id TEXT,
+    ip_address INET,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS external_model_snapshots (
+    snapshot_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    connection_id UUID NOT NULL REFERENCES planning_connections(connection_id),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    provider VARCHAR(30) NOT NULL,
+    external_model_id TEXT NOT NULL,
+    external_model_name TEXT NOT NULL,
+    snapshot_version INTEGER NOT NULL DEFAULT 1,
+    status VARCHAR(20) NOT NULL DEFAULT 'importing'
+        CHECK (status IN ('importing', 'ready', 'failed', 'superseded')),
+    error TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    stats JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fact_query JSONB,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS external_model_facts (
+    snapshot_id UUID NOT NULL REFERENCES external_model_snapshots(snapshot_id) ON DELETE CASCADE,
+    measure_id TEXT NOT NULL,
+    member_key TEXT NOT NULL,
+    value NUMERIC NOT NULL,
+    PRIMARY KEY (snapshot_id, measure_id, member_key)
+);
+
 -- Documents (for RAG / talk-to-document feature)
 CREATE TABLE IF NOT EXISTS documents (
     document_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
@@ -208,6 +264,18 @@ ALTER TABLE company_context
 ALTER TABLE user_models
   ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
 
+ALTER TABLE user_models
+  ADD COLUMN IF NOT EXISTS source_kind VARCHAR(30) NOT NULL DEFAULT 'documents';
+
+ALTER TABLE user_models
+  ADD COLUMN IF NOT EXISTS snapshot_id UUID REFERENCES external_model_snapshots(snapshot_id);
+
+ALTER TABLE scenario_parameters
+  ADD COLUMN IF NOT EXISTS member_scope JSONB;
+
+ALTER TABLE scenario_parameters
+  ADD COLUMN IF NOT EXISTS delta_type VARCHAR(16) NOT NULL DEFAULT 'absolute';
+
 ALTER TABLE scenarios
   ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
 
@@ -240,6 +308,22 @@ CREATE INDEX IF NOT EXISTS idx_company_context_workspace
     ON company_context(workspace_id, status);
 CREATE INDEX IF NOT EXISTS idx_user_models_workspace
     ON user_models(workspace_id, is_active);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_planning_connections_ws_name
+    ON planning_connections(workspace_id, lower(name))
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_planning_connections_workspace
+    ON planning_connections(workspace_id, status);
+CREATE INDEX IF NOT EXISTS idx_integration_events_workspace
+    ON integration_events(workspace_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_external_model_snapshots_version
+    ON external_model_snapshots(connection_id, external_model_id, snapshot_version);
+CREATE INDEX IF NOT EXISTS idx_external_model_snapshots_workspace
+    ON external_model_snapshots(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_external_model_facts_snapshot
+    ON external_model_facts(snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_user_models_snapshot
+    ON user_models(snapshot_id)
+    WHERE snapshot_id IS NOT NULL;
 
 -- Seed default user for local dev / testing only.
 -- In production, users should be created via the application or SSO.

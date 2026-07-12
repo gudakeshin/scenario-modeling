@@ -167,7 +167,7 @@ export interface ModelInput {
  * Implemented by CompiledModel (formula DAG) and XlsxModelRuntime (HyperFormula).
  */
 export interface EvaluableModel {
-  kind: "formula" | "xlsx";
+  kind: "formula" | "xlsx" | "dimensional";
   /** Perturbable input variables with their base values. */
   inputs: ModelInput[];
   /** Metric ids reported by evaluate() (P&L metrics / KPI outputs). */

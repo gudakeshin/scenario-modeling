@@ -100,8 +100,8 @@ export async function getWorkspaceModelId(workspaceId: string): Promise<string |
  * callers use this for advisory context (QA prompts, comparisons), not
  * for the simulation itself, which surfaces formula errors properly.
  */
-export async function computeBaseCase(modelOrVersion?: string | ModelDefinition): Promise<Record<string, number>> {
-  let model: ModelDefinition | null;
+export async function computeBaseCase(modelOrVersion?: string | ModelDefinition | import("./dimensions.js").DimensionalModelDefinition): Promise<Record<string, number>> {
+  let model: ModelDefinition | import("./dimensions.js").DimensionalModelDefinition | null;
   if (modelOrVersion && typeof modelOrVersion === "object") {
     model = modelOrVersion;
   } else {
@@ -109,6 +109,13 @@ export async function computeBaseCase(modelOrVersion?: string | ModelDefinition)
   }
   if (!model) return {};
   try {
+    const { isDimensionalModelDefinition } = await import("./dimensions.js");
+    if (isDimensionalModelDefinition(model)) {
+      // Totals-only base without loading facts — returns zeros for fact-backed inputs.
+      // Prefer resolver path when a snapshot is active; this is advisory fallback.
+      const { DimensionalModel } = await import("../services/dimensionalModel.js");
+      return new DimensionalModel(model).baseValues();
+    }
     const { CompiledModel } = await import("../services/expression.js");
     return new CompiledModel(model).baseValues();
   } catch {
@@ -145,6 +152,36 @@ export function describeModelForLLM(model: ModelDefinition): string {
   for (const v of model.variables) {
     const tags = v.tags?.length ? ` [${v.tags.join(", ")}]` : "";
     lines.push(`  - ${v.id} (${v.name}): ${v.formula}${tags}`);
+  }
+  return lines.join("\n");
+}
+
+/**
+ * Bounded description of a dimensional model for NL parsing (vars + ~2 hierarchy levels).
+ */
+export function describeDimensionalModelForLLM(model: import("./dimensions.js").DimensionalModelDefinition): string {
+  const lines = [
+    `Dimensional Planning Model (${model.model_version})`,
+    `Time: ${model.time_horizon.start} to ${model.time_horizon.end} (${model.time_horizon.granularity})`,
+    "",
+    "Dimensions (member catalog — use these ids in member_scope):",
+  ];
+  for (const dim of model.dimensions) {
+    if (dim.type === "version") continue;
+    lines.push(`  ${dim.id} (${dim.name}, ${dim.type}):`);
+    const roots = dim.members.filter((m) => !m.parentId);
+    const level1 = dim.members.filter((m) => roots.some((r) => m.parentId === r.id));
+    const show = [...roots, ...level1].slice(0, 40);
+    for (const m of show) {
+      lines.push(`    - ${m.id} (${m.name})${m.isLeaf ? " [leaf]" : ""}`);
+    }
+  }
+  lines.push("", "Variables:");
+  for (const v of model.variables) {
+    const tags = v.tags?.length ? ` [${v.tags.join(", ")}]` : "";
+    const dims = v.dims.length ? ` dims=[${v.dims.join(",")}]` : " [scalar]";
+    const kind = v.dependencies.length === 0 ? "input" : "calculated";
+    lines.push(`  - ${v.id} (${v.name}): ${kind}${dims}${tags}`);
   }
   return lines.join("\n");
 }

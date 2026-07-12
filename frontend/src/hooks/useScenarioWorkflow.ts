@@ -14,6 +14,7 @@ import {
   listScenarios,
   getOnboardingStatus,
 } from "@/lib/api";
+import { probePlanningConnectors } from "@/lib/features";
 import { setCurrency, getCurrencySymbol, getCurrencyLabel } from "@/lib/metrics";
 import type { Message, ThinkingData } from "@/types/chat";
 import { useChatStore } from "@/stores/chatStore";
@@ -46,7 +47,7 @@ export function useScenarioWorkflow() {
     setShowReview, setShowDocManager, setPreloadedInsight, setPeriodData,
     setChartData, setPendingQuestions, setOnboardingStatus, bumpRefineKey,
     setIsLoading, setExpandedPanel, closeAllPanels, setShowInsights,
-    setShowPeriods, setShowTemplates,
+    setShowPeriods, setShowTemplates, setDimensionalPov, setDimensionalMetric,
   } = useUiStore();
 
   const sessionId = useSessionStore((s) => s.sessionId);
@@ -67,6 +68,7 @@ export function useScenarioWorkflow() {
   // (onboarding status, model, and currency are all workspace-scoped).
   useEffect(() => {
     initUserContext().catch(() => {});
+    probePlanningConnectors().catch(() => {});
     getOnboardingStatus().then((s) => {
       setOnboardingStatus(s);
       if (s.currency) setCurrency(s.currency, s.currency_unit);
@@ -339,6 +341,8 @@ export function useScenarioWorkflow() {
     setShowReview(false);
     setExpandedPanel(null);
     setIsLoading(true);
+    setDimensionalPov({});
+    setDimensionalMetric(null);
     addAssistantMessage(convId, "Parameters approved. Running simulation...");
     try {
       const result = await runScenario(scenarioId);
@@ -371,13 +375,21 @@ export function useScenarioWorkflow() {
       try {
         const base = await getBaseCase();
         setChartData({
+          scenarioId,
           pl: result.pl,
           basePl: base.pl,
           periods: result.periods,
           granularity: result.granularity,
+          dimensional: result.dimensional,
         });
       } catch {
-        setChartData({ pl: result.pl, periods: result.periods, granularity: result.granularity });
+        setChartData({
+          scenarioId,
+          pl: result.pl,
+          periods: result.periods,
+          granularity: result.granularity,
+          dimensional: result.dimensional,
+        });
       }
 
       try {
@@ -424,7 +436,7 @@ export function useScenarioWorkflow() {
   }, [
     active?.scenarioId, activeId, addAssistantMessage,
     setShowReview, setExpandedPanel, setIsLoading, setPeriodData, setShowPeriods,
-    setChartData, setPreloadedInsight, setShowInsights,
+    setChartData, setPreloadedInsight, setShowInsights, setDimensionalPov, setDimensionalMetric,
   ]);
 
   const handleFollowUpAnswers = useCallback(

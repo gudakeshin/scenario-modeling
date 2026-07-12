@@ -1,0 +1,10 @@
+{
+  "value": [
+    { "ID": "World", "Description": "World", "ParentId": null },
+    { "ID": "EMEA", "Description": "EMEA", "ParentId": "World" },
+    { "ID": "AMER", "Description": "AMER", "ParentId": "World" },
+    { "ID": "UK", "Description": "UK", "ParentId": "EMEA" },
+    { "ID": "DE", "Description": "DE", "ParentId": "EMEA" },
+    { "ID": "US", "Description": "US", "ParentId": "AMER" }
+  ]
+}

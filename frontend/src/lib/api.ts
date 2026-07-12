@@ -208,6 +208,9 @@ export interface StoredParameter {
   mapped_variable_id: string;
   base_value: number | null;
   scenario_value: number;
+  delta_type?: "percent" | "absolute";
+  member_scope?: Record<string, string> | null;
+  member_catalog?: MemberCatalog;
   confidence_score: number;
   status: string;
 }
@@ -267,7 +270,13 @@ export async function getParameters(scenarioId: string): Promise<StoredParameter
   const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/parameters`);
   if (!res.ok) throw new Error("Failed to get parameters");
   const data = await res.json();
-  return data.parameters;
+  const parameters: StoredParameter[] = data.parameters ?? [];
+  return data.member_catalog
+    ? parameters.map((parameter) => ({
+        ...parameter,
+        member_catalog: parameter.member_catalog ?? data.member_catalog,
+      }))
+    : parameters;
 }
 
 export async function updateParameter(
@@ -308,6 +317,30 @@ export interface SimulationResult {
   period_count?: number;
   granularity?: "monthly" | "quarterly";
   absurdity_warnings?: string[];
+  simulation_mode?: "formula_dag" | "xlsx_cell_graph" | "external_model";
+  dimensional?: DimensionalResultBlock;
+  notices?: Array<string | Notice>;
+}
+
+export type MemberCatalog = Record<
+  string,
+  Array<{ id: string; name: string } | string> | Record<string, string>
+>;
+
+export interface DimensionalResultBlock {
+  dimensions: Array<{ id: string; name: string; type: string }>;
+  breakdowns: Record<string, Record<string, Record<string, number>>>;
+  member_catalog?: MemberCatalog;
+}
+
+export interface PovSliceResult {
+  scenario_id?: string;
+  pov: Record<string, string>;
+  pl?: Record<string, number>;
+  periods?: PeriodResult[];
+  granularity?: "monthly" | "quarterly";
+  dimensional?: DimensionalResultBlock;
+  notices?: Array<string | Notice>;
 }
 
 export async function getBaseCase(): Promise<{ pl: Record<string, number>; all_variables: Record<string, number> }> {
@@ -324,6 +357,23 @@ export async function runScenario(scenarioId: string): Promise<SimulationResult>
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error((err as { error?: string }).error || "Simulation failed");
+  }
+  return res.json();
+}
+
+export async function getPovSlice(
+  scenarioId: string,
+  pov: Record<string, string>,
+  metrics?: string[],
+): Promise<PovSliceResult> {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/pov-slice`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ pov, ...(metrics?.length ? { metrics } : {}) }),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to load POV slice");
   }
   return res.json();
 }
@@ -1134,6 +1184,235 @@ export async function addFollowUp(
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error((err as { error?: string }).error || "Follow-up failed");
+  }
+  return res.json();
+}
+
+// ── Planning connections (SAP SAC / mock) ──
+
+export interface AppFeatures {
+  planning_connectors_enabled: boolean;
+}
+
+export async function getAppFeatures(): Promise<AppFeatures> {
+  const res = await apiFetch(`${API_BASE}/api/v1/config/features`);
+  if (!res.ok) throw new Error(`Failed to load app features: ${res.status}`);
+  return res.json();
+}
+
+export interface PlanningConnection {
+  connection_id: string;
+  workspace_id: string;
+  provider: string;
+  name: string;
+  base_url: string;
+  auth_kind: string;
+  auth_public: Record<string, unknown>;
+  status: string;
+  last_test_at: string | null;
+  last_test_ok: boolean | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface PlanningModelSummary {
+  id: string;
+  name: string;
+  description?: string;
+}
+
+export interface PlanningModelMetadata {
+  modelId: string;
+  modelName: string;
+  dimensions: Array<{
+    id: string;
+    name: string;
+    type: string;
+    members: Array<{ id: string; name: string; parentId: string | null; isLeaf: boolean; ordinal: number }>;
+  }>;
+  measures: Array<{ id: string; name: string }>;
+}
+
+export interface ExternalModelSnapshot {
+  snapshot_id: string;
+  connection_id: string;
+  status: string;
+  error: string | null;
+  external_model_name: string;
+  stats: ImportStats;
+  metadata: PlanningModelMetadata | Record<string, unknown>;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface ImportStats {
+  fact_count?: number;
+  dimension_count?: number;
+  measure_count?: number;
+  source_aggregate_count?: number;
+  error_count?: number;
+  warning_count?: number;
+  errors?: string[];
+  warnings?: string[];
+  imported_at?: string;
+  [key: string]: unknown;
+}
+
+export interface ConnectionEvent {
+  event_id?: string;
+  connection_id: string;
+  event_type: string;
+  details?: Record<string, unknown> | null;
+  created_at?: string;
+  timestamp?: string;
+}
+
+export async function listConnections(): Promise<{ connections: PlanningConnection[] }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections`, { headers: authHeaders() });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to list connections");
+  }
+  return res.json();
+}
+
+export async function listImportSnapshots(): Promise<ExternalModelSnapshot[]> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/imports`, { headers: authHeaders() });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to list import snapshots");
+  }
+  const data = await res.json();
+  return Array.isArray(data) ? data : data.snapshots ?? data.imports ?? [];
+}
+
+export async function listConnectionEvents(connectionId: string): Promise<ConnectionEvent[]> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/${connectionId}/events`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to list connection events");
+  }
+  const data = await res.json();
+  return Array.isArray(data) ? data : data.events ?? [];
+}
+
+export async function createConnection(body: {
+  provider: string;
+  name: string;
+  base_url: string;
+  auth_kind: string;
+  auth_public?: Record<string, unknown>;
+  secret: string;
+}): Promise<PlanningConnection> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to create connection");
+  }
+  return res.json();
+}
+
+export async function updateConnection(
+  id: string,
+  body: Partial<{ name: string; base_url: string; auth_kind: string; auth_public: Record<string, unknown>; secret: string }>,
+): Promise<PlanningConnection> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/${id}`, {
+    method: "PUT",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to update connection");
+  }
+  return res.json();
+}
+
+export async function deleteConnection(id: string): Promise<void> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/${id}`, {
+    method: "DELETE",
+    headers: authHeaders(),
+  });
+  if (!res.ok && res.status !== 204) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to delete connection");
+  }
+}
+
+export async function testPlanningConnection(id: string): Promise<{ ok: boolean; message?: string }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/${id}/test`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Connection test failed");
+  }
+  return res.json();
+}
+
+export async function listPlanningModels(connectionId: string): Promise<{ models: PlanningModelSummary[] }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/${connectionId}/models`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to list models");
+  return res.json();
+}
+
+export async function getPlanningModelMetadata(
+  connectionId: string,
+  modelId: string,
+): Promise<PlanningModelMetadata> {
+  const res = await apiFetch(
+    `${API_BASE}/api/v1/connections/${connectionId}/models/${encodeURIComponent(modelId)}/metadata`,
+    { headers: authHeaders() },
+  );
+  if (!res.ok) throw new Error("Failed to load model metadata");
+  return res.json();
+}
+
+export async function importPlanningModel(
+  connectionId: string,
+  modelId: string,
+  factQuery: Record<string, unknown> = {},
+): Promise<{ snapshot_id: string }> {
+  const res = await apiFetch(
+    `${API_BASE}/api/v1/connections/${connectionId}/models/${encodeURIComponent(modelId)}/import`,
+    {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ fact_query: factQuery }),
+    },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Import failed");
+  }
+  return res.json();
+}
+
+export async function getImportStatus(snapshotId: string): Promise<ExternalModelSnapshot> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/imports/${snapshotId}`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) throw new Error("Failed to get import status");
+  return res.json();
+}
+
+export async function refreshImport(snapshotId: string): Promise<{ snapshot_id: string }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/imports/${snapshotId}/refresh`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Refresh failed");
   }
   return res.json();
 }

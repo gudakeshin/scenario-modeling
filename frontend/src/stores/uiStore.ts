@@ -4,13 +4,16 @@ import type {
   PeriodResult,
   FollowUpQuestion,
   OnboardingStatus,
+  DimensionalResultBlock,
 } from "@/lib/api";
 
 export type ChartData = {
+  scenarioId?: string;
   pl: Record<string, number>;
   basePl?: Record<string, number>;
   periods?: PeriodResult[];
   granularity?: "monthly" | "quarterly";
+  dimensional?: DimensionalResultBlock;
 };
 
 export type PeriodData = {
@@ -33,6 +36,9 @@ interface UiState {
   showRoles: boolean;
   showDocuments: boolean;
   showDocManager: boolean;
+  showConnections: boolean;
+  showImportWizard: boolean;
+  importConnectionId: string | null;
 
   preloadedInsight: BusinessInsight | null;
   periodData: PeriodData | null;
@@ -42,6 +48,9 @@ interface UiState {
   refineKey: number;
   isLoading: boolean;
   expandedPanel: string | null;
+
+  dimensionalPov: Record<string, string>;
+  dimensionalMetric: string | null;
 
   setShowReview: (v: boolean) => void;
   setShowComparison: (v: boolean) => void;
@@ -56,6 +65,9 @@ interface UiState {
   setShowRoles: (v: boolean) => void;
   setShowDocuments: (v: boolean) => void;
   setShowDocManager: (v: boolean) => void;
+  setShowConnections: (v: boolean) => void;
+  setShowImportWizard: (v: boolean) => void;
+  setImportConnectionId: (v: string | null) => void;
 
   toggleShowReview: () => void;
   toggleShowComparison: () => void;
@@ -70,6 +82,7 @@ interface UiState {
   toggleShowRoles: () => void;
   toggleShowDocuments: () => void;
   toggleShowDocManager: () => void;
+  toggleShowConnections: () => void;
 
   setPreloadedInsight: (v: BusinessInsight | null) => void;
   setPeriodData: (v: PeriodData | null) => void;
@@ -79,6 +92,8 @@ interface UiState {
   bumpRefineKey: () => void;
   setIsLoading: (v: boolean) => void;
   setExpandedPanel: (v: string | null) => void;
+  setDimensionalPov: (v: Record<string, string>) => void;
+  setDimensionalMetric: (v: string | null) => void;
   closeAllPanels: () => void;
 }
 
@@ -96,6 +111,9 @@ export const useUiStore = create<UiState>((set) => ({
   showRoles: false,
   showDocuments: false,
   showDocManager: false,
+  showConnections: false,
+  showImportWizard: false,
+  importConnectionId: null,
 
   preloadedInsight: null,
   periodData: null,
@@ -105,6 +123,8 @@ export const useUiStore = create<UiState>((set) => ({
   refineKey: 0,
   isLoading: false,
   expandedPanel: null,
+  dimensionalPov: {},
+  dimensionalMetric: null,
 
   setShowReview: (v) => set({ showReview: v }),
   setShowComparison: (v) => set({ showComparison: v }),
@@ -119,6 +139,9 @@ export const useUiStore = create<UiState>((set) => ({
   setShowRoles: (v) => set({ showRoles: v }),
   setShowDocuments: (v) => set({ showDocuments: v }),
   setShowDocManager: (v) => set({ showDocManager: v }),
+  setShowConnections: (v) => set({ showConnections: v }),
+  setShowImportWizard: (v) => set({ showImportWizard: v }),
+  setImportConnectionId: (v) => set({ importConnectionId: v }),
 
   toggleShowReview: () => set((s) => ({ showReview: !s.showReview })),
   toggleShowComparison: () => set((s) => ({ showComparison: !s.showComparison })),
@@ -133,6 +156,7 @@ export const useUiStore = create<UiState>((set) => ({
   toggleShowRoles: () => set((s) => ({ showRoles: !s.showRoles })),
   toggleShowDocuments: () => set((s) => ({ showDocuments: !s.showDocuments })),
   toggleShowDocManager: () => set((s) => ({ showDocManager: !s.showDocManager })),
+  toggleShowConnections: () => set((s) => ({ showConnections: !s.showConnections })),
 
   setPreloadedInsight: (v) => set({ preloadedInsight: v }),
   setPeriodData: (v) => set({ periodData: v }),
@@ -142,6 +166,8 @@ export const useUiStore = create<UiState>((set) => ({
   bumpRefineKey: () => set((s) => ({ refineKey: s.refineKey + 1 })),
   setIsLoading: (v) => set({ isLoading: v }),
   setExpandedPanel: (v) => set({ expandedPanel: v }),
+  setDimensionalPov: (v) => set({ dimensionalPov: v }),
+  setDimensionalMetric: (v) => set({ dimensionalMetric: v }),
 
   closeAllPanels: () =>
     set({
@@ -160,7 +186,12 @@ export const useUiStore = create<UiState>((set) => ({
       showRoles: false,
       showDocuments: false,
       showDocManager: false,
+      showConnections: false,
+      showImportWizard: false,
+      importConnectionId: null,
       pendingQuestions: null,
       expandedPanel: null,
+      dimensionalPov: {},
+      dimensionalMetric: null,
     }),
 }));

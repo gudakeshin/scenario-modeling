@@ -11,10 +11,13 @@
 import { pool } from "../db/index.js";
 import type { EvaluableModel } from "./expression.js";
 import type { MetricType } from "./metricTypes.js";
+import type { DimensionalOverride } from "../models/dimensions.js";
+import { DimensionalModel } from "./dimensionalModel.js";
 import {
   getEvaluableModelForScenario,
   loadScenarioOverrides,
   resolveOverridesToAbsolute,
+  toDimensionalOverrides,
 } from "./modelResolver.js";
 
 export type SwingUnit = "pp" | "relative" | "absolute";
@@ -151,6 +154,97 @@ export function computeTornado(
   };
 }
 
+export function computeTornadoDimensional(
+  model: DimensionalModel,
+  scenarioOverrides: DimensionalOverride[],
+  targetMetric: string,
+  opts: ComputeTornadoOpts = {},
+): { bars: TornadoBar[]; base_metric_value: number; swing_pct: number; percent_swing_pp: number } {
+  const swingPct = opts.swingPct ?? 20;
+  const percentSwingPp = opts.percentSwingPp ?? swingPct / 4;
+  const swing = swingPct / 100;
+  const scenarioResult = model.evaluateDimensional(scenarioOverrides);
+  if (!(targetMetric in scenarioResult.totals)) {
+    throw new SensitivityError(
+      `Unknown target metric '${targetMetric}'. Available metrics: ${model.outputIds.join(", ")}`,
+    );
+  }
+  const baseMetricValue = scenarioResult.totals[targetMetric] ?? 0;
+  const bars: TornadoBar[] = [];
+
+  for (const input of model.inputs) {
+    const inputOverride = scenarioOverrides.find((override) => override.variableId === input.id);
+    const memberScope = inputOverride?.memberScope;
+    const scenarioVal =
+      scenarioResult.valueAt(input.id, memberScope ?? {}) ??
+      scenarioResult.totals[input.id] ??
+      input.base;
+    const mt = inputMetricType(input);
+    let low: number;
+    let high: number;
+    let absoluteStep = false;
+    let swingUnit: SwingUnit = "relative";
+    let stepSize: number | undefined;
+
+    if (scenarioVal === 0) {
+      const step = Math.max(Math.abs(baseMetricValue) * 0.01, 1);
+      low = -step;
+      high = step;
+      absoluteStep = true;
+      swingUnit = "absolute";
+      stepSize = step;
+    } else if (mt === "percent") {
+      low = Math.max(0, scenarioVal - percentSwingPp);
+      high = scenarioVal + percentSwingPp;
+      swingUnit = "pp";
+      stepSize = percentSwingPp;
+    } else if (mt === "ratio") {
+      const absSwing = swingPct / 100;
+      low = scenarioVal - absSwing;
+      high = scenarioVal + absSwing;
+      swingUnit = "absolute";
+      stepSize = absSwing;
+    } else {
+      low = scenarioVal * (1 - swing);
+      high = scenarioVal * (1 + swing);
+    }
+
+    const withoutInput = scenarioOverrides.filter((override) => override.variableId !== input.id);
+    const makeOverride = (value: number): DimensionalOverride => ({
+      variableId: input.id,
+      value,
+      delta_type: "absolute",
+      ...(memberScope ? { memberScope } : {}),
+    });
+    const lowCtx = model.evaluateDimensional([...withoutInput, makeOverride(low)]).totals;
+    const highCtx = model.evaluateDimensional([...withoutInput, makeOverride(high)]).totals;
+    const lowMetric = round2(lowCtx[targetMetric] ?? 0);
+    const highMetric = round2(highCtx[targetMetric] ?? 0);
+
+    bars.push({
+      variable_id: input.id,
+      variable_name: input.name,
+      low_value: lowMetric,
+      high_value: highMetric,
+      base_value: round2(baseMetricValue),
+      low_delta: round2(lowMetric - baseMetricValue),
+      high_delta: round2(highMetric - baseMetricValue),
+      spread: round2(Math.abs(highMetric - lowMetric)),
+      swing_unit: swingUnit,
+      ...(absoluteStep ? { absolute_step: true } : {}),
+      ...(stepSize != null ? { step_size: round2(stepSize) } : {}),
+    });
+  }
+
+  bars.sort((a, b) => b.spread - a.spread);
+  return {
+    bars,
+    base_metric_value: round2(baseMetricValue),
+    swing_pct: swingPct,
+    percent_swing_pp: percentSwingPp,
+  };
+}
+
 export async function runSensitivity(
   scenarioId: string,
   targetMetric = "net_income",
@@ -170,10 +264,16 @@ export async function runSensitivity(
     );
   }
 
-  const computed = computeTornado(model, scenarioAbs, targetMetric, {
-    swingPct,
-    percentSwingPp,
-  });
+  const computed =
+    model.kind === "dimensional" && model instanceof DimensionalModel
+      ? computeTornadoDimensional(model, toDimensionalOverrides(overrides), targetMetric, {
+          swingPct,
+          percentSwingPp,
+        })
+      : computeTornado(model, scenarioAbs, targetMetric, {
+          swingPct,
+          percentSwingPp,
+        });
 
   await pool.query(
     `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'sensitivity', $2)`,

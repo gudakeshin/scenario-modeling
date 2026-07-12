@@ -5,9 +5,11 @@ import {
   getEvaluableModelForScenario,
   loadScenarioOverrides,
   resolveOverridesToAbsolute,
+  toDimensionalOverrides,
   type ResolvedModel,
   type ScenarioOverride,
 } from "./modelResolver.js";
+import { DimensionalModel } from "./dimensionalModel.js";
 import { simulationsRun } from "../metrics.js";
 import { logger } from "../logger.js";
 import {
@@ -39,9 +41,14 @@ export interface SimulationOutput {
   /** Metadata */
   period_count: number;
   granularity: "monthly" | "quarterly";
-  simulation_mode: "formula_dag" | "xlsx_cell_graph";
+  simulation_mode: "formula_dag" | "xlsx_cell_graph" | "external_model";
   absurdity_warnings?: string[];
   notices?: string[];
+  dimensional?: {
+    dimensions: Array<{ id: string; name: string; type: string }>;
+    member_catalog: Record<string, Record<string, string>>;
+    breakdowns: Record<string, Record<string, Record<string, number>>>;
+  };
 }
 
 // ── Time horizon helpers ──
@@ -167,12 +174,130 @@ export async function runSimulation(scenarioId: string): Promise<SimulationOutpu
 async function _runSimulationDispatcher(scenarioId: string): Promise<SimulationOutput> {
   const resolved = await getEvaluableModelForScenario(scenarioId);
   const overrides = await loadScenarioOverrides(scenarioId);
+  if (resolved.source === "external_model") {
+    simulationsRun.inc({ engine: "dimensional" });
+    return _runDimensionalSimulation(scenarioId, resolved, overrides);
+  }
   if (resolved.source === "xlsx_cell_graph") {
     simulationsRun.inc({ engine: "xlsx" });
     return _runXlsxSimulation(scenarioId, resolved, overrides);
   }
   simulationsRun.inc({ engine: "formula" });
   return _runFormulaSimulation(scenarioId, overrides);
+}
+
+// ── External dimensional model path ──
+
+async function _runDimensionalSimulation(
+  scenarioId: string,
+  resolved: ResolvedModel,
+  overrides: ScenarioOverride[],
+): Promise<SimulationOutput> {
+  const model = resolved.model as DimensionalModel;
+  const def = resolved.dimensionalDef!;
+  const dimOverrides = toDimensionalOverrides(overrides);
+
+  const baseResult = model.evaluateDimensional([]);
+  const scenarioResult = model.evaluateDimensional(dimOverrides);
+
+  const pl: Record<string, number> = {};
+  const basePl: Record<string, number> = {};
+  for (const id of model.outputIds) {
+    pl[id] = round2(scenarioResult.totals[id] ?? 0);
+    basePl[id] = round2(baseResult.totals[id] ?? 0);
+  }
+  const variables: Record<string, number> = {};
+  for (const input of model.inputs) {
+    variables[input.id] = round2(scenarioResult.totals[input.id] ?? input.base);
+  }
+
+  // Periods: slice time dimension via valueAt
+  const timeDimId = def.time_dimension_id;
+  const timeDim = timeDimId ? def.dimensions.find((d) => d.id === timeDimId) : undefined;
+  const timeLeaves = timeDim
+    ? timeDim.members.filter((m) => m.isLeaf).sort((a, b) => a.ordinal - b.ordinal)
+    : [];
+
+  const periods: PeriodResult[] = [];
+  if (timeLeaves.length > 0) {
+    for (const leaf of timeLeaves) {
+      const periodPl: Record<string, number> = {};
+      for (const id of model.outputIds) {
+        const v = scenarioResult.valueAt(id, { [timeDimId!]: leaf.id });
+        if (v !== undefined) periodPl[id] = round2(v);
+      }
+      periods.push({
+        period: leaf.name,
+        pl: periodPl,
+        variables: { ...periodPl },
+      });
+    }
+  } else {
+    periods.push({ period: "Total", pl, variables: { ...variables } });
+  }
+
+  // One-level breakdowns per pl_metric per dim
+  const breakdowns: Record<string, Record<string, Record<string, number>>> = {};
+  for (const metricId of model.outputIds) {
+    breakdowns[metricId] = {};
+    for (const dim of def.dimensions) {
+      if (dim.type === "version") continue;
+      const slice: Record<string, number> = {};
+      // Top-level children of roots (or all non-root members at depth 1)
+      const roots = dim.members.filter((m) => !m.parentId);
+      const level1 =
+        roots.length > 0
+          ? dim.members.filter((m) => roots.some((r) => m.parentId === r.id) || roots.includes(m))
+          : dim.members.filter((m) => m.isLeaf);
+      for (const m of level1) {
+        const v = scenarioResult.valueAt(metricId, { [dim.id]: m.id });
+        if (v !== undefined) slice[m.id] = round2(v);
+      }
+      if (Object.keys(slice).length > 0) breakdowns[metricId][dim.id] = slice;
+    }
+  }
+
+  const dimensional = {
+    dimensions: def.dimensions.map((d) => ({ id: d.id, name: d.name, type: d.type })),
+    member_catalog: Object.fromEntries(
+      def.dimensions.map((dimension) => [
+        dimension.id,
+        Object.fromEntries(dimension.members.map((member) => [member.id, member.name])),
+      ]),
+    ),
+    breakdowns,
+  };
+
+  const warnings = absurdityWarnings(basePl, pl);
+  const notices: string[] = [];
+  if (def.build_warnings?.length) {
+    notices.push(...def.build_warnings);
+  }
+
+  const outputData: Record<string, unknown> = {
+    aggregate: pl,
+    base_pl: basePl,
+    periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
+    granularity: def.time_horizon.granularity,
+    period_count: periods.length,
+    simulation_mode: "external_model",
+    dimensional,
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+  };
+  await storeAndComplete(scenarioId, outputData);
+
+  return {
+    pl,
+    variables,
+    periods,
+    period_count: periods.length,
+    granularity: def.time_horizon.granularity,
+    simulation_mode: "external_model",
+    dimensional,
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+  };
 }
 
 // ── XLSX path: real cell-level propagation via HyperFormula ──

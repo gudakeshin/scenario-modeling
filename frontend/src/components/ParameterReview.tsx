@@ -3,12 +3,37 @@
 import { useEffect, useState, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { getParameters, updateParameter, approveScenario, type StoredParameter } from "@/lib/api";
+import type { MemberCatalog } from "@/lib/api";
+import { getMemberName } from "@/lib/dimensionalPov";
 
 interface ParameterReviewProps {
   scenarioId: string;
   onApproved: () => void;
   onClose: () => void;
   onMinimize?: () => void;
+}
+
+export function ScopeBadge({
+  memberScope,
+  memberCatalog,
+}: {
+  memberScope?: Record<string, string> | null;
+  memberCatalog?: MemberCatalog;
+}) {
+  if (!memberScope || Object.keys(memberScope).length === 0) return null;
+  return (
+    <div className="mt-1 flex flex-wrap gap-1" aria-label="Member scope">
+      {Object.entries(memberScope).map(([dimensionId, memberId]) => (
+        <span
+          key={dimensionId}
+          className="rounded-full border border-accent/20 bg-accent/10 px-2 py-0.5 text-[10px] text-accent"
+          title={`${dimensionId}: ${memberId}`}
+        >
+          {dimensionId}: {getMemberName(memberCatalog, dimensionId, memberId)}
+        </span>
+      ))}
+    </div>
+  );
 }
 
 export function ParameterReview({ scenarioId, onApproved, onClose, onMinimize }: ParameterReviewProps) {
@@ -96,6 +121,7 @@ export function ParameterReview({ scenarioId, onApproved, onClose, onMinimize }:
             <div className="flex-1 min-w-0">
               <p className="font-medium truncate text-[var(--text-primary)]">{p.extracted_name}</p>
               <p className="text-xs text-[var(--text-faint)]">{p.mapped_variable_id}</p>
+              <ScopeBadge memberScope={p.member_scope} memberCatalog={p.member_catalog} />
             </div>
             <input
               type="number"

@@ -1,8 +1,8 @@
 /**
  * Model Resolver — one place that answers "what model does this scenario run on?"
  *
- * Returns an EvaluableModel (formula DAG or XLSX HyperFormula runtime), so
- * simulation, Monte Carlo, and sensitivity all evaluate through the same
+ * Returns an EvaluableModel (formula DAG, XLSX HyperFormula, or dimensional),
+ * so simulation, Monte Carlo, and sensitivity all evaluate through the same
  * engine instead of each re-implementing model loading.
  */
 
@@ -11,13 +11,21 @@ import { getModelDefinition } from "../models/registry.js";
 import { CompiledModel, type EvaluableModel, type TypedOverride, type DeltaType } from "./expression.js";
 import { getXlsxRuntime, type XlsxModelSchemaLike } from "./xlsxRuntime.js";
 import type { WorkbookGraph } from "./excelExtractor.js";
+import { DimensionalModel, factsToLeafMap } from "./dimensionalModel.js";
+import {
+  isDimensionalModelDefinition,
+  type DimensionalModelDefinition,
+  type DimensionalOverride,
+} from "../models/dimensions.js";
 
 export interface ResolvedModel {
   model: EvaluableModel;
   /** Where the model came from (for output metadata / debugging). */
-  source: "xlsx_cell_graph" | "formula_dag";
+  source: "xlsx_cell_graph" | "formula_dag" | "external_model";
   documentId?: string;
   modelSchema?: XlsxModelSchemaLike;
+  snapshotId?: string;
+  dimensionalDef?: DimensionalModelDefinition;
 }
 
 export class ModelResolutionError extends Error {
@@ -36,6 +44,13 @@ interface SpreadsheetDocRow {
   validation_status: string | null;
 }
 
+interface ActiveUserModelRow {
+  model_id: string;
+  source_kind: string;
+  snapshot_id: string | null;
+  model_definition: unknown;
+}
+
 async function findSpreadsheetModelDoc(workspaceId: string): Promise<SpreadsheetDocRow | null> {
   const r = await pool.query(
     `SELECT document_id, updated_at, model_schema, workbook_graph, validation_status
@@ -51,24 +66,106 @@ async function findSpreadsheetModelDoc(workspaceId: string): Promise<Spreadsheet
   return (r.rows[0] as SpreadsheetDocRow | undefined) ?? null;
 }
 
+async function findActiveUserModel(workspaceId: string): Promise<ActiveUserModelRow | null> {
+  const r = await pool.query(
+    `SELECT model_id, COALESCE(source_kind, 'documents') AS source_kind, snapshot_id, model_definition
+     FROM user_models
+     WHERE workspace_id = $1 AND is_active = true
+     ORDER BY created_at DESC
+     LIMIT 1`,
+    [workspaceId],
+  );
+  return (r.rows[0] as ActiveUserModelRow | undefined) ?? null;
+}
+
+async function findPinnedUserModel(
+  workspaceId: string,
+  modelId: string | null,
+): Promise<ActiveUserModelRow | null> {
+  if (!modelId) return null;
+  const r = await pool.query(
+    `SELECT model_id, COALESCE(source_kind, 'documents') AS source_kind, snapshot_id, model_definition
+     FROM user_models
+     WHERE workspace_id = $1 AND model_id::text = $2
+     LIMIT 1`,
+    [workspaceId, modelId],
+  );
+  return (r.rows[0] as ActiveUserModelRow | undefined) ?? null;
+}
+
+async function resolveExternalModel(row: ActiveUserModelRow): Promise<ResolvedModel> {
+  if (!row.snapshot_id || row.source_kind !== "external_model") {
+    throw new ModelResolutionError("External model snapshot is missing");
+  }
+  const def = row.model_definition;
+  if (!isDimensionalModelDefinition(def)) {
+    throw new ModelResolutionError(
+      "External model has an invalid dimensional definition. Re-import the planning model.",
+    );
+  }
+  const model = await getDimensionalRuntime(row.snapshot_id, def);
+  return {
+    model,
+    source: "external_model",
+    snapshotId: row.snapshot_id,
+    dimensionalDef: def,
+  };
+}
+
+const dimensionalCache = new Map<string, DimensionalModel>();
+
+async function getDimensionalRuntime(
+  snapshotId: string,
+  def: DimensionalModelDefinition,
+): Promise<DimensionalModel> {
+  const cached = dimensionalCache.get(snapshotId);
+  if (cached) return cached;
+
+  const factsRes = await pool.query(
+    `SELECT measure_id, member_key, value::float AS value
+     FROM external_model_facts WHERE snapshot_id = $1`,
+    [snapshotId],
+  );
+  const leafFacts = factsToLeafMap(factsRes.rows);
+  const model = new DimensionalModel(def, leafFacts);
+  dimensionalCache.set(snapshotId, model);
+  return model;
+}
+
+/** Clear dimensional runtime cache (tests / after refresh). */
+export function clearDimensionalRuntimeCache(snapshotId?: string): void {
+  if (snapshotId) dimensionalCache.delete(snapshotId);
+  else dimensionalCache.clear();
+}
+
 export async function getEvaluableModelForScenario(scenarioId: string): Promise<ResolvedModel> {
   const scenarioRes = await pool.query(
     "SELECT creator_id, workspace_id, model_version_hash FROM scenarios WHERE scenario_id = $1",
     [scenarioId],
   );
   if (scenarioRes.rows.length === 0) throw new ModelResolutionError("Scenario not found", 404);
-  const { creator_id: creatorId, workspace_id: workspaceIdRaw, model_version_hash: modelVersion } = scenarioRes.rows[0];
+  const { creator_id: creatorId, workspace_id: workspaceIdRaw, model_version_hash: modelVersion } =
+    scenarioRes.rows[0];
 
-  // Resolve against the scenario's own workspace — never the caller's active
-  // one — so shared scenarios and multi-workspace users always evaluate on
-  // the document set the scenario was created from. Legacy rows (pre-backfill
-  // NULL) fall back to the creator's default workspace.
   let workspaceId: string | null = workspaceIdRaw;
   if (!workspaceId) {
     const { ensureDefaultWorkspace } = await import("./workspaceService.js");
     workspaceId = await ensureDefaultWorkspace(creatorId);
   }
 
+  // 1. Preserve the external snapshot that the scenario was created against.
+  const pinned = await findPinnedUserModel(workspaceId, modelVersion);
+  if (pinned?.source_kind === "external_model" && pinned.snapshot_id) {
+    return resolveExternalModel(pinned);
+  }
+
+  // 2. Active external planning model wins over spreadsheet / formula DAG.
+  const active = await findActiveUserModel(workspaceId);
+  if (active?.source_kind === "external_model" && active.snapshot_id) {
+    return resolveExternalModel(active);
+  }
+
+  // 3. Validated spreadsheet model document
   const doc = await findSpreadsheetModelDoc(workspaceId);
   if (doc) {
     if (doc.validation_status !== "ready") {
@@ -85,9 +182,15 @@ export async function getEvaluableModelForScenario(scenarioId: string): Promise<
           "Please re-upload the XLSX file and rebuild the model context.",
       );
     }
-    return { model: runtime, source: "xlsx_cell_graph", documentId: doc.document_id, modelSchema: doc.model_schema };
+    return {
+      model: runtime,
+      source: "xlsx_cell_graph",
+      documentId: doc.document_id,
+      modelSchema: doc.model_schema,
+    };
   }
 
+  // 4. Formula DAG from user_models / registry
   const modelDef = await getModelDefinition(modelVersion);
   if (!modelDef) {
     throw new ModelResolutionError("No model found. Please build a model from your documents first.");
@@ -95,24 +198,33 @@ export async function getEvaluableModelForScenario(scenarioId: string): Promise<
   return { model: new CompiledModel(modelDef), source: "formula_dag" };
 }
 
-// ── Scenario overrides (typed deltas) ──
+// ── Scenario overrides (typed deltas + optional member_scope) ──
 
 export interface ScenarioOverride extends TypedOverride {
   variableId: string;
+  memberScope?: Record<string, string> | null;
 }
 
 export async function loadScenarioOverrides(scenarioId: string): Promise<ScenarioOverride[]> {
   const r = await pool.query(
-    `SELECT mapped_variable_id, scenario_value, delta_type
+    `SELECT mapped_variable_id, scenario_value, delta_type, member_scope
      FROM scenario_parameters
      WHERE scenario_id = $1 AND status IN ('pending', 'accepted', 'modified')`,
     [scenarioId],
   );
-  return r.rows.map((row: { mapped_variable_id: string; scenario_value: string; delta_type: string }) => ({
-    variableId: row.mapped_variable_id,
-    value: Number(row.scenario_value),
-    delta_type: (row.delta_type === "percent" ? "percent" : "absolute") as DeltaType,
-  }));
+  return r.rows.map(
+    (row: {
+      mapped_variable_id: string;
+      scenario_value: string;
+      delta_type: string;
+      member_scope: Record<string, string> | null;
+    }) => ({
+      variableId: row.mapped_variable_id,
+      value: Number(row.scenario_value),
+      delta_type: (row.delta_type === "percent" ? "percent" : "absolute") as DeltaType,
+      memberScope: row.member_scope ?? undefined,
+    }),
+  );
 }
 
 /**
@@ -143,4 +255,13 @@ export function resolveOverridesToAbsolute(
     }
   }
   return { absolute, unresolved };
+}
+
+export function toDimensionalOverrides(overrides: ScenarioOverride[]): DimensionalOverride[] {
+  return overrides.map((o) => ({
+    variableId: o.variableId,
+    memberScope: o.memberScope ?? undefined,
+    value: o.value,
+    delta_type: o.delta_type,
+  }));
 }

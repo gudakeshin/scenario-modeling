@@ -1,0 +1,8 @@
+{
+  "value": [
+    { "ID": "NI", "Description": "Net Income", "ParentId": null, "AccountType": "INC", "OrderId": 0 },
+    { "ID": "Revenue", "Description": "Revenue", "ParentId": "NI", "AccountType": "INC", "OrderId": 1 },
+    { "ID": "COGS", "Description": "COGS", "ParentId": "NI", "AccountType": "EXP", "OrderId": 2 }
+  ],
+  "@odata.nextLink": "AccountMasterWithHierarchy?$skiptoken=page2"
+}

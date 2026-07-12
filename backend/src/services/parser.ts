@@ -16,7 +16,14 @@
 
 import { z } from "zod";
 import { getApiKey, callClaudeStructured } from "./llmClient.js";
-import { getWorkspaceModelDefinition, describeModelForLLM, type ModelDefinition } from "../models/registry.js";
+import {
+  getWorkspaceModelDefinition,
+  describeModelForLLM,
+  describeDimensionalModelForLLM,
+  type ModelDefinition,
+} from "../models/registry.js";
+import { isDimensionalModelDefinition, type DimensionalModelDefinition } from "../models/dimensions.js";
+import { pool } from "../db/index.js";
 import { describeContextForLLM } from "./contextEngine.js";
 import type { Scope } from "../middleware/workspace.js";
 import { needsExternalSearch, searchPerplexity, type SearchResult } from "./searchService.js";
@@ -31,6 +38,8 @@ const llmParseResponseSchema = z.object({
     magnitude: z.number().default(0),
     unit: z.string().default("percent"),
     scope: z.record(z.string()).default({}),
+    /** Dimension id → member id for dimensional models (e.g. { region: "emea" }). */
+    member_scope: z.record(z.string()).optional(),
     confidence: z.number().min(0).max(1).default(0.5),
     suggested_variable_id: z.string().optional(),
   })).default([]),
@@ -50,6 +59,7 @@ export interface ParsedParameter {
   magnitude: number;
   unit: string;
   scope: Record<string, string>;
+  member_scope?: Record<string, string>;
   confidence: number;
   suggested_variable_id?: string;
 }
@@ -161,6 +171,35 @@ FOLLOW-UP QUESTIONS:
   return prompt;
 }
 
+async function loadActiveModelRaw(
+  workspaceId: string,
+): Promise<ModelDefinition | DimensionalModelDefinition | null> {
+  const r = await pool.query(
+    `SELECT model_definition FROM user_models
+     WHERE workspace_id = $1 AND is_active = true
+     ORDER BY created_at DESC LIMIT 1`,
+    [workspaceId],
+  );
+  if (r.rows.length === 0) return null;
+  return r.rows[0].model_definition as ModelDefinition | DimensionalModelDefinition;
+}
+
+function sanitizeMemberScope(
+  scope: Record<string, string> | undefined,
+  dimModel: DimensionalModelDefinition,
+): Record<string, string> | undefined {
+  if (!scope || Object.keys(scope).length === 0) return undefined;
+  const out: Record<string, string> = {};
+  for (const [dimId, memberId] of Object.entries(scope)) {
+    const dim = dimModel.dimensions.find((d) => d.id === dimId);
+    if (!dim) continue;
+    if (dim.members.some((m) => m.id === memberId)) {
+      out[dimId] = memberId;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 async function llmParse(
   nlInput: string,
   scope: Scope | undefined,
@@ -170,12 +209,19 @@ async function llmParse(
   if (!getApiKey()) throw new Error("No API key");
   if (!scope) throw new Error("No user — authentication required");
 
-  const model = await getWorkspaceModelDefinition(scope.workspaceId);
-  if (!model) throw new Error("No model — onboarding needed");
+  const rawModel = await loadActiveModelRaw(scope.workspaceId);
+  if (!rawModel) throw new Error("No model — onboarding needed");
 
-  const modelDesc = describeModelForLLM(model);
+  const isDim = isDimensionalModelDefinition(rawModel);
+  const model = isDim ? null : (rawModel as ModelDefinition);
+  const modelDesc = isDim
+    ? describeDimensionalModelForLLM(rawModel)
+    : describeModelForLLM(rawModel as ModelDefinition);
   const contextDesc = await describeContextForLLM(scope);
-  const systemPrompt = buildSystemPrompt(modelDesc, contextDesc);
+  let systemPrompt = buildSystemPrompt(modelDesc, contextDesc);
+  if (isDim) {
+    systemPrompt += `\n\nDIMENSIONAL SCOPE: When the user mentions a geography, product, account, or time member (e.g. "EMEA revenue +10%"), set member_scope to {dimension_id: member_id} using ONLY ids from the catalog above. Map the variable to the measure/input id. Unknown members must be omitted.`;
+  }
 
   let userContent = `Scenario input: "${nlInput}"`;
 
@@ -237,10 +283,18 @@ Do NOT use generic estimates — use the actual numbers from the research.`;
     };
   }
 
+  if (isDim) {
+    for (const p of parsed.parameters) {
+      p.member_scope = sanitizeMemberScope(p.member_scope, rawModel);
+    }
+  }
+
   // Filter out parameters targeting calculated/output variables — only input vars should be overridden
-  if (model && parsed.parameters.length > 0) {
+  if (parsed.parameters.length > 0) {
     const outputVarIds = new Set(
-      model.variables.filter((v) => v.tags?.includes("output")).map((v) => v.id)
+      (isDim ? rawModel.variables : model!.variables)
+        .filter((v) => v.tags?.includes("output"))
+        .map((v) => v.id),
     );
     const before = parsed.parameters.length;
     parsed.parameters = parsed.parameters.filter((p) => {

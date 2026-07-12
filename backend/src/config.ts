@@ -42,6 +42,16 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => v === "1" || v?.toLowerCase() === "true"),
+  ENABLE_PLANNING_CONNECTORS: z
+    .string()
+    .optional()
+    .transform((v) => v === "1" || v?.toLowerCase() === "true"),
+  /** 64 hex chars (32 bytes) for AES-256-GCM; required when ENABLE_PLANNING_CONNECTORS is on. */
+  CREDENTIALS_ENCRYPTION_KEY: z.string().optional(),
+  EXTERNAL_MODEL_MAX_CELLS: z.coerce.number().int().positive().default(500_000),
+  SAC_DEFAULT_PAGE_SIZE: z.coerce.number().int().positive().default(1000),
+  SAC_MAX_FACT_PAGES: z.coerce.number().int().positive().default(10_000),
+  SAC_HTTP_MAX_RETRIES: z.coerce.number().int().nonnegative().default(4),
   AUTH_PROVIDER: z.enum(["local"]).default("local"),
   /** Optional — reserved for future Sentry; see errorReporter.ts (no hard @sentry/node dep yet). */
   SENTRY_DSN: z.string().optional(),
@@ -70,6 +80,15 @@ function loadConfig(): AppConfig {
     console.error("EMBEDDING_PROVIDER=openai requires EMBEDDING_API_URL and EMBEDDING_API_KEY");
     process.exit(1);
   }
+  if (env.ENABLE_PLANNING_CONNECTORS) {
+    const key = env.CREDENTIALS_ENCRYPTION_KEY;
+    if (!key || key.length !== 64 || !/^[0-9a-fA-F]+$/.test(key)) {
+      console.error(
+        "ENABLE_PLANNING_CONNECTORS requires CREDENTIALS_ENCRYPTION_KEY (64 hex characters)",
+      );
+      process.exit(1);
+    }
+  }
   return {
     ...env,
     anthropicModelParse: env.ANTHROPIC_MODEL_PARSE || env.ANTHROPIC_MODEL,
@@ -78,3 +97,10 @@ function loadConfig(): AppConfig {
 }
 
 export const config = loadConfig();
+
+/** Feature gate for planning-system connectors (SAP SAC first). */
+export function isPlanningConnectorsEnabled(): boolean {
+  const fromEnv = process.env.ENABLE_PLANNING_CONNECTORS;
+  if (fromEnv === "1" || fromEnv?.toLowerCase() === "true") return true;
+  return !!config.ENABLE_PLANNING_CONNECTORS;
+}

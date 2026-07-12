@@ -21,7 +21,7 @@ const DEFAULT_MODEL = "claude-haiku-4-5-20251001";
 const REQUEST_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS) || 60_000;
 const MAX_RETRIES = Number(process.env.LLM_MAX_RETRIES) || 3;
 
-export type LlmPurpose = "parse" | "reflection" | "business_analysis" | "qa" | "context_build" | "narrative" | "rag" | "other";
+export type LlmPurpose = "parse" | "reflection" | "business_analysis" | "qa" | "context_build" | "narrative" | "rag" | "connector_map" | "other";
 
 export function getApiKey(): string | undefined {
   return process.env.ANTHROPIC_API_KEY;

@@ -1,4 +1,5 @@
 import { Router } from "express";
+import { z } from "zod";
 import { parseScenario, toTypedDelta } from "../services/parser.js";
 import { resolveToModelVariable } from "../services/mappingService.js";
 import { runSimulation } from "../services/simulationService.js";
@@ -20,7 +21,7 @@ import {
   assertCanWriteScenario,
   scenarioVisibilityClause,
 } from "../services/authzService.js";
-import { getWorkspaceModelId, getWorkspaceModelDefinition } from "../models/registry.js";
+import { getWorkspaceModelId } from "../models/registry.js";
 import { scopeOf } from "../middleware/workspace.js";
 import {
   ensureScenarioContext,
@@ -42,8 +43,19 @@ import {
   updateParameterSchema,
 } from "../schemas/auth.js";
 import { logger } from "../logger.js";
+import {
+  getEvaluableModelForScenario,
+  loadScenarioOverrides,
+  toDimensionalOverrides,
+} from "../services/modelResolver.js";
+import { DimensionalModel } from "../services/dimensionalModel.js";
 
 export const scenariosRouter = Router();
+
+const povSliceSchema = z.object({
+  pov: z.record(z.string().min(1)),
+  metrics: z.array(z.string().min(1)).optional(),
+});
 
 function authzError(e: unknown) {
   return (e as { status?: number }).status;
@@ -57,17 +69,44 @@ function sanitize(s: string): string {
 scenariosRouter.get("/base-case", async (req, res) => {
   try {
     const { computeBaseCase: compute, getPLMetrics: getMetrics } = await import("../models/registry.js");
-    const model = await getWorkspaceModelDefinition(req.workspace!.workspaceId);
-    if (!model) {
+    const { isDimensionalModelDefinition } = await import("../models/dimensions.js");
+    const { pool } = await import("../db/index.js");
+    const { DimensionalModel, factsToLeafMap } = await import("../services/dimensionalModel.js");
+
+    const r = await pool.query(
+      `SELECT model_definition, source_kind, snapshot_id FROM user_models
+       WHERE workspace_id = $1 AND is_active = true
+       ORDER BY created_at DESC LIMIT 1`,
+      [req.workspace!.workspaceId],
+    );
+    if (r.rows.length === 0) {
       return res.json({ pl: {}, all_variables: {}, time_horizon: null, needs_onboarding: true });
     }
-    const baseValues = await compute(model);
-    const plMetrics = getMetrics(model);
+    const row = r.rows[0];
+    const model = row.model_definition;
+
+    let baseValues: Record<string, number>;
+    let plMetrics: string[];
+    const timeHorizon = model.time_horizon;
+
+    if (row.source_kind === "external_model" && isDimensionalModelDefinition(model) && row.snapshot_id) {
+      const factsRes = await pool.query(
+        `SELECT measure_id, member_key, value::float AS value FROM external_model_facts WHERE snapshot_id = $1`,
+        [row.snapshot_id],
+      );
+      const dm = new DimensionalModel(model, factsToLeafMap(factsRes.rows));
+      baseValues = dm.baseValues();
+      plMetrics = dm.outputIds;
+    } else {
+      baseValues = await compute(model);
+      plMetrics = getMetrics(model);
+    }
+
     const pl: Record<string, number> = {};
     for (const id of plMetrics) {
       if (id in baseValues) pl[id] = Math.round(baseValues[id] * 100) / 100;
     }
-    return res.json({ pl, all_variables: baseValues, time_horizon: model.time_horizon });
+    return res.json({ pl, all_variables: baseValues, time_horizon: timeHorizon });
   } catch (e) {
     logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to compute base case" });
@@ -168,9 +207,17 @@ scenariosRouter.post("/", requireRole("analyst"), validateBody(createScenarioSch
         confidence: p.confidence,
       });
       await pool.query(
-        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-        [scenarioId, p.name, variableId, scenarioValue, deltaType, p.confidence]
+        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status, member_scope)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)`,
+        [
+          scenarioId,
+          p.name,
+          variableId,
+          scenarioValue,
+          deltaType,
+          p.confidence,
+          p.member_scope ? JSON.stringify(p.member_scope) : null,
+        ]
       );
     }
     mergeTouchedLevers(
@@ -266,9 +313,17 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
       const { value: scenarioValue, delta_type: deltaType } = toTypedDelta(p);
       paramsWithMapping.push({ name: p.name, mapped_variable_id: variableId, scenario_value: scenarioValue, confidence: p.confidence });
       await pool.query(
-        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status)
-         VALUES ($1, $2, $3, $4, $5, $6, 'pending')`,
-        [sid, p.name, variableId, scenarioValue, deltaType, p.confidence]
+        `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status, member_scope)
+         VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)`,
+        [
+          sid,
+          p.name,
+          variableId,
+          scenarioValue,
+          deltaType,
+          p.confidence,
+          p.member_scope ? JSON.stringify(p.member_scope) : null,
+        ]
       );
     }
     mergeTouchedLevers(
@@ -345,7 +400,8 @@ scenariosRouter.get("/:id/parameters", async (req, res) => {
   try {
     await assertCanReadScenario(req.user!.userId, req.user!.role, req.params.id);
     const r = await pool.query(
-      `SELECT parameter_id, extracted_name, mapped_variable_id, base_value, scenario_value, confidence_score, status
+      `SELECT parameter_id, extracted_name, mapped_variable_id, base_value, scenario_value,
+              delta_type, member_scope, confidence_score, status
        FROM scenario_parameters WHERE scenario_id = $1 ORDER BY created_at`,
       [req.params.id]
     );
@@ -355,6 +411,115 @@ scenariosRouter.get("/:id/parameters", async (req, res) => {
     if (status) return res.status(status).json({ error: (e as Error).message });
     logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to get parameters" });
+  }
+});
+
+scenariosRouter.post("/:id/pov-slice", validateBody(povSliceSchema), async (req, res) => {
+  try {
+    const scenarioId = req.params.id;
+    await assertCanReadScenario(req.user!.userId, req.user!.role, scenarioId);
+    const scenario = await pool.query(
+      "SELECT status FROM scenarios WHERE scenario_id = $1",
+      [scenarioId],
+    );
+    if (scenario.rows.length === 0) return res.status(404).json({ error: "Scenario not found" });
+    if (scenario.rows[0].status !== "completed") {
+      return res.status(409).json({ error: "Scenario must be completed before requesting a POV slice" });
+    }
+
+    const resolved = await getEvaluableModelForScenario(scenarioId);
+    if (resolved.source !== "external_model" || !(resolved.model instanceof DimensionalModel)) {
+      return res.status(422).json({ error: "POV slices require a dimensional external model" });
+    }
+    const def = resolved.dimensionalDef!;
+    const { pov, metrics: requestedMetrics } = req.body as z.infer<typeof povSliceSchema>;
+    for (const [dimensionId, memberId] of Object.entries(pov)) {
+      const dimension = def.dimensions.find((item) => item.id === dimensionId);
+      if (!dimension || !dimension.members.some((member) => member.id === memberId)) {
+        return res.status(400).json({
+          error: `Unknown POV member '${memberId}' for dimension '${dimensionId}'`,
+        });
+      }
+    }
+    const metrics = requestedMetrics ?? resolved.model.outputIds;
+    const unknownMetrics = metrics.filter((metric) => !resolved.model.outputIds.includes(metric));
+    if (unknownMetrics.length > 0) {
+      return res.status(400).json({ error: `Unknown metrics: ${unknownMetrics.join(", ")}` });
+    }
+
+    const overrides = toDimensionalOverrides(await loadScenarioOverrides(scenarioId));
+    const result = resolved.model.evaluateDimensional(overrides);
+    const pl = Object.fromEntries(
+      metrics.map((metric) => [metric, Math.round((result.valueAt(metric, pov) ?? 0) * 100) / 100]),
+    );
+
+    const timeDimensionId = def.time_dimension_id;
+    let periods:
+      | Array<{ period: string; member_id: string; pl: Record<string, number> }>
+      | undefined;
+    if (timeDimensionId) {
+      const timeDimension = def.dimensions.find((dimension) => dimension.id === timeDimensionId);
+      if (timeDimension) {
+        const selected = pov[timeDimensionId];
+        const included = new Set<string>();
+        if (selected) {
+          const stack = [selected];
+          while (stack.length > 0) {
+            const current = stack.pop()!;
+            const children = timeDimension.members.filter((member) => member.parentId === current);
+            if (children.length === 0) included.add(current);
+            else stack.push(...children.map((member) => member.id));
+          }
+        }
+        const leaves = timeDimension.members
+          .filter((member) => member.isLeaf && (!selected || included.has(member.id)))
+          .sort((a, b) => a.ordinal - b.ordinal);
+        periods = leaves.map((member) => ({
+          period: member.name,
+          member_id: member.id,
+          pl: Object.fromEntries(
+            metrics.map((metric) => [
+              metric,
+              Math.round(
+                (result.valueAt(metric, { ...pov, [timeDimensionId]: member.id }) ?? 0) * 100,
+              ) / 100,
+            ]),
+          ),
+        }));
+      }
+    }
+
+    const breakdowns: Record<string, Record<string, Record<string, number>>> = {};
+    for (const metric of metrics) {
+      breakdowns[metric] = {};
+      for (const dimension of def.dimensions) {
+        if (dimension.type === "version") continue;
+        const selected = pov[dimension.id];
+        const roots = dimension.members.filter((member) => !member.parentId);
+        const members = selected
+          ? dimension.members.filter((member) => member.id === selected)
+          : dimension.members.filter(
+              (member) =>
+                roots.includes(member) || roots.some((root) => member.parentId === root.id),
+            );
+        const values = Object.fromEntries(
+          members.map((member) => [
+            member.id,
+            Math.round(
+              (result.valueAt(metric, { ...pov, [dimension.id]: member.id }) ?? 0) * 100,
+            ) / 100,
+          ]),
+        );
+        if (Object.keys(values).length > 0) breakdowns[metric][dimension.id] = values;
+      }
+    }
+
+    return res.json({ pl, ...(periods ? { periods } : {}), dimensional: { breakdowns } });
+  } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "POV slice failed");
+    return res.status(500).json({ error: "Failed to compute POV slice" });
   }
 });
 

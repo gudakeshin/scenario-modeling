@@ -19,8 +19,11 @@ import {
   getEvaluableModelForScenario,
   loadScenarioOverrides,
   resolveOverridesToAbsolute,
+  toDimensionalOverrides,
 } from "./modelResolver.js";
 import type { DeltaType, EvaluableModel, ModelInput } from "./expression.js";
+import type { DimensionalOverride } from "../models/dimensions.js";
+import { DimensionalModel } from "./dimensionalModel.js";
 import {
   mulberry32,
   randomSeed,
@@ -233,6 +236,10 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
   // Deterministic scenario overrides applied to every iteration
   const overrides = await loadScenarioOverrides(config.scenario_id);
   const { absolute: deterministicAbs } = resolveOverridesToAbsolute(model, overrides);
+  const dimensional = resolved.source === "external_model" && model instanceof DimensionalModel;
+  const scenarioScopeByVariable = new Map(
+    overrides.map((override) => [override.variableId, override.memberScope ?? undefined]),
+  );
 
   const inputBaseById = new Map(model.inputs.map((i) => [i.id, i.base]));
   const inputById = new Map(model.inputs.map((i) => [i.id, i]));
@@ -303,10 +310,17 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
   const startedAt = Date.now();
   let completed = 0;
   const correlatedSet = new Set(correlated?.order ?? []);
+  const sampledVariableIds = new Set(dists.map((dist) => dist.variable_id));
+  const baseDimensionalOverrides = dimensional
+    ? toDimensionalOverrides(overrides).filter(
+        (override) => !sampledVariableIds.has(override.variableId),
+      )
+    : [];
 
   monteCarloIterations.inc(requestedIterations);
   for (let i = 0; i < requestedIterations; i++) {
     const absVals: Record<string, number> = { ...deterministicAbs };
+    const sampledDimensionalOverrides: DimensionalOverride[] = [];
 
     // Correlated block first (consumes one normal draw per correlated var)
     if (correlated) {
@@ -316,17 +330,46 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
         let zc = 0;
         for (let k = 0; k <= r; k++) zc += L[r][k] * z[k];
         const dist = dists.find((d) => d.variable_id === order[r])!;
-        applySampled(absVals, dist, transformNormalDraw(zc, dist), inputBaseById, notices, inputById, clampCounts);
+        const sampled = transformNormalDraw(zc, dist);
+        if (dimensional) {
+          applySampledDimensional(
+            sampledDimensionalOverrides,
+            dist,
+            sampled,
+            scenarioScopeByVariable.get(dist.variable_id),
+            inputById,
+            clampCounts,
+          );
+        } else {
+          applySampled(absVals, dist, sampled, inputBaseById, notices, inputById, clampCounts);
+        }
       }
     }
 
     // Independent distributions
     for (const dist of dists) {
       if (correlatedSet.has(dist.variable_id)) continue;
-      applySampled(absVals, dist, sampleDistribution(rng, dist), inputBaseById, notices, inputById, clampCounts);
+      const sampled = sampleDistribution(rng, dist);
+      if (dimensional) {
+        applySampledDimensional(
+          sampledDimensionalOverrides,
+          dist,
+          sampled,
+          scenarioScopeByVariable.get(dist.variable_id),
+          inputById,
+          clampCounts,
+        );
+      } else {
+        applySampled(absVals, dist, sampled, inputBaseById, notices, inputById, clampCounts);
+      }
     }
 
-    const out = model.evaluate(absVals);
+    const out = dimensional
+      ? model.evaluateDimensional([
+          ...baseDimensionalOverrides,
+          ...sampledDimensionalOverrides,
+        ]).totals
+      : model.evaluate(absVals);
     for (const m of outputIds) {
       results[m].push(round2(out[m] ?? 0));
     }
@@ -475,6 +518,34 @@ export function applySampled(
   }
 
   absVals[dist.variable_id] = absolute;
+}
+
+function applySampledDimensional(
+  overrides: DimensionalOverride[],
+  dist: DistributionConfig,
+  sampled: number,
+  memberScope: Record<string, string> | undefined,
+  inputById?: Map<string, ModelInput>,
+  clampCounts?: Map<string, number>,
+): void {
+  const deltaType: DeltaType = dist.delta_type ?? "percent";
+  let value = sampled;
+  const mt = inputById?.get(dist.variable_id)?.metricType;
+  const shouldTruncate =
+    dist.truncate_at_zero === true ||
+    (dist.truncate_at_zero !== false &&
+      deltaType === "absolute" &&
+      (mt === "currency" || mt === "volume" || mt === "count"));
+  if (shouldTruncate && value < 0) {
+    value = 0;
+    clampCounts?.set(dist.variable_id, (clampCounts.get(dist.variable_id) ?? 0) + 1);
+  }
+  overrides.push({
+    variableId: dist.variable_id,
+    value,
+    delta_type: deltaType,
+    ...(memberScope ? { memberScope } : {}),
+  });
 }
 
 /**
