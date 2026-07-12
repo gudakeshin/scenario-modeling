@@ -10,9 +10,9 @@
     "db:migrate": "node-pg-migrate up --tsx --envPath .env",
     "db:migrate:down": "node-pg-migrate down --tsx --envPath .env",
     "db:seed": "tsx scripts/seed-dev.ts",
-    "test": "npm run build && NODE_ENV=test node --test --test-force-exit dist/services/parser.test.js dist/services/xlsxStructural.test.js dist/services/xlsxSimulation.test.js dist/tests/authz.test.js dist/tests/workspaces.test.js",
+    "test": "npm run build && NODE_ENV=test node --test --test-force-exit dist/services/parser.test.js dist/services/xlsxStructural.test.js dist/services/xlsxSimulation.test.js dist/services/metricTypes.test.js dist/services/simulationAggregation.test.js dist/services/contextEngine.test.js dist/services/modelValidation.test.js dist/services/sensitivity.test.js dist/services/monteCarloDefaults.test.js dist/services/basePl.test.js dist/tests/authz.test.js dist/tests/workspaces.test.js",
     "test:e2e": "npm run build && NODE_ENV=test node --test --test-force-exit dist/tests/e2e.test.js",
-    "test:all": "npm run build && NODE_ENV=test node --test --test-force-exit dist/services/parser.test.js dist/services/xlsxStructural.test.js dist/services/xlsxSimulation.test.js dist/tests/authz.test.js dist/tests/workspaces.test.js dist/tests/e2e.test.js",
+    "test:all": "npm run build && NODE_ENV=test node --test --test-force-exit dist/services/parser.test.js dist/services/xlsxStructural.test.js dist/services/xlsxSimulation.test.js dist/services/metricTypes.test.js dist/services/simulationAggregation.test.js dist/services/contextEngine.test.js dist/services/modelValidation.test.js dist/services/sensitivity.test.js dist/services/monteCarloDefaults.test.js dist/services/basePl.test.js dist/tests/authz.test.js dist/tests/workspaces.test.js dist/tests/e2e.test.js",
     "lint": "eslint src"
   },
   "dependencies": {

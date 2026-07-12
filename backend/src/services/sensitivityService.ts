@@ -1,44 +1,53 @@
 /**
  * Sensitivity Analysis / Tornado Chart Service
  *
- * One-at-a-time perturbation: each input is swung ±X% around its value in
- * the SCENARIO being analyzed (base + the scenario's own parameter
- * overrides — previously the overrides were loaded but never applied, so
- * the tornado was always centered on the model base instead).
+ * One-at-a-time perturbation: each input is swung around its value in
+ * the SCENARIO being analyzed (base + scenario parameter overrides).
  *
- * Inputs whose scenario value is exactly 0 are perturbed by an absolute
- * step instead of being skipped, and are annotated as such.
+ * Percent inputs swing in percentage points; ratio inputs use absolute
+ * swings; currency/count/volume use relative ±swing%.
  */
 
 import { pool } from "../db/index.js";
+import type { EvaluableModel } from "./expression.js";
+import type { MetricType } from "./metricTypes.js";
 import {
   getEvaluableModelForScenario,
   loadScenarioOverrides,
   resolveOverridesToAbsolute,
 } from "./modelResolver.js";
 
+export type SwingUnit = "pp" | "relative" | "absolute";
+
 export interface TornadoBar {
   variable_id: string;
   variable_name: string;
-  low_value: number;    // metric value when variable is at -swing%
-  high_value: number;   // metric value when variable is at +swing%
-  base_value: number;   // metric value at the scenario baseline
-  low_delta: number;    // low_value - base_value
-  high_delta: number;   // high_value - base_value
-  spread: number;       // |high_value - low_value|
+  low_value: number;
+  high_value: number;
+  base_value: number;
+  low_delta: number;
+  high_delta: number;
+  spread: number;
   /** True when the input's scenario value was 0 and an absolute step was used. */
   absolute_step?: boolean;
+  swing_unit?: SwingUnit;
+  step_size?: number;
 }
 
 export interface SensitivityResult {
   target_metric: string;
   swing_pct: number;
-  /** Metric value at the scenario baseline (scenario overrides applied). */
+  percent_swing_pp?: number;
   base_metric_value: number;
-  /** Overrides from the scenario were applied before perturbation. */
   scenario_applied: boolean;
   bars: TornadoBar[];
   notices?: string[];
+}
+
+export interface ComputeTornadoOpts {
+  swingPct?: number;
+  /** Percentage-point swing for percent-type inputs. Default: swingPct / 4. */
+  percentSwingPp?: number;
 }
 
 class SensitivityError extends Error {
@@ -49,19 +58,24 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-export async function runSensitivity(
-  scenarioId: string,
-  targetMetric = "net_income",
-  swingPct = 20
-): Promise<SensitivityResult> {
-  const resolved = await getEvaluableModelForScenario(scenarioId);
-  const model = resolved.model;
+function inputMetricType(input: { id: string; metricType?: MetricType }): MetricType {
+  return input.metricType ?? "unknown";
+}
 
-  // Scenario baseline: model base + the scenario's own overrides
-  const overrides = await loadScenarioOverrides(scenarioId);
-  const { absolute: scenarioAbs, unresolved } = resolveOverridesToAbsolute(model, overrides);
+/**
+ * Pure tornado computation — no Postgres. Exported for unit tests.
+ */
+export function computeTornado(
+  model: EvaluableModel,
+  scenarioAbs: Record<string, number>,
+  targetMetric: string,
+  opts: ComputeTornadoOpts = {},
+): { bars: TornadoBar[]; base_metric_value: number; swing_pct: number; percent_swing_pp: number } {
+  const swingPct = opts.swingPct ?? 20;
+  const percentSwingPp = opts.percentSwingPp ?? swingPct / 4;
+  const swing = swingPct / 100;
+
   const scenarioCtx = model.evaluate(scenarioAbs);
-
   if (!(targetMetric in scenarioCtx)) {
     throw new SensitivityError(
       `Unknown target metric '${targetMetric}'. Available metrics: ${model.outputIds.join(", ")}`,
@@ -70,31 +84,40 @@ export async function runSensitivity(
   const baseMetricValue = scenarioCtx[targetMetric] ?? 0;
 
   const bars: TornadoBar[] = [];
-  const swing = swingPct / 100;
-  const notices: string[] = [];
-  if (unresolved.length > 0) {
-    notices.push(
-      `Percent overrides for ${unresolved.join(", ")} could not be applied (no non-zero base value).`,
-    );
-  }
 
   for (const input of model.inputs) {
-    // The input's value in the scenario (override if present, else base)
     const scenarioVal = scenarioAbs[input.id] ?? input.base;
+    const mt = inputMetricType(input);
 
     let low: number;
     let high: number;
     let absoluteStep = false;
+    let swingUnit: SwingUnit = "relative";
+    let stepSize: number | undefined;
+
     if (scenarioVal === 0) {
-      // Zero baseline: swing by an absolute step derived from the model
-      // base (or ±1.0 as a last resort) instead of dropping the driver.
-      const step = Math.abs(input.base) > 0 ? Math.abs(input.base) * swing : swing * 5;
+      const step = Math.max(Math.abs(baseMetricValue) * 0.01, 1);
       low = -step;
       high = step;
       absoluteStep = true;
+      swingUnit = "absolute";
+      stepSize = step;
+    } else if (mt === "percent") {
+      // Percentage points (default 20% relative → ±5pp)
+      low = Math.max(0, scenarioVal - percentSwingPp);
+      high = scenarioVal + percentSwingPp;
+      swingUnit = "pp";
+      stepSize = percentSwingPp;
+    } else if (mt === "ratio") {
+      const absSwing = (swingPct / 100) * 1.0;
+      low = scenarioVal - absSwing;
+      high = scenarioVal + absSwing;
+      swingUnit = "absolute";
+      stepSize = absSwing;
     } else {
       low = scenarioVal * (1 - swing);
       high = scenarioVal * (1 + swing);
+      swingUnit = "relative";
     }
 
     const lowCtx = model.evaluate({ ...scenarioAbs, [input.id]: low });
@@ -112,31 +135,65 @@ export async function runSensitivity(
       low_delta: round2(lowMetric - baseMetricValue),
       high_delta: round2(highMetric - baseMetricValue),
       spread: round2(Math.abs(highMetric - lowMetric)),
+      swing_unit: swingUnit,
       ...(absoluteStep ? { absolute_step: true } : {}),
+      ...(stepSize != null ? { step_size: round2(stepSize) } : {}),
     });
   }
 
-  // Sort by spread descending (widest impact first)
   bars.sort((a, b) => b.spread - a.spread);
 
-  // Store result
+  return {
+    bars,
+    base_metric_value: round2(baseMetricValue),
+    swing_pct: swingPct,
+    percent_swing_pp: percentSwingPp,
+  };
+}
+
+export async function runSensitivity(
+  scenarioId: string,
+  targetMetric = "net_income",
+  swingPct = 20,
+  percentSwingPp?: number,
+): Promise<SensitivityResult> {
+  const resolved = await getEvaluableModelForScenario(scenarioId);
+  const model = resolved.model;
+
+  const overrides = await loadScenarioOverrides(scenarioId);
+  const { absolute: scenarioAbs, unresolved } = resolveOverridesToAbsolute(model, overrides);
+
+  const notices: string[] = [];
+  if (unresolved.length > 0) {
+    notices.push(
+      `Percent overrides for ${unresolved.join(", ")} could not be applied (no non-zero base value).`,
+    );
+  }
+
+  const computed = computeTornado(model, scenarioAbs, targetMetric, {
+    swingPct,
+    percentSwingPp,
+  });
+
   await pool.query(
     `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'sensitivity', $2)`,
     [scenarioId, JSON.stringify({
       target_metric: targetMetric,
-      swing_pct: swingPct,
+      swing_pct: computed.swing_pct,
+      percent_swing_pp: computed.percent_swing_pp,
       scenario_applied: true,
-      bars,
+      bars: computed.bars,
       ...(notices.length > 0 ? { notices } : {}),
-    })]
+    })],
   );
 
   return {
     target_metric: targetMetric,
-    swing_pct: swingPct,
-    base_metric_value: round2(baseMetricValue),
+    swing_pct: computed.swing_pct,
+    percent_swing_pp: computed.percent_swing_pp,
+    base_metric_value: computed.base_metric_value,
     scenario_applied: true,
-    bars,
+    bars: computed.bars,
     ...(notices.length > 0 ? { notices } : {}),
   };
 }

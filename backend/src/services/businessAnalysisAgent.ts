@@ -17,7 +17,6 @@
 import { z } from "zod";
 import { getApiKey, callClaudeStructured } from "./llmClient.js";
 import { pool } from "../db/index.js";
-import { computeBaseCase } from "../models/registry.js";
 import { logger } from "../logger.js";
 
 // ── Types ──
@@ -130,12 +129,9 @@ async function loadAnalysisContext(scenarioId: string): Promise<AnalysisContext>
   const modelRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
   const modelHash = modelRef.rows[0]?.model_version_hash;
   const { getModelDefinition: getModel } = await import("../models/registry.js");
+  const { resolveBasePl } = await import("./basePl.js");
   const model = await getModel(modelHash);
-  const baseCtx = model ? await computeBaseCase(model) : {};
-  const base_pl: Record<string, number> = {};
-  for (const [k, v] of Object.entries(baseCtx)) {
-    base_pl[k] = Math.round(v * 100) / 100;
-  }
+  const base_pl = await resolveBasePl(rawPl, model);
 
   const currency_symbol = await getCurrencyFromContext(scenarioId);
 

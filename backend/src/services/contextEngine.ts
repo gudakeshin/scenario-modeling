@@ -13,9 +13,12 @@ import { z } from "zod";
 import { config } from "../config.js";
 import { pool, resolveUserId } from "../db/index.js";
 import { callClaudeStructured, getApiKey } from "./llmClient.js";
-import type { ModelDefinition } from "../models/registry.js";
+import type { ModelDefinition, ModelVariable } from "../models/registry.js";
 import type { Scope } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
+import { CompiledModel } from "./expression.js";
+import { inferMetricTypeFromId, type MetricType, type VariableProvenance } from "./metricTypes.js";
+import { crossFootExtractedPL, type TieOutVariance } from "./modelValidation.js";
 
 const financialMetricSchema = z.object({
   name: z.string(),
@@ -71,6 +74,10 @@ export interface ContextData {
   competitive_landscape: string;
   key_risks: string[];
   benchmarks: Record<string, string>;
+  /** Surfaced on GET /context — assumed zeros, tie-outs, tax rewrite notices. */
+  model_warnings?: string[];
+  tie_out_variances?: TieOutVariance[];
+  tie_out_status?: "ok" | "variances";
 }
 
 export interface HeaderMappingSuggestion {
@@ -186,6 +193,7 @@ CRITICAL RULES FOR VALUE EXTRACTION:
 4. Extract from the DETAILED P&L LINE ITEMS — look for rows like "TOTAL REVENUE FROM OPERATIONS", "TOTAL COST OF REVENUE", "GROSS PROFIT", "TOTAL OPERATING EXPENSES", "EBITDA", "EBIT", "TOTAL OTHER INCOME", "TOTAL FINANCE COSTS", "PROFIT BEFORE TAX", "TOTAL TAX EXPENSE", "PROFIT AFTER TAX / NET INCOME".
 5. Do NOT extract from summary ratio tables or key metrics sections — use the ACTUAL income statement figures.
 6. Build a complete P&L hierarchy: Revenue → Cost of Revenue → Gross Profit → Operating Expenses → EBITDA → EBIT → Other Income → Finance Costs → PBT → Tax → Net Income.
+   CONVENTION: operating_expenses EXCLUDES depreciation & amortization. EBITDA = gross_profit − operating_expenses; EBIT = EBITDA − depreciation_amortization.
 7. For sub-totals, use the document's stated total, not your own calculation.
 8. IMPORTANT for multi-tab Excel files: review ALL relevant tabs/sheets (P&L, assumptions, product hierarchy, headcount, volumes), not just the first sheet.
 9. Classify non-financial operational metrics correctly: headcount and volumes are NOT currency.
@@ -275,6 +283,21 @@ Rules for financial_metrics:
   // 5. Generate and store a dynamic model definition
   const modelDef = buildModelFromContext(contextData);
 
+  // Cross-foot extracted P&L against repaired formulas (warn only)
+  const tieOuts = crossFootExtractedPL(contextData.financial_metrics);
+  const buildWarnings = [...(modelDef.build_warnings ?? [])];
+  for (const v of tieOuts) buildWarnings.push(v.message);
+  modelDef.build_warnings = buildWarnings.length > 0 ? buildWarnings : undefined;
+
+  contextData.model_warnings = modelDef.build_warnings;
+  contextData.tie_out_variances = tieOuts.length > 0 ? tieOuts : undefined;
+  contextData.tie_out_status = tieOuts.length > 0 ? "variances" : "ok";
+
+  await pool.query(
+    "UPDATE company_context SET context_data = $1, updated_at = NOW() WHERE context_id = $2",
+    [JSON.stringify(contextData), ctx.context_id],
+  );
+
   // Deactivate existing models
   await pool.query("UPDATE user_models SET is_active = false WHERE workspace_id = $1 AND is_active = true", [workspaceId]);
 
@@ -341,6 +364,17 @@ function isNumericFormula(formula: string | undefined): boolean {
   return /^-?\d+(\.\d+)?$/.test(formula.trim());
 }
 
+/**
+ * Canonical P&L identities for formula repair.
+ *
+ * Convention: operating_expenses EXCLUDES depreciation & amortization.
+ *   EBITDA = gross_profit − operating_expenses
+ *   EBIT   = EBITDA − depreciation_amortization
+ *   PBT    = EBIT − finance_costs + other_income
+ *   NI     = PBT − tax_expense
+ *
+ * When D&A is absent, degraded fallbacks treat EBIT ≈ EBITDA and emit a build warning.
+ */
 const KNOWN_CALCULATED_FORMULAS: Record<string, { deps: string[]; formula: string }[]> = {
   cost_of_revenue: [
     { deps: ["employee_benefits_delivery", "subcontracting_costs", "travel_costs_delivery", "software_licenses_tools", "hosting_cloud_infrastructure"], formula: "employee_benefits_delivery + subcontracting_costs + travel_costs_delivery + software_licenses_tools + hosting_cloud_infrastructure" },
@@ -354,30 +388,43 @@ const KNOWN_CALCULATED_FORMULAS: Record<string, { deps: string[]; formula: strin
     { deps: ["revenue", "direct_costs"], formula: "revenue - direct_costs" },
   ],
   operating_income: [
+    { deps: ["ebitda", "depreciation_amortization"], formula: "ebitda - depreciation_amortization" },
+    { deps: ["ebit"], formula: "ebit" },
+    { deps: ["gross_profit", "operating_expenses", "depreciation_amortization"], formula: "gross_profit - operating_expenses - depreciation_amortization" },
+    { deps: ["gross_profit", "operating_expenses"], formula: "gross_profit - operating_expenses" },
+    { deps: ["gross_profit", "opex"], formula: "gross_profit - opex" },
+  ],
+  // Preferred: EBIT = EBITDA − D&A. Do NOT use gross_profit − opex (that is EBITDA).
+  ebit: [
+    { deps: ["ebitda", "depreciation_amortization"], formula: "ebitda - depreciation_amortization" },
+    { deps: ["ebitda", "depreciation"], formula: "ebitda - depreciation" },
+    { deps: ["gross_profit", "operating_expenses", "depreciation_amortization"], formula: "gross_profit - operating_expenses - depreciation_amortization" },
+    { deps: ["operating_income"], formula: "operating_income" },
+    // Degraded fallback when D&A missing — EBIT treated equal to EBITDA
+    { deps: ["ebitda"], formula: "ebitda" },
+    { deps: ["gross_profit", "operating_expenses"], formula: "gross_profit - operating_expenses" },
+  ],
+  // Preferred: EBITDA = GP − opex (opex excludes D&A).
+  ebitda: [
     { deps: ["gross_profit", "operating_expenses"], formula: "gross_profit - operating_expenses" },
     { deps: ["gross_profit", "opex"], formula: "gross_profit - opex" },
     { deps: ["revenue", "cogs", "operating_expenses"], formula: "revenue - cogs - operating_expenses" },
-  ],
-  ebit: [
-    { deps: ["gross_profit", "operating_expenses"], formula: "gross_profit - operating_expenses" },
-    { deps: ["operating_income"], formula: "operating_income" },
-    { deps: ["ebitda", "depreciation_amortization"], formula: "ebitda - depreciation_amortization" },
-  ],
-  ebitda: [
+    { deps: ["revenue", "cost_of_revenue", "operating_expenses"], formula: "revenue - cost_of_revenue - operating_expenses" },
     { deps: ["ebit", "depreciation_amortization"], formula: "ebit + depreciation_amortization" },
-    { deps: ["gross_profit", "operating_expenses", "depreciation_amortization"], formula: "gross_profit - operating_expenses + depreciation_amortization" },
-    { deps: ["operating_income", "depreciation", "amortization"], formula: "operating_income + depreciation + amortization" },
     { deps: ["operating_income", "depreciation_amortization"], formula: "operating_income + depreciation_amortization" },
-    { deps: ["revenue", "cogs", "operating_expenses"], formula: "revenue - cogs - operating_expenses" },
-    { deps: ["gross_profit", "operating_expenses"], formula: "gross_profit - operating_expenses" },
+    { deps: ["operating_income", "depreciation", "amortization"], formula: "operating_income + depreciation + amortization" },
     { deps: ["revenue", "total_expenses"], formula: "revenue - total_expenses" },
   ],
   profit_before_tax: [
+    { deps: ["ebit", "finance_costs", "other_income"], formula: "ebit - finance_costs + other_income" },
+    { deps: ["ebit", "interest_expense", "other_income"], formula: "ebit - interest_expense + other_income" },
+    { deps: ["ebit", "finance_costs"], formula: "ebit - finance_costs" },
+    { deps: ["ebit", "interest_expense"], formula: "ebit - interest_expense" },
+    { deps: ["operating_income", "interest_expense", "other_income"], formula: "operating_income - interest_expense + other_income" },
     { deps: ["operating_income", "interest_expense"], formula: "operating_income - interest_expense" },
-    { deps: ["ebitda", "depreciation", "amortization", "interest_expense"], formula: "ebitda - depreciation - amortization - interest_expense" },
     { deps: ["ebitda", "depreciation_amortization", "interest_expense"], formula: "ebitda - depreciation_amortization - interest_expense" },
     { deps: ["operating_income"], formula: "operating_income" },
-    { deps: ["ebitda"], formula: "ebitda" },
+    { deps: ["ebit"], formula: "ebit" },
   ],
   net_income: [
     { deps: ["profit_before_tax", "tax_expense"], formula: "profit_before_tax - tax_expense" },
@@ -422,13 +469,11 @@ const TYPICALLY_CALCULATED = new Set([
   "cost_of_revenue", "cost_of_goods_sold", "cogs",
 ]);
 
-function findKnownFormula(
+/** Select first matching known formula (no DEMO_MODE gate — for tests / callers). */
+export function selectKnownFormula(
   variableId: string,
   availableVars: Set<string>,
 ): { formula: string; deps: string[] } | null {
-  // Hardcoded P&L formula map is demo scaffolding only — production models
-  // must come from workbook graphs or LLM extraction.
-  if (!config.DEMO_MODE) return null;
   const candidates = KNOWN_CALCULATED_FORMULAS[variableId];
   if (!candidates) return null;
   for (const c of candidates) {
@@ -437,6 +482,16 @@ function findKnownFormula(
     }
   }
   return null;
+}
+
+function findKnownFormula(
+  variableId: string,
+  availableVars: Set<string>,
+): { formula: string; deps: string[] } | null {
+  // Hardcoded P&L formula map is demo scaffolding only — production models
+  // must come from workbook graphs or LLM extraction.
+  if (!config.DEMO_MODE) return null;
+  return selectKnownFormula(variableId, availableVars);
 }
 
 function buildFormulaFromDependencies(
@@ -523,9 +578,11 @@ function validateAndRepairMetrics(metrics: FinancialMetric[]): void {
  * have proper formula paths. Attempts one last repair using the full variable set.
  */
 function sanityCheckVariables(
-  variables: Array<{ id: string; name: string; formula: string; dependencies: string[]; tags: string[] }>,
+  variables: BuildVar[],
+  warnings: string[],
 ): void {
   const varIds = new Set(variables.map((v) => v.id));
+  const hasDA = varIds.has("depreciation_amortization") || varIds.has("depreciation");
 
   for (const v of variables) {
     if (!v.tags.includes("output")) continue;
@@ -544,15 +601,149 @@ function sanityCheckVariables(
       );
     }
   }
+
+  if (!hasDA && (varIds.has("ebit") || varIds.has("ebitda"))) {
+    warnings.push("D&A not extracted — EBIT and EBITDA treated as equal");
+  }
+}
+
+type BuildVar = ModelVariable & { tags: string[] };
+
+const SAFE_FN_NAMES = new Set(["min", "max", "abs", "round", "floor", "ceil", "sqrt", "pow"]);
+
+function metricTypeForBuild(m: FinancialMetric): MetricType {
+  return m.metric_type ?? inferMetricTypeFromId(m.variable_id, m.name);
+}
+
+function dependentsOf(variables: BuildVar[], targetId: string): string[] {
+  return variables.filter((v) => v.dependencies.includes(targetId)).map((v) => v.id);
+}
+
+/**
+ * Rewrite fixed tax_expense as effective_tax_rate × max(0, PBT).
+ * Build-time only — existing stored models unchanged.
+ */
+export function rewriteTaxAsEffectiveRate(variables: BuildVar[], warnings: string[]): void {
+  const TAX_IDS = ["tax_expense", "tax", "income_tax"];
+  const PBT_IDS = ["profit_before_tax", "pbt"];
+
+  const taxVar = variables.find((v) => TAX_IDS.includes(v.id) && v.dependencies.length === 0);
+  if (!taxVar) return;
+
+  const pbtVar = variables.find((v) => PBT_IDS.includes(v.id));
+  if (!pbtVar) {
+    warnings.push("Tax rewrite skipped — profit_before_tax not found in model");
+    return;
+  }
+
+  // Resolve base values from numeric formulas / evaluate
+  let taxBase: number;
+  let pbtBase: number;
+  try {
+    const tmp: ModelDefinition = {
+      model_version: "tax-rewrite-probe",
+      time_horizon: { start: "2026-Q1", end: "2026-Q1", granularity: "quarterly" },
+      variables: variables.map((v) => ({ ...v })),
+    };
+    const base = new CompiledModel(tmp).baseValues();
+    taxBase = base[taxVar.id] ?? 0;
+    pbtBase = base[pbtVar.id] ?? 0;
+  } catch {
+    warnings.push("Tax rewrite skipped — model failed to compile during rate derivation");
+    return;
+  }
+
+  if (pbtBase <= 0) {
+    warnings.push(`Tax rewrite skipped — PBT is ${pbtBase} (need positive PBT to derive effective rate)`);
+    return;
+  }
+  if (taxBase < 0) {
+    warnings.push("Tax rewrite skipped — tax_expense is negative");
+    return;
+  }
+  const rate = taxBase / pbtBase;
+  if (!(rate > 0 && rate <= 0.6)) {
+    warnings.push(`Tax rewrite skipped — implied rate ${(rate * 100).toFixed(1)}% outside (0%, 60%]`);
+    return;
+  }
+
+  // Cycle safety: skip if PBT transitively depends on tax
+  const byId = new Map(variables.map((v) => [v.id, v]));
+  const visiting = new Set<string>();
+  function dependsOnTax(id: string): boolean {
+    if (id === taxVar!.id) return true;
+    if (visiting.has(id)) return false;
+    visiting.add(id);
+    const v = byId.get(id);
+    if (!v) return false;
+    return v.dependencies.some((d) => dependsOnTax(d));
+  }
+  if (dependsOnTax(pbtVar.id)) {
+    warnings.push("Tax rewrite skipped — profit_before_tax depends on tax (cycle)");
+    return;
+  }
+
+  const ratePct = Math.round(rate * 10000) / 100;
+  const snapshot = {
+    formula: taxVar.formula,
+    dependencies: [...taxVar.dependencies],
+    tags: [...taxVar.tags],
+    provenance: taxVar.provenance,
+    metric_type: taxVar.metric_type,
+  };
+
+  if (!variables.some((v) => v.id === "effective_tax_rate")) {
+    variables.push({
+      id: "effective_tax_rate",
+      name: "Effective Tax Rate",
+      formula: String(ratePct),
+      dependencies: [],
+      tags: ["input", "percent_delta"],
+      metric_type: "percent",
+      provenance: "derived",
+    });
+  }
+
+  taxVar.formula = `max(0, ${pbtVar.id}) * effective_tax_rate / 100`;
+  taxVar.dependencies = [pbtVar.id, "effective_tax_rate"];
+  taxVar.tags = ["pl_metric", "output"];
+  taxVar.provenance = "derived";
+  taxVar.metric_type = "currency";
+
+  try {
+    const check: ModelDefinition = {
+      model_version: "tax-rewrite-check",
+      time_horizon: { start: "2026-Q1", end: "2026-Q1", granularity: "quarterly" },
+      variables: variables.map((v) => ({ ...v })),
+    };
+    new CompiledModel(check);
+  } catch (e) {
+    taxVar.formula = snapshot.formula;
+    taxVar.dependencies = snapshot.dependencies;
+    taxVar.tags = snapshot.tags;
+    taxVar.provenance = snapshot.provenance;
+    taxVar.metric_type = snapshot.metric_type;
+    const idx = variables.findIndex((v) => v.id === "effective_tax_rate" && v.provenance === "derived");
+    if (idx >= 0) variables.splice(idx, 1);
+    warnings.push(`Tax rewrite reverted — compile failed: ${(e as Error).message}`);
+    return;
+  }
+
+  warnings.push(
+    `Tax rewritten as effective rate ${ratePct}% × max(0, ${pbtVar.id}). ` +
+      `Override effective_tax_rate to change the rate; tax now scales with PBT.`,
+  );
 }
 
 /**
  * Build a ModelDefinition from extracted financial metrics.
+ * Exported for unit tests (no Postgres required).
  */
-function buildModelFromContext(ctx: ContextData): ModelDefinition {
+export function buildModelFromContext(ctx: ContextData): ModelDefinition {
   validateAndRepairMetrics(ctx.financial_metrics);
+  const warnings: string[] = [];
 
-  const variables = ctx.financial_metrics.map((m) => ({
+  const variables: BuildVar[] = ctx.financial_metrics.map((m) => ({
     id: m.variable_id,
     name: m.name,
     formula: m.is_input
@@ -560,52 +751,58 @@ function buildModelFromContext(ctx: ContextData): ModelDefinition {
       : (m.formula || "0"),
     dependencies: m.dependencies || [],
     tags: buildTags(m),
+    metric_type: metricTypeForBuild(m),
+    provenance: "extracted" as VariableProvenance,
   }));
 
   // Inject missing dependency variables referenced in formulas but not present in the model.
-  // Scans both the explicit dependencies array AND the formula text for variable references.
   const varIds = new Set(variables.map((v) => v.id));
   const missingVars = new Set<string>();
   for (const v of variables) {
     for (const dep of v.dependencies) {
       if (!varIds.has(dep)) missingVars.add(dep);
     }
-    // Also scan formula text for references to identifiers not in the model
     const formulaRefs = v.formula.match(/\b[a-z][a-z0-9_]*\b/g) || [];
     for (const ref of formulaRefs) {
+      if (SAFE_FN_NAMES.has(ref)) continue;
       if (!varIds.has(ref) && !missingVars.has(ref)) {
         missingVars.add(ref);
       }
     }
   }
-  // Common default values for financial variables that LLM might reference but not extract
-  const COMMON_DEFAULTS: Record<string, number> = {
-    depreciation: 1200, amortization: 650, depreciation_amortization: 2250,
-    tax_expense: 1885, tax: 1885, income_tax: 1885,
-    interest_expense: 650, finance_costs: 650,
-    other_income: 389, exceptional_items: 0,
-  };
 
   for (const missing of missingVars) {
     const matchingMetric = ctx.financial_metrics.find((m) =>
       m.variable_id === missing || m.name.toLowerCase().replace(/[^a-z0-9]/g, "_").includes(missing)
     );
-    const value = matchingMetric?.typical_value ?? COMMON_DEFAULTS[missing] ?? 0;
+    const value = matchingMetric?.typical_value ?? 0;
     const name = missing.replace(/_/g, " ").replace(/\b\w/g, (c) => c.toUpperCase());
+    const provenance: VariableProvenance = matchingMetric?.typical_value != null ? "extracted" : "assumed";
     variables.push({
       id: missing,
       name,
       formula: String(value),
       dependencies: [],
       tags: ["pl_metric", "input", "percent_delta"],
+      metric_type: inferMetricTypeFromId(missing, name),
+      provenance,
     });
     varIds.add(missing);
-    logger.info(`[ContextEngine] Injected missing dependency variable: ${missing} = ${value}`);
+    if (provenance === "assumed") {
+      const deps = dependentsOf(variables, missing);
+      warnings.push(
+        `'${name}' referenced by formulas but not found in document — assumed 0. ` +
+          `Review dependent metrics (${deps.length ? deps.join(", ") : "none yet"}).`,
+      );
+    }
+    logger.info(`[ContextEngine] Injected missing dependency variable: ${missing} = ${value} (${provenance})`);
   }
+
   // Also ensure dependencies arrays are complete — add any formula-referenced vars to deps
   for (const v of variables) {
     const formulaRefs = v.formula.match(/\b[a-z][a-z0-9_]*\b/g) || [];
     for (const ref of formulaRefs) {
+      if (SAFE_FN_NAMES.has(ref)) continue;
       if (varIds.has(ref) && ref !== v.id && !v.dependencies.includes(ref)) {
         v.dependencies.push(ref);
       }
@@ -619,7 +816,6 @@ function buildModelFromContext(ctx: ContextData): ModelDefinition {
   ];
   for (const e of essentials) {
     if (!varIds.has(e.id)) {
-      // Try to find something similar
       const similar = variables.find((v) => v.id.includes(e.id) || v.name.toLowerCase().includes(e.id));
       if (!similar) {
         variables.push({
@@ -628,12 +824,20 @@ function buildModelFromContext(ctx: ContextData): ModelDefinition {
           formula: "0",
           dependencies: [],
           tags: [e.needsTag, "input", "percent_delta"],
+          metric_type: "currency",
+          provenance: "assumed",
         });
+        varIds.add(e.id);
+        warnings.push(
+          `Model is incomplete — essential '${e.id}' was not extracted and was assumed 0. ` +
+            `Upload a fuller P&L or edit the model before relying on simulations.`,
+        );
       }
     }
   }
 
-  sanityCheckVariables(variables);
+  rewriteTaxAsEffectiveRate(variables, warnings);
+  sanityCheckVariables(variables, warnings);
 
   const now = new Date();
   const qtr = Math.ceil((now.getMonth() + 1) / 3);
@@ -647,6 +851,7 @@ function buildModelFromContext(ctx: ContextData): ModelDefinition {
       granularity: "quarterly",
     },
     variables,
+    ...(warnings.length > 0 ? { build_warnings: warnings } : {}),
   };
 }
 

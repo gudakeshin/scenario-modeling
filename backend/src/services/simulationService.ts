@@ -10,6 +10,11 @@ import {
 } from "./modelResolver.js";
 import { simulationsRun } from "../metrics.js";
 import { logger } from "../logger.js";
+import {
+  aggregatePeriodPl,
+  hasPeriodGrowth,
+  periodOverrides,
+} from "./simulationAggregation.js";
 
 export interface ScenarioParameterRow {
   mapped_variable_id: string;
@@ -245,11 +250,13 @@ async function _runFormulaSimulation(
   // any known id present in the map and ignores unknown synthetic ids.
 
   const baseCtx = model.baseValues();
-  // Same delta applied to the original base each period — no compounding.
-  const scenarioCtx = model.evaluate(absolute);
-
   const periodLabels = generatePeriodLabels(modelDef.time_horizon);
-  const periods: PeriodResult[] = periodLabels.map((label) => {
+  const useGrowth = hasPeriodGrowth(modelDef);
+
+  // Absolute scenario overrides are the period-0 base; growth compounds from there.
+  const periods: PeriodResult[] = periodLabels.map((label, t) => {
+    const absForPeriod = useGrowth ? periodOverrides(modelDef, absolute, t, baseCtx) : absolute;
+    const scenarioCtx = model.evaluate(absForPeriod);
     const periodPl: Record<string, number> = {};
     for (const id of plMetricIds) {
       if (id in scenarioCtx) periodPl[id] = round2(scenarioCtx[id]);
@@ -257,13 +264,7 @@ async function _runFormulaSimulation(
     return { period: label, pl: periodPl, variables: { ...scenarioCtx } };
   });
 
-  // ── Aggregate: sum P&L across all periods ──
-  const aggregatePl: Record<string, number> = {};
-  for (const id of plMetricIds) {
-    let total = 0;
-    for (const p of periods) total += p.pl[id] || 0;
-    aggregatePl[id] = round2(total);
-  }
+  const aggregatePl = aggregatePeriodPl(model, modelDef, periods, absolute);
   const lastPeriodVars = periods.length > 0 ? periods[periods.length - 1].variables : {};
 
   const basePl: Record<string, number> = {};
@@ -271,6 +272,15 @@ async function _runFormulaSimulation(
   const singlePeriodPl: Record<string, number> = periods[0]?.pl ?? {};
   const warnings = absurdityWarnings(basePl, singlePeriodPl);
   const notices = unresolvedNotices(unresolved);
+
+  const assumed = modelDef.variables
+    .filter((v) => v.provenance === "assumed")
+    .map((v) => v.id);
+  if (assumed.length > 0) {
+    notices.push(
+      `Model includes assumed-0 variables (not extracted from documents): ${assumed.join(", ")}. Review before relying on dependent metrics.`,
+    );
+  }
 
   const outputData: Record<string, unknown> = {
     aggregate: aggregatePl,

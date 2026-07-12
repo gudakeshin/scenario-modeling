@@ -5,6 +5,7 @@ type PptxTableRow = Array<{ text: string; options?: Record<string, unknown> }>;
 type PptxTableCell = { text: string; options?: Record<string, unknown> };
 import { pool } from "../db/index.js";
 import { computeBaseCase, getModelDefinition, getPLMetrics } from "../models/registry.js";
+import { resolveBasePl } from "./basePl.js";
 
 interface PeriodBreakdown {
   period: string;
@@ -55,9 +56,13 @@ export async function exportToPptx(scenarioId: string): Promise<Buffer> {
   const sModelRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
   const modelHash = sModelRef.rows[0]?.model_version_hash;
   const model = await getModelDefinition(modelHash);
-  if (!model) throw new Error("No model found for this scenario");
-  const baseValues = await computeBaseCase(model);
-  const plMetrics = getPLMetrics(model);
+  const baseValues = await resolveBasePl(rawOutput, model);
+  const plMetrics = model
+    ? getPLMetrics(model)
+    : [...new Set([...Object.keys(pl), ...Object.keys(baseValues)])];
+  if (model && Object.keys(baseValues).length === 0) {
+    Object.assign(baseValues, await computeBaseCase(model));
+  }
   const periodCount = periods.length || 1;
 
   // Create presentation

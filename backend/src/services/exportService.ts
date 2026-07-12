@@ -1,6 +1,7 @@
 import ExcelJS from "exceljs";
 import { pool } from "../db/index.js";
 import { computeBaseCase, getModelDefinition, getPLMetrics } from "../models/registry.js";
+import { resolveBasePl } from "./basePl.js";
 
 interface PeriodBreakdown {
   period: string;
@@ -16,6 +17,7 @@ interface ExportData {
   granularity: string;
   parameters: { extracted_name: string; mapped_variable_id: string; scenario_value: number; status: string }[];
   narrative: string | null;
+  raw_output: Record<string, unknown>;
 }
 
 async function loadExportData(scenarioId: string): Promise<ExportData> {
@@ -39,12 +41,41 @@ async function loadExportData(scenarioId: string): Promise<ExportData> {
     [scenarioId]
   );
 
-  return { scenario_id: scenarioId, name: row.name, nl_input: row.nl_input, pl, periods, granularity, parameters: pRes.rows, narrative };
+  return {
+    scenario_id: scenarioId,
+    name: row.name,
+    nl_input: row.nl_input,
+    pl,
+    periods,
+    granularity,
+    parameters: pRes.rows,
+    narrative,
+    raw_output: rawOutput,
+  };
 }
 
 // Dynamic metric label generation from model
 function metricLabel(id: string): string {
   return id.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+}
+
+async function resolveExportBase(
+  scenarioId: string,
+  rawOutput: Record<string, unknown>,
+): Promise<{ baseValues: Record<string, number>; plMetrics: string[] }> {
+  const sRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
+  const modelHash = sRef.rows[0]?.model_version_hash;
+  const model = await getModelDefinition(modelHash);
+  let baseValues = await resolveBasePl(rawOutput, model);
+  if (model) {
+    if (Object.keys(baseValues).length === 0) baseValues = await computeBaseCase(model);
+    return { baseValues, plMetrics: getPLMetrics(model) };
+  }
+  const keys = new Set<string>(Object.keys(baseValues));
+  if (rawOutput.aggregate && typeof rawOutput.aggregate === "object") {
+    for (const k of Object.keys(rawOutput.aggregate as object)) keys.add(k);
+  }
+  return { baseValues, plMetrics: [...keys] };
 }
 
 export async function exportToExcel(scenarioId: string): Promise<Buffer> {
@@ -53,12 +84,7 @@ export async function exportToExcel(scenarioId: string): Promise<Buffer> {
   wb.creator = "Scenario Modeling | Deloitte";
   wb.created = new Date();
 
-  const sRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
-  const modelHash = sRef.rows[0]?.model_version_hash;
-  const model = await getModelDefinition(modelHash);
-  if (!model) throw new Error("No model found for this scenario");
-  const baseValues = await computeBaseCase(model);
-  const plMetrics = getPLMetrics(model);
+  const { baseValues, plMetrics } = await resolveExportBase(scenarioId, data.raw_output);
 
   // Deloitte-style header formatting
   const headerFill: ExcelJS.Fill = { type: "pattern", pattern: "solid", fgColor: { argb: "FF1D1D1B" } };
@@ -163,12 +189,7 @@ export async function exportToExcel(scenarioId: string): Promise<Buffer> {
 
 export async function exportToCsv(scenarioId: string): Promise<string> {
   const data = await loadExportData(scenarioId);
-  const sRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
-  const modelHash = sRef.rows[0]?.model_version_hash;
-  const model = await getModelDefinition(modelHash);
-  if (!model) throw new Error("No model found for this scenario");
-  const baseValues = await computeBaseCase(model);
-  const plMetrics = getPLMetrics(model);
+  const { baseValues, plMetrics } = await resolveExportBase(scenarioId, data.raw_output);
 
   const sections: string[] = [];
 

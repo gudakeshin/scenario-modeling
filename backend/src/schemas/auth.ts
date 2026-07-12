@@ -95,6 +95,7 @@ export const monteCarloSchema = z.object({
         max: z.number().finite().optional(),
         mode: z.number().finite().optional(),
         delta_type: z.enum(["percent", "absolute"]).optional(),
+        truncate_at_zero: z.boolean().optional(),
       })
     )
     .optional(),
@@ -112,4 +113,5 @@ export const monteCarloSchema = z.object({
 export const sensitivitySchema = z.object({
   target_metric: z.string().min(1).max(255).optional(),
   swing_pct: z.number().positive().max(100).optional(),
+  percent_swing_pp: z.number().positive().max(100).optional(),
 });

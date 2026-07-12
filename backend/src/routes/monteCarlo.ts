@@ -29,25 +29,8 @@ analysisRouter.post("/:id/monte-carlo", requireRole("analyst"), validateBody(mon
     const correlations: CorrelationSpec[] | undefined = req.body.correlations;
     const seed = req.body.seed != null ? Number(req.body.seed) : undefined;
 
-    // If no distributions provided, auto-generate from scenario parameters.
-    // The distribution is over the parameter's DELTA (same semantics as the
-    // deterministic scenario value), so delta_type is carried through.
-    if (distributions.length === 0) {
-      const { pool } = await import("../db/index.js");
-      const pRes = await pool.query(
-        "SELECT mapped_variable_id, scenario_value, delta_type FROM scenario_parameters WHERE scenario_id = $1 AND status IN ('pending','accepted','modified')",
-        [scenarioId]
-      );
-      for (const row of pRes.rows) {
-        distributions.push({
-          variable_id: row.mapped_variable_id,
-          type: "normal",
-          base_value: Number(row.scenario_value),
-          stddev: Math.abs(Number(row.scenario_value) * 0.15) || 1,
-          delta_type: row.delta_type === "percent" ? "percent" : "absolute",
-        });
-      }
-    }
+    // Auto-generation of distributions (when empty) happens inside runMonteCarlo
+    // where model.inputs / metric types are available.
 
     const result = await runMonteCarlo({ scenario_id: scenarioId, iterations, distributions, correlations, seed });
     await logAudit(scenarioId, "monte_carlo_run", { iterations: result.iterations, seed: result.seed }, req.user!.userId);
@@ -69,9 +52,10 @@ analysisRouter.post("/:id/sensitivity", requireRole("analyst"), validateBody(sen
     await assertCanWriteScenario(req.user!.userId, req.user!.role, scenarioId);
     const target_metric = req.body.target_metric || "net_income";
     const swing_pct = req.body.swing_pct || 20;
+    const percent_swing_pp = req.body.percent_swing_pp;
 
-    const result = await runSensitivity(scenarioId, target_metric, swing_pct);
-    await logAudit(scenarioId, "sensitivity_run", { target_metric, swing_pct }, req.user!.userId);
+    const result = await runSensitivity(scenarioId, target_metric, swing_pct, percent_swing_pp);
+    await logAudit(scenarioId, "sensitivity_run", { target_metric, swing_pct, percent_swing_pp }, req.user!.userId);
     return res.json(result);
   } catch (e) {
     const status = authzError(e);

@@ -16,6 +16,7 @@
  */
 
 import type { ModelDefinition, ModelVariable } from "../models/registry.js";
+import { inferMetricTypeFromId, type MetricType } from "./metricTypes.js";
 
 export class ExpressionError extends Error {
   variableId?: string;
@@ -157,6 +158,8 @@ export interface ModelInput {
   id: string;
   name: string;
   base: number;
+  /** Present on formula-DAG models; XLSX inputs stay unknown / omitted. */
+  metricType?: MetricType;
 }
 
 /**
@@ -199,7 +202,12 @@ export class CompiledModel implements EvaluableModel {
     this.baseCtx = this.evaluate({});
     this.inputs = model.variables
       .filter((v) => v.dependencies.length === 0)
-      .map((v) => ({ id: v.id, name: v.name, base: this.baseCtx[v.id] ?? 0 }));
+      .map((v) => ({
+        id: v.id,
+        name: v.name,
+        base: this.baseCtx[v.id] ?? 0,
+        metricType: v.metric_type ?? inferMetricTypeFromId(v.id, v.name),
+      }));
     this.outputIds = model.variables
       .filter((v) => v.tags?.includes("pl_metric"))
       .map((v) => v.id);

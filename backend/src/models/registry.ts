@@ -8,6 +8,7 @@
  */
 
 import { pool } from "../db/index.js";
+import type { MetricType, VariableProvenance } from "../services/metricTypes.js";
 
 export interface ModelVariable {
   id: string;
@@ -15,6 +16,12 @@ export interface ModelVariable {
   formula: string;
   dependencies: string[];
   tags?: string[];
+  /** Semantic type — used for aggregation, sensitivity, and Monte Carlo defaults. */
+  metric_type?: MetricType;
+  /** How the variable entered the model. */
+  provenance?: VariableProvenance;
+  /** Per-period compound growth (%). Flow inputs only; percent/ratio never compound. */
+  period_growth_pct?: number;
 }
 
 export interface TimeHorizon {
@@ -27,6 +34,8 @@ export interface ModelDefinition {
   model_version: string;
   variables: ModelVariable[];
   time_horizon: TimeHorizon;
+  /** Build-time analyst notices (assumed zeros, tie-out variances, tax rewrite). */
+  build_warnings?: string[];
 }
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
