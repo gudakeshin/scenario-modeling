@@ -15,6 +15,7 @@
   /* Core */
   --background: #FFFFFF;
   --foreground: #1D1D1B;
+  --bg: var(--background);
 
   /* Sidebar — dark charcoal for brand presence */
   --sidebar-bg: #1D1D1B;
@@ -29,6 +30,9 @@
   --accent-hover: #6FA020;
   --accent-light: rgba(134, 188, 37, 0.08);
   --accent-muted: rgba(134, 188, 37, 0.15);
+  /* Charcoal on green fills; darker green for links on light surfaces */
+  --on-accent: #1D1D1B;
+  --accent-text: #4A7A12;
 
   /* Message bubbles */
   --message-user-bg: #86BC25;
@@ -85,6 +89,7 @@
 .dark {
   --background: #17181A;
   --foreground: #EDEDEC;
+  --bg: var(--background);
 
   --sidebar-bg: #101112;
   --sidebar-border: #26272A;
@@ -97,6 +102,8 @@
   --accent-hover: #86BC25;
   --accent-light: rgba(158, 213, 69, 0.12);
   --accent-muted: rgba(158, 213, 69, 0.2);
+  --on-accent: #1D1D1B;
+  --accent-text: var(--accent);
 
   --message-user-bg: #4C7A17;
   --message-user-text: #FFFFFF;

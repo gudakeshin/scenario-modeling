@@ -1228,9 +1228,36 @@ export interface PlanningModelMetadata {
     id: string;
     name: string;
     type: string;
-    members: Array<{ id: string; name: string; parentId: string | null; isLeaf: boolean; ordinal: number }>;
+    members: Array<{
+      id: string;
+      name: string;
+      parentId: string | null;
+      isLeaf: boolean;
+      ordinal: number;
+      sign?: number;
+    }>;
   }>;
-  measures: Array<{ id: string; name: string }>;
+  measures: Array<{ id: string; name: string; formula?: string }>;
+}
+
+export interface MappingPreviewMeasure {
+  id: string;
+  name: string;
+  role: "input" | "formula_exposed" | "formula_derived_on_import";
+  signage_note?: string;
+}
+
+export interface MappingPreview {
+  model_id: string;
+  model_name: string;
+  measures: MappingPreviewMeasure[];
+  account_signage: boolean;
+  notes: string[];
+}
+
+export interface ImportProgress {
+  phase: string;
+  cells: number;
 }
 
 export interface ExternalModelSnapshot {
@@ -1239,6 +1266,8 @@ export interface ExternalModelSnapshot {
   status: string;
   error: string | null;
   external_model_name: string;
+  external_model_id?: string;
+  snapshot_version?: number;
   stats: ImportStats;
   metadata: PlanningModelMetadata | Record<string, unknown>;
   created_at: string;
@@ -1255,6 +1284,7 @@ export interface ImportStats {
   errors?: string[];
   warnings?: string[];
   imported_at?: string;
+  progress?: ImportProgress;
   [key: string]: unknown;
 }
 
@@ -1357,6 +1387,25 @@ export async function testPlanningConnection(id: string): Promise<{ ok: boolean;
   return res.json();
 }
 
+export async function testConnectionDraft(body: {
+  provider: string;
+  base_url: string;
+  auth_kind: string;
+  auth_public?: Record<string, unknown>;
+  secret: string;
+}): Promise<{ ok: boolean; message?: string; model_count?: number }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/test`, {
+    method: "POST",
+    headers: authHeaders({ "Content-Type": "application/json" }),
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Connection test failed");
+  }
+  return res.json();
+}
+
 export async function listPlanningModels(connectionId: string): Promise<{ models: PlanningModelSummary[] }> {
   const res = await apiFetch(`${API_BASE}/api/v1/connections/${connectionId}/models`, {
     headers: authHeaders(),
@@ -1374,6 +1423,21 @@ export async function getPlanningModelMetadata(
     { headers: authHeaders() },
   );
   if (!res.ok) throw new Error("Failed to load model metadata");
+  return res.json();
+}
+
+export async function getModelMappingPreview(
+  connectionId: string,
+  modelId: string,
+): Promise<MappingPreview> {
+  const res = await apiFetch(
+    `${API_BASE}/api/v1/connections/${connectionId}/models/${encodeURIComponent(modelId)}/mapping-preview`,
+    { headers: authHeaders() },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to load mapping preview");
+  }
   return res.json();
 }
 
@@ -1402,6 +1466,18 @@ export async function getImportStatus(snapshotId: string): Promise<ExternalModel
     headers: authHeaders(),
   });
   if (!res.ok) throw new Error("Failed to get import status");
+  return res.json();
+}
+
+export async function cancelImport(snapshotId: string): Promise<{ cancelled: boolean }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/connections/imports/${snapshotId}/cancel`, {
+    method: "POST",
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Cancel failed");
+  }
   return res.json();
 }
 

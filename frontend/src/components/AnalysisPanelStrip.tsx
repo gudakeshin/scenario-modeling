@@ -15,13 +15,10 @@ import { RoleManagement } from "./RoleManagement";
 import { FollowUpQuestions } from "./FollowUpQuestions";
 import { DocumentPanel } from "./DocumentPanel";
 import { DocumentManager } from "./DocumentManager";
-import { ConnectionsPanel } from "./ConnectionsPanel";
-import { ModelImportWizard } from "./ModelImportWizard";
 import { AnalysisModal } from "./AnalysisModal";
 import { getOnboardingStatus } from "@/lib/api";
 import { setCurrency } from "@/lib/metrics";
 import { useUiStore } from "@/stores/uiStore";
-import { usePlanningConnectorsEnabled } from "@/lib/features";
 
 const CARD_COLORS: Record<string, string> = {
   review: "bg-accent", comparison: "bg-[var(--info)]", monteCarlo: "bg-accent",
@@ -31,8 +28,6 @@ const CARD_COLORS: Record<string, string> = {
   insights: "bg-[var(--success)]", followUp: "bg-accent",
   documents: "bg-[var(--info)]",
   docManager: "bg-accent",
-  connections: "bg-[var(--info)]",
-  importWizard: "bg-accent",
 };
 
 interface AnalysisPanelStripProps {
@@ -50,22 +45,20 @@ export function AnalysisPanelStrip({
   onFollowUpAnswers,
   onTemplateCloned,
 }: AnalysisPanelStripProps) {
-  const planningConnectorsEnabled = usePlanningConnectorsEnabled();
   const {
     showReview, showComparison, showAudit, showMonteCarlo, showTornado,
     showTemplates, showInsights, showPeriods, showCharts, showSharing,
-    showRoles, showDocuments, showDocManager, showConnections, showImportWizard,
+    showRoles, showDocuments, showDocManager,
     preloadedInsight, periodData, chartData, pendingQuestions,
-    refineKey, expandedPanel, importConnectionId,
+    refineKey, expandedPanel,
     setShowReview, setShowComparison, setShowAudit, setShowMonteCarlo,
     setShowTornado, setShowTemplates, setShowInsights, setShowPeriods,
     setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
-    setShowDocManager, setShowConnections, setShowImportWizard, setImportConnectionId,
+    setShowDocManager,
     setPreloadedInsight, setPendingQuestions,
     setOnboardingStatus, setExpandedPanel,
   } = useUiStore();
 
-  // Auto-expand follow-up questions when they appear
   useEffect(() => {
     if (pendingQuestions && pendingQuestions.length > 0) {
       setExpandedPanel("followUp");
@@ -88,17 +81,14 @@ export function AnalysisPanelStrip({
     if (pendingQuestions && pendingQuestions.length > 0 && scenarioId) cards.push({ id: "followUp", title: "Refine Scenario", close: () => setPendingQuestions(null) });
     if (showDocuments) cards.push({ id: "documents", title: "Documents", close: () => setShowDocuments(false) });
     if (showDocManager) cards.push({ id: "docManager", title: "Document Manager", close: () => setShowDocManager(false) });
-    if (planningConnectorsEnabled && showConnections) cards.push({ id: "connections", title: "Connections", close: () => setShowConnections(false) });
-    if (planningConnectorsEnabled && showImportWizard) cards.push({ id: "importWizard", title: "Import Model", close: () => setShowImportWizard(false) });
     return cards;
   }, [
     showReview, showComparison, showMonteCarlo, showTornado, showPeriods, showCharts,
     showSharing, showAudit, showTemplates, showRoles, showInsights, pendingQuestions,
-    showDocuments, showDocManager, showConnections, showImportWizard, scenarioId, periodData, chartData, planningConnectorsEnabled,
+    showDocuments, showDocManager, scenarioId, periodData, chartData,
     setShowReview, setShowComparison, setShowMonteCarlo, setShowTornado, setShowPeriods,
     setShowCharts, setShowSharing, setShowAudit, setShowTemplates, setShowRoles,
     setShowInsights, setPreloadedInsight, setPendingQuestions, setShowDocuments, setShowDocManager,
-    setShowConnections, setShowImportWizard,
   ]);
 
   const closePanel = (id: string, closeFn: () => void) => {
@@ -139,31 +129,6 @@ export function AnalysisPanelStrip({
         return <DocumentPanel onClose={() => closePanel("documents", () => setShowDocuments(false))} onMinimize={collapseModal} />;
       case "docManager":
         return <DocumentManager onClose={() => closePanel("docManager", () => setShowDocManager(false))} onMinimize={collapseModal} onContextBuilt={() => { getOnboardingStatus().then((s) => { setOnboardingStatus(s); if (s.currency) setCurrency(s.currency, s.currency_unit); }).catch(() => {}); }} />;
-      case "connections":
-        if (!planningConnectorsEnabled) return null;
-        return (
-          <ConnectionsPanel
-            onClose={() => closePanel("connections", () => setShowConnections(false))}
-            onMinimize={collapseModal}
-            onOpenImport={(cid) => {
-              setImportConnectionId(cid);
-              setShowImportWizard(true);
-              setExpandedPanel("importWizard");
-            }}
-          />
-        );
-      case "importWizard":
-        if (!planningConnectorsEnabled) return null;
-        return (
-          <ModelImportWizard
-            onClose={() => closePanel("importWizard", () => { setShowImportWizard(false); setImportConnectionId(null); })}
-            onMinimize={collapseModal}
-            initialConnectionId={importConnectionId}
-            onImported={() => {
-              getOnboardingStatus().then((s) => { setOnboardingStatus(s); if (s.currency) setCurrency(s.currency, s.currency_unit); }).catch(() => {});
-            }}
-          />
-        );
       default:
         return null;
     }
@@ -171,7 +136,6 @@ export function AnalysisPanelStrip({
 
   return (
     <>
-      {/* ── Analysis card strip: compact cards for each active panel ── */}
       {panelCards.length > 0 && (
         <div className="px-3 py-2 border-t border-[var(--border)] bg-[var(--panel-bg)]/60 flex gap-2 overflow-x-auto shrink-0">
           {panelCards.map((card) => (
@@ -207,7 +171,6 @@ export function AnalysisPanelStrip({
         </div>
       )}
 
-      {/* ── Modal overlay for expanded panel ── */}
       {expandedPanel && (
         <AnalysisModal onCollapse={() => setExpandedPanel(null)} title={panelCards.find((c) => c.id === expandedPanel)?.title}>
           {renderExpandedPanel()}

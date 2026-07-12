@@ -11,6 +11,7 @@ import {
   createConnectionSchema,
   updateConnectionSchema,
   importModelSchema,
+  testConnectionSchema,
 } from "../schemas/connections.js";
 import {
   ConnectionError,
@@ -20,6 +21,7 @@ import {
   updateConnection,
   deleteConnection,
   testConnection,
+  testConnectionDraft,
   listModels,
   getModelMetadata,
   listIntegrationEvents,
@@ -29,7 +31,9 @@ import {
   getSnapshot,
   listSnapshots,
   refreshImport,
+  cancelImport,
 } from "../services/externalModelImport.js";
+import { buildMappingPreview } from "../services/externalModelMapping.js";
 import { isPlanningConnectorsEnabled } from "../config.js";
 import { logger } from "../logger.js";
 
@@ -93,6 +97,35 @@ connectionsRouter.post(
     try {
       const result = await refreshImport(scopeOf(req), req.params.snapshotId);
       return res.status(202).json(result);
+    } catch (e) {
+      return handleConnError(e, res);
+    }
+  },
+);
+
+connectionsRouter.post(
+  "/imports/:snapshotId/cancel",
+  requireRole("analyst"),
+  async (req, res) => {
+    try {
+      const result = await cancelImport(scopeOf(req), req.params.snapshotId);
+      return res.json(result);
+    } catch (e) {
+      return handleConnError(e, res);
+    }
+  },
+);
+
+// ── Draft test (before /:id) ──
+
+connectionsRouter.post(
+  "/test",
+  requireRole("analyst"),
+  validateBody(testConnectionSchema),
+  async (req, res) => {
+    try {
+      const result = await testConnectionDraft(req.body);
+      return res.json(result);
     } catch (e) {
       return handleConnError(e, res);
     }
@@ -208,6 +241,23 @@ connectionsRouter.get(
         req.params.modelId,
       );
       return res.json(metadata);
+    } catch (e) {
+      return handleConnError(e, res);
+    }
+  },
+);
+
+connectionsRouter.get(
+  "/:id/models/:modelId/mapping-preview",
+  requireRole("analyst"),
+  async (req, res) => {
+    try {
+      const metadata = await getModelMetadata(
+        req.workspace!.workspaceId,
+        req.params.id,
+        req.params.modelId,
+      );
+      return res.json(buildMappingPreview(metadata));
     } catch (e) {
       return handleConnError(e, res);
     }

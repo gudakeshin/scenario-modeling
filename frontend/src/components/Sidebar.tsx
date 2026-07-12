@@ -1,10 +1,12 @@
 "use client";
 
 import { useEffect, useMemo, useRef, useState } from "react";
+import Link from "next/link";
 import type { Conversation } from "@/types/chat";
 import { ThemeToggle } from "./ThemeToggle";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
 import { strings } from "@/lib/strings";
+import { usePlanningConnectorsEnabled } from "@/lib/features";
 
 interface SidebarProps {
   conversations: Conversation[];
@@ -160,6 +162,7 @@ function SidebarContent({
   showCollapse: boolean;
 }) {
   const [query, setQuery] = useState("");
+  const planningConnectorsEnabled = usePlanningConnectorsEnabled();
 
   const filtered = useMemo(() => {
     const q = query.trim().toLowerCase();
@@ -193,6 +196,19 @@ function SidebarContent({
             <line x1="5" y1="12" x2="19" y2="12" />
           </svg>
         </button>
+        {planningConnectorsEnabled && (
+          <Link
+            href="/connections"
+            className="mt-2 p-2 rounded-lg hover:bg-[var(--sidebar-hover)] text-[var(--sidebar-text)] transition-colors"
+            aria-label="Data & Models"
+          >
+            <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+              <ellipse cx="12" cy="5" rx="9" ry="3" />
+              <path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5" />
+              <path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6" />
+            </svg>
+          </Link>
+        )}
       </div>
     );
   }
@@ -242,6 +258,21 @@ function SidebarContent({
         </svg>
         {strings.sidebar.newChat}
       </button>
+
+      {/* Data & Models hub — planning connectors */}
+      {planningConnectorsEnabled && (
+        <Link
+          href="/connections"
+          className="mx-3 mb-2 flex items-center gap-2 rounded-xl border border-[var(--sidebar-border)] px-3 py-2 text-sm font-medium text-[var(--sidebar-text)] hover:bg-[var(--sidebar-hover)] transition-colors"
+        >
+          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" aria-hidden="true">
+            <ellipse cx="12" cy="5" rx="9" ry="3" />
+            <path d="M3 5v6c0 1.7 4 3 9 3s9-1.3 9-3V5" />
+            <path d="M3 11v6c0 1.7 4 3 9 3s9-1.3 9-3v-6" />
+          </svg>
+          Data &amp; Models
+        </Link>
+      )}
 
       {/* Search filter */}
       <div className="px-3 pb-2">

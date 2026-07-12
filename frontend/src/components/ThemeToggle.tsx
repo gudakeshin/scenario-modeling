@@ -3,18 +3,31 @@
 import { useEffect, useState } from "react";
 import { getTheme, toggleTheme, type Theme } from "@/lib/theme";
 
-export function ThemeToggle({ className = "" }: { className?: string }) {
+type ChromeVariant = "sidebar" | "page";
+
+export function ThemeToggle({
+  className = "",
+  variant = "sidebar",
+}: {
+  className?: string;
+  variant?: ChromeVariant;
+}) {
   const [theme, setThemeState] = useState<Theme>("light");
 
   useEffect(() => {
     setThemeState(getTheme());
   }, []);
 
+  const chromeClass =
+    variant === "page"
+      ? "hover:bg-[var(--panel-bg)] text-[var(--text-secondary)]"
+      : "hover:bg-[var(--sidebar-hover)] text-[var(--sidebar-text-muted)]";
+
   return (
     <button
       type="button"
       onClick={() => setThemeState(toggleTheme())}
-      className={`p-1.5 rounded-lg hover:bg-[var(--sidebar-hover)] text-[var(--sidebar-text-muted)] transition-colors ${className}`}
+      className={`p-1.5 rounded-lg transition-colors ${chromeClass} ${className}`}
       aria-label={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
       title={theme === "dark" ? "Switch to light mode" : "Switch to dark mode"}
     >

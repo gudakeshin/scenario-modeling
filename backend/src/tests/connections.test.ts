@@ -155,6 +155,52 @@ test("browse models + metadata via mock", async () => {
   assertNoSecrets(meta.body);
 });
 
+test("draft-test mock credentials without persisting", async () => {
+  if (!adminToken || !workspaceId) return;
+  const before = await authed(agent.get("/api/v1/connections"), analystToken, workspaceId);
+  const countBefore = before.body.connections?.length ?? 0;
+
+  const res = await authed(agent.post("/api/v1/connections/test"), analystToken, workspaceId).send({
+    provider: "mock",
+    base_url: "mock://local",
+    auth_kind: "api_key",
+    auth_public: {},
+    secret: "draft-secret-not-saved",
+  });
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.equal(res.body.ok, true);
+  assert.ok((res.body.model_count ?? 0) >= 1);
+  assert.match(res.body.message || "", /found \d+ model/i);
+  assertNoSecrets(res.body);
+
+  const after = await authed(agent.get("/api/v1/connections"), analystToken, workspaceId);
+  assert.equal(after.body.connections?.length ?? 0, countBefore);
+});
+
+test("mapping-preview classifies measures without activating", async () => {
+  if (!connectionId) return;
+  const models = await authed(
+    agent.get(`/api/v1/connections/${connectionId}/models`),
+    analystToken,
+    workspaceId,
+  );
+  const modelId = models.body.models[0].id;
+  const res = await authed(
+    agent.get(
+      `/api/v1/connections/${connectionId}/models/${encodeURIComponent(modelId)}/mapping-preview`,
+    ),
+    analystToken,
+    workspaceId,
+  );
+  assert.equal(res.status, 200, JSON.stringify(res.body));
+  assert.ok(Array.isArray(res.body.measures));
+  assert.ok(res.body.measures.length >= 1);
+  for (const m of res.body.measures) {
+    assert.ok(["input", "formula_exposed", "formula_derived_on_import"].includes(m.role));
+  }
+  assertNoSecrets(res.body);
+});
+
 test("import via mock → poll until ready; facts persisted", async () => {
   if (!connectionId) return;
   const models = await authed(
@@ -196,4 +242,48 @@ test("import via mock → poll until ready; facts persisted", async () => {
     [snapshotId],
   );
   assert.ok(facts.rows[0].n > 0);
+});
+
+test("cancel import mid-flight marks snapshot failed", async () => {
+  if (!connectionId) return;
+  const models = await authed(
+    agent.get(`/api/v1/connections/${connectionId}/models`),
+    analystToken,
+    workspaceId,
+  );
+  const modelId = models.body.models[0].id;
+
+  const imp = await authed(
+    agent.post(`/api/v1/connections/${connectionId}/models/${encodeURIComponent(modelId)}/import`),
+    analystToken,
+    workspaceId,
+  ).send({ fact_query: {} });
+  assert.equal(imp.status, 202, JSON.stringify(imp.body));
+  const snapshotId = imp.body.snapshot_id;
+
+  const cancel = await authed(
+    agent.post(`/api/v1/connections/imports/${snapshotId}/cancel`),
+    analystToken,
+    workspaceId,
+  );
+  // May already be ready on tiny fixtures — accept 200 cancel or 400 if finished
+  assert.ok([200, 400].includes(cancel.status), JSON.stringify(cancel.body));
+
+  let status = "importing";
+  let snap: { status: string; error?: string | null } | null = null;
+  for (let i = 0; i < 40; i++) {
+    await new Promise((r) => setTimeout(r, 100));
+    const poll = await authed(
+      agent.get(`/api/v1/connections/imports/${snapshotId}`),
+      analystToken,
+      workspaceId,
+    );
+    snap = poll.body;
+    status = poll.body.status;
+    if (status === "ready" || status === "failed") break;
+  }
+  assert.ok(["ready", "failed"].includes(status), JSON.stringify(snap));
+  if (status === "failed" && cancel.status === 200) {
+    assert.match(snap!.error || "", /cancel/i);
+  }
 });

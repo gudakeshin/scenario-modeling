@@ -3,11 +3,55 @@
 import { useEffect, useRef, useState } from "react";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 
+type ChromeVariant = "sidebar" | "page";
+
+const chrome = {
+  sidebar: {
+    root: "relative px-3 pt-3",
+    trigger:
+      "w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-[var(--sidebar-border)] hover:bg-[var(--sidebar-hover)] text-[var(--sidebar-text)] transition-colors",
+    menu: "absolute left-3 right-3 z-30 mt-1 rounded-lg border border-[var(--sidebar-border)] bg-[var(--sidebar-bg)] shadow-lg overflow-hidden",
+    option:
+      "flex-1 min-w-0 flex items-center gap-2 px-3 py-2 text-left text-sm text-[var(--sidebar-text)] hover:bg-[var(--sidebar-hover)] transition-colors",
+    muted: "text-[var(--sidebar-text-muted)]",
+    mutedHover: "p-1 rounded text-[var(--sidebar-text-muted)] hover:text-[var(--sidebar-text)]",
+    deleteHover: "p-1 rounded text-[var(--sidebar-text-muted)] hover:text-[var(--danger)]",
+    divider: "border-t border-[var(--sidebar-border)] p-2",
+    input:
+      "flex-1 min-w-0 px-2 py-1.5 text-sm rounded border border-[var(--sidebar-border)] bg-transparent text-[var(--sidebar-text)] outline-none focus:border-[var(--sidebar-text-muted)]",
+    addBtn:
+      "px-2 py-1.5 text-sm rounded text-[var(--sidebar-text)] hover:bg-[var(--sidebar-hover)] disabled:opacity-50",
+    newBtn:
+      "w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded text-[var(--sidebar-text-muted)] hover:text-[var(--sidebar-text)] hover:bg-[var(--sidebar-hover)] transition-colors",
+  },
+  page: {
+    root: "relative",
+    trigger:
+      "w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-[var(--border)] hover:bg-[var(--panel-bg)] text-[var(--text-primary)] transition-colors",
+    menu: "absolute left-0 right-0 z-30 mt-1 min-w-[14rem] rounded-lg border border-[var(--border)] bg-[var(--card-bg)] shadow-lg overflow-hidden",
+    option:
+      "flex-1 min-w-0 flex items-center gap-2 px-3 py-2 text-left text-sm text-[var(--text-primary)] hover:bg-[var(--panel-bg)] transition-colors",
+    muted: "text-[var(--text-muted)]",
+    mutedHover: "p-1 rounded text-[var(--text-muted)] hover:text-[var(--text-primary)]",
+    deleteHover: "p-1 rounded text-[var(--text-muted)] hover:text-[var(--danger)]",
+    divider: "border-t border-[var(--border)] p-2",
+    input:
+      "flex-1 min-w-0 px-2 py-1.5 text-sm rounded border border-[var(--border)] bg-[var(--card-bg)] text-[var(--text-primary)] placeholder:text-[var(--text-faint)] outline-none focus:border-accent/40",
+    addBtn:
+      "px-2 py-1.5 text-sm rounded text-[var(--text-primary)] hover:bg-[var(--panel-bg)] disabled:opacity-50",
+    newBtn:
+      "w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded text-[var(--text-muted)] hover:text-[var(--text-primary)] hover:bg-[var(--panel-bg)] transition-colors",
+  },
+} as const;
+
 /**
  * Workspace selector — each workspace has its own documents, model, and
  * scenarios. Switching swaps the entire app context.
+ *
+ * `variant="sidebar"` (default) uses dark sidebar tokens.
+ * `variant="page"` uses page surface tokens for light headers (e.g. Data & Models).
  */
-export function WorkspaceSwitcher() {
+export function WorkspaceSwitcher({ variant = "sidebar" }: { variant?: ChromeVariant }) {
   const { workspaces, activeWorkspaceId, loaded, loadWorkspaces, switchWorkspace, createWorkspace, renameWorkspace, deleteWorkspace } =
     useWorkspaceStore();
   const [open, setOpen] = useState(false);
@@ -17,6 +61,7 @@ export function WorkspaceSwitcher() {
   const [error, setError] = useState<string | null>(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
+  const c = chrome[variant];
 
   useEffect(() => {
     if (!loaded) loadWorkspaces().catch(() => {});
@@ -26,7 +71,6 @@ export function WorkspaceSwitcher() {
     if (creating) inputRef.current?.focus();
   }, [creating]);
 
-  // Close on outside click
   useEffect(() => {
     if (!open) return;
     const onClick = (e: MouseEvent) => {
@@ -81,11 +125,11 @@ export function WorkspaceSwitcher() {
   };
 
   return (
-    <div ref={rootRef} className="relative px-3 pt-3">
+    <div ref={rootRef} className={c.root}>
       <button
         type="button"
         onClick={() => setOpen((v) => !v)}
-        className="w-full flex items-center justify-between gap-2 px-3 py-2 rounded-lg border border-[var(--sidebar-border)] hover:bg-[var(--sidebar-hover)] text-[var(--sidebar-text)] transition-colors"
+        className={c.trigger}
         aria-haspopup="listbox"
         aria-expanded={open}
       >
@@ -101,7 +145,7 @@ export function WorkspaceSwitcher() {
       </button>
 
       {open && (
-        <div className="absolute left-3 right-3 z-30 mt-1 rounded-lg border border-[var(--sidebar-border)] bg-[var(--sidebar-bg)] shadow-lg overflow-hidden">
+        <div className={c.menu}>
           <ul role="listbox" className="max-h-64 overflow-y-auto py-1">
             {workspaces.map((w) => (
               <li key={w.workspace_id} className="group flex items-center">
@@ -113,7 +157,7 @@ export function WorkspaceSwitcher() {
                     switchWorkspace(w.workspace_id);
                     setOpen(false);
                   }}
-                  className="flex-1 min-w-0 flex items-center gap-2 px-3 py-2 text-left text-sm text-[var(--sidebar-text)] hover:bg-[var(--sidebar-hover)] transition-colors"
+                  className={c.option}
                 >
                   <span className="w-4 flex-shrink-0">
                     {w.workspace_id === activeWorkspaceId && (
@@ -124,14 +168,16 @@ export function WorkspaceSwitcher() {
                   </span>
                   <span className="truncate">{w.name}</span>
                   {w.is_default && (
-                    <span className="text-[10px] uppercase tracking-wide text-[var(--sidebar-text-muted)] flex-shrink-0">default</span>
+                    <span className={`text-[10px] uppercase tracking-wide flex-shrink-0 ${c.muted}`}>
+                      default
+                    </span>
                   )}
                 </button>
                 <span className="hidden group-hover:flex items-center pr-2 gap-1">
                   <button
                     type="button"
                     onClick={() => handleRename(w.workspace_id, w.name)}
-                    className="p-1 rounded text-[var(--sidebar-text-muted)] hover:text-[var(--sidebar-text)]"
+                    className={c.mutedHover}
                     aria-label={`Rename ${w.name}`}
                   >
                     <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -142,7 +188,7 @@ export function WorkspaceSwitcher() {
                     <button
                       type="button"
                       onClick={() => handleDelete(w.workspace_id, w.name, w.document_count, w.scenario_count)}
-                      className="p-1 rounded text-[var(--sidebar-text-muted)] hover:text-red-500"
+                      className={c.deleteHover}
                       aria-label={`Delete ${w.name}`}
                     >
                       <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -155,7 +201,7 @@ export function WorkspaceSwitcher() {
             ))}
           </ul>
 
-          <div className="border-t border-[var(--sidebar-border)] p-2">
+          <div className={c.divider}>
             {creating ? (
               <div className="flex items-center gap-1">
                 <input
@@ -173,23 +219,19 @@ export function WorkspaceSwitcher() {
                     }
                   }}
                   placeholder="Workspace name"
-                  className="flex-1 min-w-0 px-2 py-1.5 text-sm rounded border border-[var(--sidebar-border)] bg-transparent text-[var(--sidebar-text)] outline-none focus:border-[var(--sidebar-text-muted)]"
+                  className={c.input}
                 />
                 <button
                   type="button"
                   onClick={handleCreate}
                   disabled={busy || !draft.trim()}
-                  className="px-2 py-1.5 text-sm rounded text-[var(--sidebar-text)] hover:bg-[var(--sidebar-hover)] disabled:opacity-50"
+                  className={c.addBtn}
                 >
                   Add
                 </button>
               </div>
             ) : (
-              <button
-                type="button"
-                onClick={() => setCreating(true)}
-                className="w-full flex items-center gap-2 px-2 py-1.5 text-sm rounded text-[var(--sidebar-text-muted)] hover:text-[var(--sidebar-text)] hover:bg-[var(--sidebar-hover)] transition-colors"
-              >
+              <button type="button" onClick={() => setCreating(true)} className={c.newBtn}>
                 <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
                   <line x1="12" y1="5" x2="12" y2="19" />
                   <line x1="5" y1="12" x2="19" y2="12" />
@@ -197,7 +239,7 @@ export function WorkspaceSwitcher() {
                 New workspace
               </button>
             )}
-            {error && <p className="mt-1 px-2 text-xs text-red-500">{error}</p>}
+            {error && <p className="mt-1 px-2 text-xs text-[var(--danger)]">{error}</p>}
           </div>
         </div>
       )}

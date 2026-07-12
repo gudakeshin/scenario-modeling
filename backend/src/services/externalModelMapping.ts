@@ -64,6 +64,68 @@ function inferTimeHorizon(meta: PlanningModelMetadata): {
   };
 }
 
+export interface MappingPreviewMeasure {
+  id: string;
+  name: string;
+  role: "input" | "formula_exposed" | "formula_derived_on_import";
+  signage_note?: string;
+}
+
+export interface MappingPreview {
+  model_id: string;
+  model_name: string;
+  measures: MappingPreviewMeasure[];
+  account_signage: boolean;
+  notes: string[];
+}
+
+/**
+ * Heuristic-only mapping preview (no LLM). Classifies measures the same way
+ * activateExternalModel decides which need formula derivation.
+ */
+export function buildMappingPreview(meta: PlanningModelMetadata): MappingPreview {
+  const accountDim = meta.dimensions.find((d) => d.type === "account");
+  const notes: string[] = [];
+  if (accountDim) {
+    notes.push("Account rollups use source signage (signed_sum) on import.");
+  }
+
+  const measures: MappingPreviewMeasure[] = meta.measures.map((measure) => {
+    if (measure.formula) {
+      return {
+        id: measure.id,
+        name: measure.name,
+        role: "formula_exposed",
+        signage_note: accountDim ? "Uses account signage when activated" : undefined,
+      };
+    }
+    const looksDerived =
+      /calc|derived|margin|ratio/i.test(measure.name) || !!measure.attributes?.calculated;
+    if (looksDerived) {
+      return {
+        id: measure.id,
+        name: measure.name,
+        role: "formula_derived_on_import",
+        signage_note: "Formula derived on import (LLM assist when available)",
+      };
+    }
+    return {
+      id: measure.id,
+      name: measure.name,
+      role: "input",
+      signage_note: accountDim ? "Direct input; account signage applied on rollup" : "Direct input from facts",
+    };
+  });
+
+  return {
+    model_id: meta.modelId,
+    model_name: meta.modelName,
+    measures,
+    account_signage: !!accountDim,
+    notes,
+  };
+}
+
 export function mapMetadataToDefinition(
   meta: PlanningModelMetadata,
   opts?: { llmFormulas?: Map<string, { formula: string; dependencies: string[]; confidence: number }> },

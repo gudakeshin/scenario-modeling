@@ -6,6 +6,8 @@ export interface ConnectionFormValues {
   tokenUrl: string;
   clientId: string;
   secret: string;
+  namespaceId: string;
+  desBasePath: string;
 }
 
 export type ConnectionValidationErrors = Partial<Record<keyof ConnectionFormValues, string>>;
@@ -16,6 +18,12 @@ function isHttpsUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+function isValidDesBasePath(value: string): boolean {
+  const trimmed = value.trim();
+  if (!trimmed) return true; // empty → backend default
+  return trimmed.startsWith("/") && !/\s/.test(trimmed) && trimmed.length <= 200;
 }
 
 export function validateConnection(
@@ -32,6 +40,9 @@ export function validateConnection(
     }
     if (!isHttpsUrl(values.tokenUrl)) errors.tokenUrl = "Token URL must be a valid HTTPS URL.";
     if (!values.clientId.trim()) errors.clientId = "Client ID is required.";
+    if (values.desBasePath.trim() && !isValidDesBasePath(values.desBasePath)) {
+      errors.desBasePath = "DES base path must start with / and contain no spaces.";
+    }
   } else if (!values.baseUrl.trim()) {
     errors.baseUrl = "Base URL is required.";
   }

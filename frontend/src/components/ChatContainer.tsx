@@ -10,11 +10,9 @@ import { RoleSwitcher } from "./RoleSwitcher";
 import { useScenarioWorkflow } from "@/hooks/useScenarioWorkflow";
 import { useUiStore } from "@/stores/uiStore";
 import { strings } from "@/lib/strings";
-import { usePlanningConnectorsEnabled } from "@/lib/features";
 
 export function ChatContainer() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
-  const planningConnectorsEnabled = usePlanningConnectorsEnabled();
 
   const {
     conversations,
@@ -37,12 +35,12 @@ export function ChatContainer() {
   const {
     showReview, showComparison, showAudit, showMonteCarlo, showTornado,
     showTemplates, showInsights, showPeriods, showCharts, showSharing,
-    showRoles, showDocuments, showDocManager, showConnections, showImportWizard,
+    showRoles, showDocuments, showDocManager,
     periodData, chartData, expandedPanel,
     setShowReview, setShowComparison, setShowAudit, setShowMonteCarlo,
     setShowTornado, setShowTemplates, setShowInsights, setShowPeriods,
     setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
-    setShowDocManager, setShowConnections, setShowImportWizard, setPreloadedInsight, setExpandedPanel,
+    setShowDocManager, setPreloadedInsight, setExpandedPanel,
   } = useUiStore();
 
   // Toggle helper: activate+expand or deactivate+collapse
@@ -187,16 +185,6 @@ export function ChatContainer() {
               <button type="button" onClick={tp("docManager", showDocManager, setShowDocManager)} className={actionBtn(showDocManager)}>
                 {showDocManager ? "Hide Manager" : "Manager"}
               </button>
-              {planningConnectorsEnabled && (
-                <>
-                  <button type="button" onClick={tp("connections", showConnections, setShowConnections)} className={actionBtn(showConnections)}>
-                    {showConnections ? "Hide Connections" : "Connections"}
-                  </button>
-                  <button type="button" onClick={tp("importWizard", showImportWizard, setShowImportWizard)} className={actionBtn(showImportWizard)}>
-                    {showImportWizard ? "Hide Import" : "Import Model"}
-                  </button>
-                </>
-              )}
               <button
                 type="button"
                 onClick={() => {
@@ -235,24 +223,6 @@ export function ChatContainer() {
               >
                 {showDocManager ? "Hide Manager" : "Document Manager"}
               </button>
-              {planningConnectorsEnabled && (
-                <>
-                  <button
-                    type="button"
-                    onClick={tp("connections", showConnections, setShowConnections)}
-                    className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] hover:bg-background hover:shadow-card transition-all"
-                  >
-                    {showConnections ? "Hide Connections" : "Connections"}
-                  </button>
-                  <button
-                    type="button"
-                    onClick={tp("importWizard", showImportWizard, setShowImportWizard)}
-                    className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] hover:bg-background hover:shadow-card transition-all"
-                  >
-                    {showImportWizard ? "Hide Import" : "Import Model"}
-                  </button>
-                </>
-              )}
               <button
                 type="button"
                 onClick={() => {

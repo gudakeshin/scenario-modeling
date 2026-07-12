@@ -91,6 +91,8 @@ export interface FactQuery {
   versionMemberId?: string;
   /** Time member ids (inclusive range selection from wizard). */
   timeMemberIds?: string[];
+  /** Measure ids to include (empty/missing = all measures). */
+  measureIds?: string[];
   /** Advanced escape hatch — validated OData $filter fragment. */
   odataFilterRaw?: string;
   /** When true (default), non-leaf fact tuples are collected as source_aggregates. */

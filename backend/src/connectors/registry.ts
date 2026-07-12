@@ -40,27 +40,58 @@ function buildAuth(row: ConnectionRow, secretPlain: string): ConnectorAuth {
   };
 }
 
-export function createConnector(row: ConnectionRow): PlanningConnector {
-  const secretPlain = decryptSecret(row.secret_ciphertext);
-  const auth = buildAuth(row, secretPlain);
-  const creds: ConnectionCredentials = {
-    connectionId: row.connection_id,
-    provider: row.provider,
-    baseUrl: row.base_url,
-    auth,
-    authPublic: row.auth_public || {},
-    fixturePath: row.fixture_path || undefined,
-  };
-
-  switch (row.provider) {
+function connectorFromCreds(creds: ConnectionCredentials): PlanningConnector {
+  switch (creds.provider) {
     case "sap_sac":
       return new SacConnector(creds);
     case "mock":
       return new MockConnector(creds);
     case "anaplan":
     case "oracle_pbcs":
-      throw new Error(`Provider '${row.provider}' is not implemented yet`);
+      throw new Error(`Provider '${creds.provider}' is not implemented yet`);
     default:
-      throw new Error(`Unknown planning provider: ${row.provider}`);
+      throw new Error(`Unknown planning provider: ${creds.provider}`);
   }
+}
+
+export function createConnector(row: ConnectionRow): PlanningConnector {
+  const secretPlain = decryptSecret(row.secret_ciphertext);
+  const auth = buildAuth(row, secretPlain);
+  return connectorFromCreds({
+    connectionId: row.connection_id,
+    provider: row.provider,
+    baseUrl: row.base_url,
+    auth,
+    authPublic: row.auth_public || {},
+    fixturePath: row.fixture_path || undefined,
+  });
+}
+
+/** Build a connector from unsaved draft credentials (no DB row). */
+export function createConnectorFromDraft(opts: {
+  provider: PlanningProvider;
+  base_url: string;
+  auth_kind: AuthKind;
+  auth_public?: Record<string, unknown>;
+  secret: string;
+}): PlanningConnector {
+  const row: ConnectionRow = {
+    connection_id: "draft",
+    workspace_id: "draft",
+    provider: opts.provider,
+    name: "draft",
+    base_url: opts.base_url,
+    auth_kind: opts.auth_kind,
+    auth_public: opts.auth_public || {},
+    secret_ciphertext: "", // unused — we pass plaintext via buildAuth
+    status: "active",
+  };
+  const auth = buildAuth(row, opts.secret);
+  return connectorFromCreds({
+    connectionId: "draft",
+    provider: opts.provider,
+    baseUrl: opts.base_url,
+    auth,
+    authPublic: opts.auth_public || {},
+  });
 }

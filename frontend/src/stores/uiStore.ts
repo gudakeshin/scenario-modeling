@@ -36,9 +36,6 @@ interface UiState {
   showRoles: boolean;
   showDocuments: boolean;
   showDocManager: boolean;
-  showConnections: boolean;
-  showImportWizard: boolean;
-  importConnectionId: string | null;
 
   preloadedInsight: BusinessInsight | null;
   periodData: PeriodData | null;
@@ -65,9 +62,6 @@ interface UiState {
   setShowRoles: (v: boolean) => void;
   setShowDocuments: (v: boolean) => void;
   setShowDocManager: (v: boolean) => void;
-  setShowConnections: (v: boolean) => void;
-  setShowImportWizard: (v: boolean) => void;
-  setImportConnectionId: (v: string | null) => void;
 
   toggleShowReview: () => void;
   toggleShowComparison: () => void;
@@ -82,7 +76,6 @@ interface UiState {
   toggleShowRoles: () => void;
   toggleShowDocuments: () => void;
   toggleShowDocManager: () => void;
-  toggleShowConnections: () => void;
 
   setPreloadedInsight: (v: BusinessInsight | null) => void;
   setPeriodData: (v: PeriodData | null) => void;
@@ -111,9 +104,6 @@ export const useUiStore = create<UiState>((set) => ({
   showRoles: false,
   showDocuments: false,
   showDocManager: false,
-  showConnections: false,
-  showImportWizard: false,
-  importConnectionId: null,
 
   preloadedInsight: null,
   periodData: null,
@@ -139,9 +129,6 @@ export const useUiStore = create<UiState>((set) => ({
   setShowRoles: (v) => set({ showRoles: v }),
   setShowDocuments: (v) => set({ showDocuments: v }),
   setShowDocManager: (v) => set({ showDocManager: v }),
-  setShowConnections: (v) => set({ showConnections: v }),
-  setShowImportWizard: (v) => set({ showImportWizard: v }),
-  setImportConnectionId: (v) => set({ importConnectionId: v }),
 
   toggleShowReview: () => set((s) => ({ showReview: !s.showReview })),
   toggleShowComparison: () => set((s) => ({ showComparison: !s.showComparison })),
@@ -156,7 +143,6 @@ export const useUiStore = create<UiState>((set) => ({
   toggleShowRoles: () => set((s) => ({ showRoles: !s.showRoles })),
   toggleShowDocuments: () => set((s) => ({ showDocuments: !s.showDocuments })),
   toggleShowDocManager: () => set((s) => ({ showDocManager: !s.showDocManager })),
-  toggleShowConnections: () => set((s) => ({ showConnections: !s.showConnections })),
 
   setPreloadedInsight: (v) => set({ preloadedInsight: v }),
   setPeriodData: (v) => set({ periodData: v }),
@@ -186,9 +172,6 @@ export const useUiStore = create<UiState>((set) => ({
       showRoles: false,
       showDocuments: false,
       showDocManager: false,
-      showConnections: false,
-      showImportWizard: false,
-      importConnectionId: null,
       pendingQuestions: null,
       expandedPanel: null,
       dimensionalPov: {},

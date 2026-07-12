@@ -66,6 +66,10 @@ export class MockConnector implements PlanningConnector {
       const set = new Set(query.timeMemberIds);
       rows = rows.filter((r) => r.memberKey.split("|").some((p) => set.has(p)));
     }
+    if (query.measureIds && query.measureIds.length > 0) {
+      const set = new Set(query.measureIds);
+      rows = rows.filter((r) => set.has(r.measureId));
+    }
     if (query.filters) {
       for (const [, memberIds] of Object.entries(query.filters)) {
         if (!memberIds.length) continue;

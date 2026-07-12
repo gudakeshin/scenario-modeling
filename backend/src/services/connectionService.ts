@@ -4,12 +4,16 @@
  */
 
 import { pool } from "../db/index.js";
-import { createConnector, type ConnectionRow } from "../connectors/registry.js";
+import { createConnector, createConnectorFromDraft, type ConnectionRow } from "../connectors/registry.js";
 import type { FactQuery, PlanningModelMetadata, PlanningModelSummary } from "../connectors/types.js";
 import { encryptSecret } from "./secretVault.js";
 import { getRequestContext } from "../requestContext.js";
 import type { Scope } from "../middleware/workspace.js";
-import type { CreateConnectionBody, UpdateConnectionBody } from "../schemas/connections.js";
+import type {
+  CreateConnectionBody,
+  UpdateConnectionBody,
+  TestConnectionBody,
+} from "../schemas/connections.js";
 
 /** Explicit public columns — never SELECT *. */
 export const CONNECTION_PUBLIC_COLUMNS = `
@@ -39,6 +43,30 @@ export class ConnectionError extends Error {
     super(message);
     this.status = status;
   }
+}
+
+/** Map low-level OAuth/HTTP failures to user-facing guidance. */
+export function decodeConnectionError(err: unknown): string {
+  const msg = (err as Error)?.message || String(err);
+  if (/401|unauthorized|invalid_client|invalid_grant|access_denied/i.test(msg)) {
+    return "Authentication failed — check Client ID and secret";
+  }
+  if (/403|forbidden/i.test(msg)) {
+    return "Access denied — check permissions for this tenant";
+  }
+  if (/ENOTFOUND|ECONNREFUSED|getaddrinfo|fetch failed|network/i.test(msg)) {
+    return "Could not reach the server — check the base URL and network";
+  }
+  if (/timeout|ETIMEDOUT|AbortError/i.test(msg)) {
+    return "Connection timed out — check network and URL";
+  }
+  if (/certificate|SSL|TLS|CERT_/i.test(msg)) {
+    return "TLS/certificate error — verify the HTTPS URL";
+  }
+  if (/not implemented/i.test(msg)) {
+    return msg;
+  }
+  return msg.length > 280 ? `${msg.slice(0, 277)}…` : msg;
 }
 
 export async function writeIntegrationEvent(opts: {
@@ -257,7 +285,12 @@ export async function testConnection(
   if (!row) throw new ConnectionError("Connection not found", 404);
 
   const connector = createConnector(row);
-  const result = await connector.testConnection();
+  let result: { ok: boolean; message?: string };
+  try {
+    result = await connector.testConnection();
+  } catch (e) {
+    result = { ok: false, message: decodeConnectionError(e) };
+  }
 
   await pool.query(
     `UPDATE planning_connections
@@ -273,6 +306,42 @@ export async function testConnection(
     details: { ok: result.ok, message: result.message },
   });
   return result;
+}
+
+/**
+ * Test unsaved connection credentials without persisting.
+ * On success, includes model_count from a best-effort listModels call.
+ */
+export async function testConnectionDraft(
+  body: TestConnectionBody,
+): Promise<{ ok: boolean; message?: string; model_count?: number }> {
+  try {
+    const connector = createConnectorFromDraft({
+      provider: body.provider,
+      base_url: body.base_url,
+      auth_kind: body.auth_kind,
+      auth_public: body.auth_public,
+      secret: body.secret,
+    });
+    const result = await connector.testConnection();
+    if (!result.ok) {
+      return { ok: false, message: result.message || "Connection test failed" };
+    }
+    let model_count: number | undefined;
+    try {
+      const models = await connector.listModels();
+      model_count = models.length;
+    } catch {
+      // listModels is best-effort after a successful connectivity test
+    }
+    const message =
+      model_count !== undefined
+        ? `Connected — found ${model_count} model${model_count === 1 ? "" : "s"}`
+        : result.message || "Connected";
+    return { ok: true, message, model_count };
+  } catch (e) {
+    return { ok: false, message: decodeConnectionError(e) };
+  }
 }
 
 export async function listModels(
