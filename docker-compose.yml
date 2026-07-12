@@ -15,6 +15,16 @@ services:
       timeout: 5s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
   backend:
     build:
       context: ./backend
@@ -24,21 +34,28 @@ services:
       NODE_ENV: production
       PORT: 4000
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/scenario_modeling
-      # REQUIRED — set before starting (openssl rand -base64 48)
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in the environment or a .env file}
       JWT_ISSUER: scenario-modeling
       JWT_AUDIENCE: scenario-modeling-api
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
-      # REQUIRED for AI features in production
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in the environment or a .env file}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5-20251001}
       PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY:-}
       LLAMA_CLOUD_API_KEY: ${LLAMA_CLOUD_API_KEY:-}
       EMBEDDING_PROVIDER: ${EMBEDDING_PROVIDER:-none}
       DEMO_MODE: ${DEMO_MODE:-false}
-      AUTH_PROVIDER: local
+      AUTH_PROVIDER: ${AUTH_PROVIDER:-local}
+      SENTRY_DSN: ${SENTRY_DSN:-}
+      SHOWCASE_AGENT_ENABLED: ${SHOWCASE_AGENT_ENABLED:-false}
+      OBJECT_STORAGE_ENDPOINT: ${OBJECT_STORAGE_ENDPOINT:-}
+      OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-}
     depends_on:
       postgres:
+        condition: service_healthy
+      redis:
         condition: service_healthy
     healthcheck:
       test:
@@ -63,6 +80,7 @@ services:
     environment:
       PORT: 3000
       HOSTNAME: 0.0.0.0
+      NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
     depends_on:
       backend:
         condition: service_healthy

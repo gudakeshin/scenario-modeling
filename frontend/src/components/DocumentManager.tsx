@@ -15,6 +15,8 @@ import {
   type DocumentRecord,
   type CompanyContext,
   type UserModel,
+  type IngestionReport,
+  type FidelityReport,
 } from "@/lib/api";
 import { getCurrencySymbol } from "@/lib/metrics";
 
@@ -26,6 +28,21 @@ interface Props {
   onContextBuilt?: () => void;
 }
 
+function kindLabel(kind?: string) {
+  if (kind === "spreadsheet_model") return "XLSX model";
+  if (kind === "tabular_data") return "Tabular data";
+  return "Document";
+}
+
+function ingestionSummary(doc: DocumentRecord): string | null {
+  const r = doc.ingestion_report as IngestionReport | null | undefined;
+  if (!r?.summary) {
+    if (doc.document_kind === "tabular_data") return "CSV data-only (no formulas)";
+    return null;
+  }
+  return r.summary;
+}
+
 export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) {
   const [tab, setTab] = useState<Tab>("documents");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
@@ -34,6 +51,8 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [context, setContext] = useState<CompanyContext | null>(null);
   const [modelValidationStatus, setModelValidationStatus] = useState<"processing" | "needs_validation" | "ready" | null>(null);
+  const [ingestionReport, setIngestionReport] = useState<IngestionReport | null>(null);
+  const [fidelityReport, setFidelityReport] = useState<FidelityReport | null>(null);
   const [model, setModel] = useState<UserModel | null>(null);
   const [building, setBuilding] = useState(false);
   const [buildError, setBuildError] = useState<string | null>(null);
@@ -50,6 +69,14 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
       const { context: ctx, model_intelligence } = await getCompanyContext();
       setContext(ctx);
       setModelValidationStatus(model_intelligence?.validation_status || null);
+      setIngestionReport(
+        (model_intelligence?.ingestion_report as IngestionReport | null | undefined) ||
+          (ctx?.context_data?.ingestion_report as IngestionReport | null | undefined) ||
+          null,
+      );
+      const fidelity =
+        (ctx?.context_data?.runtime_validation?.fidelity as FidelityReport | undefined) || null;
+      setFidelityReport(fidelity);
     } catch { /* ignore */ }
   }, []);
 
@@ -141,11 +168,16 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
 
   const handleValidateModel = async () => {
     try {
-      await validateModelSchema();
+      setBuildError(null);
+      const result = await validateModelSchema();
+      if (result.fidelity) setFidelityReport(result.fidelity);
       await loadContext();
       await loadDocuments();
     } catch (e) {
-      setBuildError((e as Error).message);
+      const err = e as Error & { fidelity?: FidelityReport };
+      if (err.fidelity) setFidelityReport(err.fidelity);
+      setBuildError(err.message);
+      await loadContext();
     }
   };
 
@@ -180,10 +212,11 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
 
   const readyDocs = documents.filter((d) => d.status === "ready").length;
 
-  const validationPill = (status?: "processing" | "needs_validation" | "ready") => {
+  const validationPill = (status?: "processing" | "needs_validation" | "ready" | "error") => {
     if (!status) return null;
     if (status === "ready") return <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--success)]/15 text-[var(--success)] border border-[var(--success)]/20">Model Intelligence Ready</span>;
     if (status === "needs_validation") return <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 border border-amber-500/20">Needs Validation</span>;
+    if (status === "error") return <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-500/15 text-red-600 border border-red-500/20">Validation Error</span>;
     return <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent/10 text-accent border border-accent/20">Processing</span>;
   };
 
@@ -310,11 +343,26 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                   <div className="min-w-0">
                     <p className="text-sm font-medium text-[var(--text-primary)] truncate">{doc.original_filename}</p>
                     <p className="text-xs text-[var(--text-muted)]">
-                      {(doc.file_size_bytes / 1024).toFixed(0)} KB &middot; {doc.chunk_count} chunks &middot;{" "}
+                      {kindLabel(doc.document_kind)} &middot; {(doc.file_size_bytes / 1024).toFixed(0)} KB &middot; {doc.chunk_count} chunks &middot;{" "}
                       <span className={doc.status === "ready" ? "text-[var(--success)]" : "text-[var(--warning)]"}>{doc.status}</span>
                     </p>
-                    {doc.document_kind === "spreadsheet_model" && (
-                      <div className="mt-1">{validationPill(doc.validation_status)}</div>
+                    {ingestionSummary(doc) && (
+                      <p className="text-[11px] text-[var(--text-secondary)] mt-0.5 truncate">{ingestionSummary(doc)}</p>
+                    )}
+                    {(doc.document_kind === "spreadsheet_model" || doc.document_kind === "tabular_data") && (
+                      <div className="mt-1 flex flex-wrap gap-1.5 items-center">
+                        {doc.document_kind === "spreadsheet_model" && validationPill(doc.validation_status)}
+                        {doc.document_kind === "tabular_data" && (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--panel-bg)] border border-[var(--border)] text-[var(--text-muted)]">
+                            Data-only (no formulas)
+                          </span>
+                        )}
+                        {doc.ingestion_report?.unit && (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent/10 text-accent border border-accent/20">
+                            {[doc.ingestion_report.currency, doc.ingestion_report.unit].filter(Boolean).join(" ")}
+                          </span>
+                        )}
+                      </div>
                     )}
                   </div>
                   <button type="button" onClick={() => handleDelete(doc.document_id)} className="ml-2 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors" title="Delete">
@@ -363,6 +411,115 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                   >
                     Mark Model Validated
                   </button>
+                </div>
+              )}
+
+              {(ingestionReport || context.context_data.ingestion_report) && (
+                <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                  <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">Structural Ingestion</span>
+                  {(() => {
+                    const r = ingestionReport || context.context_data.ingestion_report;
+                    if (!r) return null;
+                    return (
+                      <>
+                        <p className="text-xs text-[var(--text-secondary)]">{r.summary}</p>
+                        {r.classification_evidence?.reason && (
+                          <p className="text-[11px] text-[var(--text-muted)]">{r.classification_evidence.reason}</p>
+                        )}
+                        <div className="text-[11px] text-[var(--text-muted)] flex flex-wrap gap-x-3 gap-y-1">
+                          {r.sheetCount != null && <span>Sheets: {r.sheetCount}</span>}
+                          {r.formulaCount != null && <span>Formulas: {r.formulaCount}</span>}
+                          {r.crossSheetLinkCount != null && <span>Cross-sheet links: {r.crossSheetLinkCount}</span>}
+                          {(r.currency || r.unit) && (
+                            <span>Denomination: {[r.currency, r.unit].filter(Boolean).join(" ")}</span>
+                          )}
+                          {r.executable != null && (
+                            <span>{r.executable ? "Executable cell graph" : "Not executable"}</span>
+                          )}
+                        </div>
+                        {r.warnings && r.warnings.length > 0 && (
+                          <ul className="text-[11px] text-[var(--warning)] list-disc list-inside max-h-24 overflow-auto">
+                            {r.warnings.slice(0, 8).map((w, i) => (
+                              <li key={`${w.code}-${i}`}>{w.message}{w.cell ? ` (${w.sheet}!${w.cell})` : ""}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {(fidelityReport || context.context_data.runtime_validation?.fidelity) && (() => {
+                const f = fidelityReport || context.context_data.runtime_validation?.fidelity;
+                if (!f) return null;
+                return (
+                  <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">Fidelity Reconciliation</span>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                        f.ready
+                          ? "bg-accent/10 text-accent border-accent/20"
+                          : "bg-[var(--warning)]/10 text-[var(--warning)] border-[var(--warning)]/30"
+                      }`}>
+                        {f.ready ? "Ready" : "Blocked"} · score {(f.score * 100).toFixed(1)}%
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-[var(--text-muted)] flex flex-wrap gap-x-3 gap-y-1">
+                      <span>Overall: {(f.score * 100).toFixed(1)}%</span>
+                      <span>Key outputs: {(f.key_output_score * 100).toFixed(1)}%</span>
+                      {f.compared_cells != null && <span>Compared: {f.compared_cells}</span>}
+                      {f.unsupported_cells?.length > 0 && (
+                        <span>Unsupported: {f.unsupported_cells.length}</span>
+                      )}
+                    </div>
+                    {f.divergences?.length > 0 && (
+                      <ul className="text-[11px] text-[var(--warning)] list-disc list-inside max-h-28 overflow-auto">
+                        {f.divergences.slice(0, 8).map((d, i) => (
+                          <li key={`${d.sheet}-${d.cell}-${i}`}>
+                            {d.sheet}!{d.cell}: expected {d.expected}, got {Number.isFinite(d.actual) ? d.actual : "NaN"}
+                            {d.is_key_output ? " (key output)" : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {f.unsupported_cells?.length > 0 && (
+                      <ul className="text-[11px] text-[var(--text-muted)] list-disc list-inside max-h-20 overflow-auto">
+                        {f.unsupported_cells.slice(0, 5).map((u, i) => (
+                          <li key={`${u.sheet}-${u.cell}-${i}`}>
+                            Unsupported {u.sheet}!{u.cell}: {u.reason}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {f.missing_expected_key_outputs && f.missing_expected_key_outputs.length > 0 && (
+                      <ul className="text-[11px] text-[var(--warning)] list-disc list-inside max-h-20 overflow-auto">
+                        {f.missing_expected_key_outputs.slice(0, 5).map((m, i) => (
+                          <li key={`${m.sheet}-${m.cell}-${i}`}>
+                            Missing Excel cached result for key output {m.sheet}!{m.cell}
+                            {m.id ? ` (${m.id})` : ""} — re-save/re-upload workbook
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {(context.context_data.tie_out_status === "variances" ||
+                (context.context_data.tie_out_variances && context.context_data.tie_out_variances.length > 0)) && (
+                <div className="bg-[var(--card-bg)] border border-[var(--warning)]/30 rounded-lg p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">P&amp;L Tie-out</span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--warning)]/10 text-[var(--warning)] border border-[var(--warning)]/30">
+                      {context.context_data.usability === "needs_review" ? "Needs review" : "Variances"}
+                    </span>
+                  </div>
+                  <ul className="text-[11px] text-[var(--warning)] list-disc list-inside max-h-28 overflow-auto">
+                    {(context.context_data.tie_out_variances || []).slice(0, 8).map((v, i) => (
+                      <li key={`${v.variable_id}-${i}`}>{v.message}</li>
+                    ))}
+                  </ul>
                 </div>
               )}
 

@@ -1,7 +1,7 @@
 import test from "node:test";
 import assert from "node:assert";
 import { CompiledModel } from "./expression.js";
-import { aggregatePeriodPl, periodOverrides, hasPeriodGrowth } from "./simulationAggregation.js";
+import { aggregatePeriodPl, aggregateXlsxPeriodPl, periodOverrides, hasPeriodGrowth } from "./simulationAggregation.js";
 import type { ModelDefinition } from "../models/registry.js";
 
 function makeModel(overrides?: Partial<ModelDefinition>): { model: CompiledModel; def: ModelDefinition } {
@@ -18,6 +18,17 @@ function makeModel(overrides?: Partial<ModelDefinition>): { model: CompiledModel
   };
   return { model: new CompiledModel(def), def };
 }
+
+test("aggregate xlsx: margin weighted, revenue summed", () => {
+  const periods = [
+    { period: "Q1", pl: { revenue: 1000, gross_margin: 0.4 }, variables: {} },
+    { period: "Q2", pl: { revenue: 3000, gross_margin: 0.5 }, variables: {} },
+  ];
+  const { aggregate } = aggregateXlsxPeriodPl(periods, ["revenue", "gross_margin"]);
+  assert.strictEqual(aggregate.revenue, 4000);
+  // weighted: (0.4*1000 + 0.5*3000) / 4000 = 0.475 → round2 → 0.48
+  assert.ok(Math.abs(aggregate.gross_margin - 0.48) < 1e-9, `got ${aggregate.gross_margin}`);
+});
 
 test("aggregate: revenue sums, gross_margin is ratio not ×N", () => {
   const { model, def } = makeModel();

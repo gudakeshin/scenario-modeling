@@ -18,6 +18,10 @@ import { z } from "zod";
 import { getApiKey, callClaudeStructured } from "./llmClient.js";
 import { pool } from "../db/index.js";
 import { logger } from "../logger.js";
+import {
+  describeCostRevenueComposition,
+  type ContextData,
+} from "./contextEngine.js";
 
 // ── Types ──
 
@@ -62,6 +66,13 @@ interface AnalysisContext {
   currency_symbol: string;
   absurdity_warnings?: string[];
   period_count?: number;
+  company_name?: string;
+  industry?: string;
+  business_model?: string;
+  /** Revenue streams + cost/revenue line-item composition for grounded analysis. */
+  cost_revenue_composition?: string;
+  causal_chain?: Array<{ step: string; detail?: string; kind?: string }>;
+  research_citations?: Array<{ source: string; snippet?: string; url?: string }>;
 }
 
 const CURRENCY_SYMBOLS: Record<string, string> = {
@@ -85,9 +96,42 @@ async function getCurrencyFromContext(scenarioId: string): Promise<string> {
   }
 }
 
+async function getCompanyContextForScenario(scenarioId: string): Promise<{
+  company_name?: string;
+  industry?: string;
+  business_model?: string;
+  cost_revenue_composition?: string;
+}> {
+  try {
+    const r = await pool.query(
+      `SELECT cc.company_name, cc.industry, cc.context_data FROM company_context cc
+       JOIN scenarios s ON s.workspace_id = cc.workspace_id
+       WHERE s.scenario_id = $1 AND cc.status = 'active'
+       ORDER BY cc.created_at DESC LIMIT 1`,
+      [scenarioId],
+    );
+    if (!r.rows[0]) return {};
+    const data = (r.rows[0].context_data || {}) as ContextData;
+    return {
+      company_name: r.rows[0].company_name || data.company_name || undefined,
+      industry: r.rows[0].industry || data.industry || undefined,
+      business_model: data.business_model || undefined,
+      cost_revenue_composition: describeCostRevenueComposition(data) || undefined,
+    };
+  } catch {
+    return {};
+  }
+}
+
 // ── Data loader ──
 
-async function loadAnalysisContext(scenarioId: string): Promise<AnalysisContext> {
+async function loadAnalysisContext(
+  scenarioId: string,
+  extras?: {
+    causal_chain?: AnalysisContext["causal_chain"];
+    research_citations?: AnalysisContext["research_citations"];
+  },
+): Promise<AnalysisContext> {
   const sRes = await pool.query("SELECT name, nl_input FROM scenarios WHERE scenario_id = $1", [scenarioId]);
   if (sRes.rows.length === 0) throw new Error("Scenario not found");
 
@@ -134,6 +178,7 @@ async function loadAnalysisContext(scenarioId: string): Promise<AnalysisContext>
   const base_pl = await resolveBasePl(rawPl, model);
 
   const currency_symbol = await getCurrencyFromContext(scenarioId);
+  const company = await getCompanyContextForScenario(scenarioId);
 
   return {
     scenario_name: sRes.rows[0].name,
@@ -151,6 +196,9 @@ async function loadAnalysisContext(scenarioId: string): Promise<AnalysisContext>
     })),
     sensitivity,
     monte_carlo,
+    ...company,
+    causal_chain: extras?.causal_chain,
+    research_citations: extras?.research_citations,
   };
 }
 
@@ -319,6 +367,10 @@ function buildUserPrompt(ctx: AnalysisContext): string {
   const parts = [
     `## Scenario: "${ctx.nl_input}"`,
     `Name: ${ctx.scenario_name || "(unnamed)"}`,
+    ctx.company_name ? `Company: ${ctx.company_name}` : "",
+    ctx.industry ? `Industry: ${ctx.industry}` : "",
+    ctx.business_model ? `Business model: ${ctx.business_model}` : "",
+    ctx.cost_revenue_composition || "",
     ctx.period_count ? `Periods: ${ctx.period_count} quarters` : "",
     "",
     "## Assumptions Changed",
@@ -331,6 +383,20 @@ function buildUserPrompt(ctx: AnalysisContext): string {
     const delta = val - base;
     const pct = base !== 0 ? ((delta / base) * 100).toFixed(1) : "n/a";
     parts.push(`- ${metric}: ${c}${base.toLocaleString()} → ${c}${val.toLocaleString()} (${delta >= 0 ? "+" : "-"}${c}${Math.abs(delta).toLocaleString()}, ${pct}%)`);
+  }
+
+  if (ctx.causal_chain && ctx.causal_chain.length > 0) {
+    parts.push("", "## Causal Chain (from scenario reasoning agent)");
+    for (const step of ctx.causal_chain) {
+      parts.push(`- [${step.kind || "other"}] ${step.step}${step.detail ? `: ${step.detail}` : ""}`);
+    }
+  }
+
+  if (ctx.research_citations && ctx.research_citations.length > 0) {
+    parts.push("", "## Research Citations");
+    for (const cite of ctx.research_citations) {
+      parts.push(`- ${cite.source}${cite.snippet ? `: ${cite.snippet}` : ""}${cite.url ? ` (${cite.url})` : ""}`);
+    }
   }
 
   if (ctx.sensitivity?.bars && ctx.sensitivity.bars.length > 0) {
@@ -356,11 +422,17 @@ function buildUserPrompt(ctx: AnalysisContext): string {
   }
 
   parts.push("", "Produce your structured business analysis focusing on 'So what does this mean?' and 'What should we do next?'");
-  return parts.join("\n");
+  return parts.filter((p, i, arr) => !(p === "" && arr[i - 1] === "")).join("\n");
 }
 
-export async function generateBusinessAnalysis(scenarioId: string): Promise<BusinessInsight> {
-  const ctx = await loadAnalysisContext(scenarioId);
+export async function generateBusinessAnalysis(
+  scenarioId: string,
+  extras?: {
+    causal_chain?: AnalysisContext["causal_chain"];
+    research_citations?: AnalysisContext["research_citations"];
+  },
+): Promise<BusinessInsight> {
+  const ctx = await loadAnalysisContext(scenarioId, extras);
 
   if (!getApiKey()) {
     return generateFallbackAnalysis(ctx);

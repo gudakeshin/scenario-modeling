@@ -1,5 +1,5 @@
 import type { Request, Response, NextFunction } from "express";
-import { getAuthProvider } from "./localProvider.js";
+import { getAuthProvider } from "./getProvider.js";
 import type { AuthUser, Role } from "./provider.js";
 
 export type { AuthUser, Role };

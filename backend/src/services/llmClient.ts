@@ -4,6 +4,9 @@
  * All LLM calls go through this module so retries, timeouts, model
  * routing, and usage tracking are handled in one place instead of being
  * (or not being) reimplemented per caller.
+ *
+ * Stable system prompts are marked with Anthropic `cache_control: ephemeral`
+ * so repeated calls can hit prompt cache (cost/latency win, no behavior change).
  */
 
 import Anthropic from "@anthropic-ai/sdk";
@@ -21,7 +24,17 @@ const DEFAULT_MODEL = "claude-haiku-4-5-20251001";
 const REQUEST_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS) || 60_000;
 const MAX_RETRIES = Number(process.env.LLM_MAX_RETRIES) || 3;
 
-export type LlmPurpose = "parse" | "reflection" | "business_analysis" | "qa" | "context_build" | "narrative" | "rag" | "connector_map" | "other";
+export type LlmPurpose =
+  | "parse"
+  | "reflection"
+  | "business_analysis"
+  | "qa"
+  | "context_build"
+  | "narrative"
+  | "rag"
+  | "connector_map"
+  | "agent"
+  | "other";
 
 export function getApiKey(): string | undefined {
   return process.env.ANTHROPIC_API_KEY;
@@ -32,16 +45,19 @@ export function getModel(): string {
   return process.env.ANTHROPIC_MODEL || DEFAULT_MODEL;
 }
 
-/** Model routing: parse gets the fast/cheap tier, analysis/QA get the stronger tier. */
-function modelForPurpose(purpose: LlmPurpose): string {
+/** Model routing: parse/cheap, analysis/Sonnet, QA+agent/Opus. */
+export function modelForPurpose(purpose: LlmPurpose): string {
   switch (purpose) {
     case "parse":
     case "reflection":
       return config.anthropicModelParse || getModel();
     case "business_analysis":
-    case "qa":
     case "context_build":
+    case "narrative":
       return config.anthropicModelAnalysis || getModel();
+    case "qa":
+    case "agent":
+      return config.anthropicModelQa || config.anthropicModelAnalysis || getModel();
     default:
       return getModel();
   }
@@ -57,24 +73,74 @@ export function getClient(): Anthropic {
   return _client;
 }
 
+/** Mark a stable system prompt as an Anthropic prompt-cache breakpoint. */
+function cachedSystem(text: string): Anthropic.TextBlockParam[] {
+  return [
+    {
+      type: "text",
+      text,
+      cache_control: { type: "ephemeral" },
+    },
+  ];
+}
+
+function usageCacheTokens(usage?: {
+  cache_read_input_tokens?: number | null;
+  cache_creation_input_tokens?: number | null;
+} | null): { cacheReadInputTokens: number; cacheCreationInputTokens: number } {
+  return {
+    cacheReadInputTokens: usage?.cache_read_input_tokens ?? 0,
+    cacheCreationInputTokens: usage?.cache_creation_input_tokens ?? 0,
+  };
+}
+
 async function logUsage(entry: {
   purpose: string;
   model: string;
   inputTokens: number;
   outputTokens: number;
+  cacheReadInputTokens?: number;
+  cacheCreationInputTokens?: number;
   latencyMs: number;
   succeeded: boolean;
   errorMessage?: string;
 }): Promise<void> {
   try {
     await pool.query(
-      `INSERT INTO llm_usage (purpose, model, input_tokens, output_tokens, latency_ms, succeeded, error_message)
-       VALUES ($1, $2, $3, $4, $5, $6, $7)`,
-      [entry.purpose, entry.model, entry.inputTokens, entry.outputTokens, entry.latencyMs, entry.succeeded, entry.errorMessage ?? null],
+      `INSERT INTO llm_usage (
+         purpose, model, input_tokens, output_tokens,
+         cache_read_input_tokens, cache_creation_input_tokens,
+         latency_ms, succeeded, error_message
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
+      [
+        entry.purpose,
+        entry.model,
+        entry.inputTokens,
+        entry.outputTokens,
+        entry.cacheReadInputTokens ?? 0,
+        entry.cacheCreationInputTokens ?? 0,
+        entry.latencyMs,
+        entry.succeeded,
+        entry.errorMessage ?? null,
+      ],
     );
   } catch (e) {
     // Usage logging must never break the caller's actual LLM call.
-    logger.warn({ detail: (e as Error).message }, "[llmClient] Failed to log usage:");
+    // Older DBs without cache columns: retry without them once.
+    const msg = (e as Error).message || "";
+    if (msg.includes("cache_read_input_tokens") || msg.includes("cache_creation_input_tokens")) {
+      try {
+        await pool.query(
+          `INSERT INTO llm_usage (purpose, model, input_tokens, output_tokens, latency_ms, succeeded, error_message)
+           VALUES ($1, $2, $3, $4, $5, $6, $7)`,
+          [entry.purpose, entry.model, entry.inputTokens, entry.outputTokens, entry.latencyMs, entry.succeeded, entry.errorMessage ?? null],
+        );
+      } catch (e2) {
+        logger.warn({ detail: (e2 as Error).message }, "[llmClient] Failed to log usage (fallback):");
+      }
+    } else {
+      logger.warn({ detail: msg }, "[llmClient] Failed to log usage:");
+    }
   }
   llmTokensUsed.inc({ model: entry.model, type: "input" }, entry.inputTokens);
   llmTokensUsed.inc({ model: entry.model, type: "output" }, entry.outputTokens);
@@ -101,7 +167,7 @@ export async function callClaude(opts: {
         model,
         max_tokens: opts.maxTokens ?? 2000,
         temperature: opts.temperature ?? 0.2,
-        system: opts.system,
+        system: cachedSystem(opts.system),
         messages: [{ role: "user", content: opts.userMessage }],
       },
       { maxRetries: MAX_RETRIES, timeout: REQUEST_TIMEOUT_MS },
@@ -111,11 +177,13 @@ export async function callClaude(opts: {
     if (block.type !== "text" || !block.text) {
       throw new Error("Empty Claude response");
     }
+    const cache = usageCacheTokens(response.usage);
     void logUsage({
       purpose: opts.purpose ?? "other",
       model,
       inputTokens: response.usage?.input_tokens ?? 0,
       outputTokens: response.usage?.output_tokens ?? 0,
+      ...cache,
       latencyMs: Date.now() - started,
       succeeded: true,
     });
@@ -171,7 +239,7 @@ export async function callClaudeStructured<T>(opts: {
         model,
         max_tokens: opts.maxTokens ?? 2000,
         temperature: opts.temperature ?? 0.2,
-        system: opts.system,
+        system: cachedSystem(opts.system),
         messages: [{ role: "user", content: opts.userMessage }],
         tools: [
           {
@@ -185,11 +253,13 @@ export async function callClaudeStructured<T>(opts: {
       { maxRetries: MAX_RETRIES, timeout: REQUEST_TIMEOUT_MS },
     );
 
+    const cache = usageCacheTokens(response.usage);
     void logUsage({
       purpose: opts.purpose ?? "other",
       model,
       inputTokens: response.usage?.input_tokens ?? 0,
       outputTokens: response.usage?.output_tokens ?? 0,
+      ...cache,
       latencyMs: Date.now() - started,
       succeeded: true,
     });
@@ -214,6 +284,207 @@ export async function callClaudeStructured<T>(opts: {
         errorMessage: (e as Error).message,
       });
     }
+    throw e;
+  }
+}
+
+export interface AgentTool {
+  name: string;
+  description: string;
+  inputSchema: Anthropic.Tool.InputSchema;
+  handler: (input: unknown) => Promise<unknown>;
+}
+
+export interface AgentLoopResult {
+  result: unknown;
+  steps: Array<{ tool: string; input: unknown; output: unknown }>;
+  stopped_reason: string;
+}
+
+/**
+ * Multi-turn Claude tool loop. Continues until the model calls `terminalToolName`
+ * (validated against `terminalSchema`), or max steps / timeout is hit.
+ */
+export async function callClaudeAgentLoop(opts: {
+  system: string;
+  userMessage: string;
+  tools: AgentTool[];
+  terminalToolName: string;
+  terminalSchema: z.ZodType<any>;
+  maxSteps?: number;
+  purpose?: LlmPurpose;
+}): Promise<AgentLoopResult> {
+  const client = getClient();
+  const purpose = opts.purpose ?? "agent";
+  const model = modelForPurpose(purpose);
+  const maxSteps = opts.maxSteps ?? config.AGENT_MAX_STEPS;
+  const timeoutMs = config.AGENT_TIMEOUT_MS;
+  const started = Date.now();
+  const steps: AgentLoopResult["steps"] = [];
+
+  const toolsByName = new Map(opts.tools.map((t) => [t.name, t]));
+  if (!toolsByName.has(opts.terminalToolName)) {
+    throw new Error(`Terminal tool "${opts.terminalToolName}" must be included in tools`);
+  }
+
+  const anthropicTools: Anthropic.Tool[] = opts.tools.map((t) => ({
+    name: t.name,
+    description: t.description,
+    input_schema: t.inputSchema,
+  }));
+
+  type Msg = Anthropic.MessageParam;
+  const messages: Msg[] = [{ role: "user", content: opts.userMessage }];
+  const system = cachedSystem(opts.system);
+
+  let totalIn = 0;
+  let totalOut = 0;
+  let totalCacheRead = 0;
+  let totalCacheCreation = 0;
+
+  try {
+    for (let step = 0; step < maxSteps; step++) {
+      if (Date.now() - started > timeoutMs) {
+        void logUsage({
+          purpose,
+          model,
+          inputTokens: totalIn,
+          outputTokens: totalOut,
+          cacheReadInputTokens: totalCacheRead,
+          cacheCreationInputTokens: totalCacheCreation,
+          latencyMs: Date.now() - started,
+          succeeded: false,
+          errorMessage: "agent_timeout",
+        });
+        return { result: null, steps, stopped_reason: "timeout" };
+      }
+
+      const remaining = Math.max(5_000, timeoutMs - (Date.now() - started));
+      const response = await client.messages.create(
+        {
+          model,
+          max_tokens: 4096,
+          temperature: 0.2,
+          system,
+          messages,
+          tools: anthropicTools,
+        },
+        { maxRetries: MAX_RETRIES, timeout: Math.min(REQUEST_TIMEOUT_MS, remaining) },
+      );
+
+      totalIn += response.usage?.input_tokens ?? 0;
+      totalOut += response.usage?.output_tokens ?? 0;
+      const cache = usageCacheTokens(response.usage);
+      totalCacheRead += cache.cacheReadInputTokens;
+      totalCacheCreation += cache.cacheCreationInputTokens;
+
+      const toolUses = response.content.filter(
+        (b): b is Anthropic.ToolUseBlock => b.type === "tool_use",
+      );
+
+      messages.push({ role: "assistant", content: response.content });
+
+      if (toolUses.length === 0) {
+        void logUsage({
+          purpose,
+          model,
+          inputTokens: totalIn,
+          outputTokens: totalOut,
+          cacheReadInputTokens: totalCacheRead,
+          cacheCreationInputTokens: totalCacheCreation,
+          latencyMs: Date.now() - started,
+          succeeded: true,
+        });
+        return { result: null, steps, stopped_reason: "no_tool_use" };
+      }
+
+      const toolResults: Anthropic.ToolResultBlockParam[] = [];
+      for (const tu of toolUses) {
+        const tool = toolsByName.get(tu.name);
+        if (!tool) {
+          toolResults.push({
+            type: "tool_result",
+            tool_use_id: tu.id,
+            content: JSON.stringify({ error: `Unknown tool: ${tu.name}` }),
+            is_error: true,
+          });
+          steps.push({ tool: tu.name, input: tu.input, output: { error: `Unknown tool: ${tu.name}` } });
+          continue;
+        }
+
+        if (tu.name === opts.terminalToolName) {
+          const parsed = opts.terminalSchema.safeParse(tu.input);
+          if (!parsed.success) {
+            const errOut = {
+              error: `Terminal schema validation failed: ${parsed.error.message}`,
+            };
+            toolResults.push({
+              type: "tool_result",
+              tool_use_id: tu.id,
+              content: JSON.stringify(errOut),
+              is_error: true,
+            });
+            steps.push({ tool: tu.name, input: tu.input, output: errOut });
+            continue;
+          }
+          steps.push({ tool: tu.name, input: tu.input, output: parsed.data });
+          void logUsage({
+            purpose,
+            model,
+            inputTokens: totalIn,
+            outputTokens: totalOut,
+            cacheReadInputTokens: totalCacheRead,
+            cacheCreationInputTokens: totalCacheCreation,
+            latencyMs: Date.now() - started,
+            succeeded: true,
+          });
+          return { result: parsed.data, steps, stopped_reason: "terminal_tool" };
+        }
+
+        let output: unknown;
+        try {
+          output = await tool.handler(tu.input);
+        } catch (e) {
+          output = { error: (e as Error).message };
+        }
+        steps.push({ tool: tu.name, input: tu.input, output });
+        toolResults.push({
+          type: "tool_result",
+          tool_use_id: tu.id,
+          content: JSON.stringify(output).slice(0, 80_000),
+          is_error: !!(output && typeof output === "object" && "error" in (output as object)),
+        });
+      }
+
+      if (toolResults.length > 0) {
+        messages.push({ role: "user", content: toolResults });
+      }
+    }
+
+    void logUsage({
+      purpose,
+      model,
+      inputTokens: totalIn,
+      outputTokens: totalOut,
+      cacheReadInputTokens: totalCacheRead,
+      cacheCreationInputTokens: totalCacheCreation,
+      latencyMs: Date.now() - started,
+      succeeded: false,
+      errorMessage: "max_steps",
+    });
+    return { result: null, steps, stopped_reason: "max_steps" };
+  } catch (e) {
+    void logUsage({
+      purpose,
+      model,
+      inputTokens: totalIn,
+      outputTokens: totalOut,
+      cacheReadInputTokens: totalCacheRead,
+      cacheCreationInputTokens: totalCacheCreation,
+      latencyMs: Date.now() - started,
+      succeeded: false,
+      errorMessage: (e as Error).message,
+    });
     throw e;
   }
 }

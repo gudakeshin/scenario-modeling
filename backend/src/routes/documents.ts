@@ -4,13 +4,14 @@
 
 import { Router } from "express";
 import multer from "multer";
-import { processDocument, listDocuments, getDocument, deleteDocument } from "../services/documentService.js";
+import { processDocument, listDocuments, getDocument, deleteDocument, appendDocumentConversationMessage, listDocumentConversationMessages, getDocumentSignedUrl, getDocumentOriginalBytes } from "../services/documentService.js";
 import { queryDocument } from "../services/ragService.js";
 import { isLlamaParseConfigured, testLlamaParseConnection } from "../services/llamaParseService.js";
 import { requireRole } from "../middleware/rbac.js";
 import { assertCanReadDocument } from "../services/authzService.js";
 import { scopeOf } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
+import { isEmbeddingEnabled } from "../services/embeddingService.js";
 
 export const documentsRouter = Router();
 
@@ -85,6 +86,20 @@ documentsRouter.get("/", async (req, res) => {
   }
 });
 
+// ── Document conversation history (before /:id) ──
+documentsRouter.get("/conversations/:conversationId/messages", async (req, res) => {
+  try {
+    const messages = await listDocumentConversationMessages(
+      req.params.conversationId,
+      req.workspace!.workspaceId,
+    );
+    return res.json({ conversation_id: req.params.conversationId, messages });
+  } catch (e) {
+    logger.error({ err: e }, "Request failed");
+    return res.status(500).json({ error: "Failed to load conversation" });
+  }
+});
+
 // ── Get single document ──
 documentsRouter.get("/:id", async (req, res) => {
   try {
@@ -97,6 +112,46 @@ documentsRouter.get("/:id", async (req, res) => {
     if (status) return res.status(status).json({ error: (e as Error).message });
     logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to get document" });
+  }
+});
+
+// ── Signed URL for original (S3); 404 when BYTEA-only ──
+documentsRouter.get("/:id/signed-url", async (req, res) => {
+  try {
+    await assertCanReadDocument(req.user!.userId, req.user!.role, req.params.id);
+    const url = await getDocumentSignedUrl(req.params.id);
+    if (!url) {
+      return res.status(404).json({
+        error: "Signed URL unavailable — original is stored in Postgres or object storage is unset",
+        code: "NO_OBJECT_STORAGE",
+      });
+    }
+    return res.json({ url, expires_in: 3600 });
+  } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
+    return res.status(500).json({ error: "Failed to get signed URL" });
+  }
+});
+
+// ── Download original bytes (dual-read S3 → BYTEA) ──
+documentsRouter.get("/:id/original", async (req, res) => {
+  try {
+    await assertCanReadDocument(req.user!.userId, req.user!.role, req.params.id);
+    const original = await getDocumentOriginalBytes(req.params.id);
+    if (!original) return res.status(404).json({ error: "Original bytes not found" });
+    res.setHeader("Content-Type", original.contentType);
+    res.setHeader(
+      "Content-Disposition",
+      `attachment; filename="${original.filename.replace(/"/g, "")}"`,
+    );
+    return res.send(original.bytes);
+  } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
+    return res.status(500).json({ error: "Failed to download original" });
   }
 });
 
@@ -119,8 +174,27 @@ documentsRouter.post("/:id/query", async (req, res) => {
       return res.status(400).json({ error: `Document is still ${doc.status}. Please wait.` });
     }
 
-    const result = await queryDocument(question, req.workspace!.workspaceId, req.params.id);
-    return res.json(result);
+    const result = await queryDocument(question, req.workspace!.workspaceId, req.params.id, {
+      conversationId: req.body?.conversation_id,
+    });
+    let conversation_id: string | undefined;
+    if (req.body?.persist !== false) {
+      try {
+        const saved = await appendDocumentConversationMessage({
+          workspaceId: req.workspace!.workspaceId,
+          userId: req.user!.userId,
+          documentId: req.params.id,
+          conversationId: req.body?.conversation_id,
+          question,
+          answer: result.answer,
+          sources: result.sources,
+        });
+        conversation_id = saved.conversation_id;
+      } catch (e) {
+        logger.warn({ detail: (e as Error).message }, "[Documents] Failed to persist conversation:");
+      }
+    }
+    return res.json({ ...result, conversation_id, retrieval: isEmbeddingEnabled() ? "hybrid" : "keyword" });
   } catch (e) {
     const status = authzError(e);
     if (status) return res.status(status).json({ error: (e as Error).message });
@@ -137,8 +211,27 @@ documentsRouter.post("/query", async (req, res) => {
       return res.status(400).json({ error: "question is required" });
     }
 
-    const result = await queryDocument(question, req.workspace!.workspaceId);
-    return res.json(result);
+    const result = await queryDocument(question, req.workspace!.workspaceId, undefined, {
+      conversationId: req.body?.conversation_id,
+    });
+    let conversation_id: string | undefined;
+    if (req.body?.persist !== false) {
+      try {
+        const saved = await appendDocumentConversationMessage({
+          workspaceId: req.workspace!.workspaceId,
+          userId: req.user!.userId,
+          documentId: null,
+          conversationId: req.body?.conversation_id,
+          question,
+          answer: result.answer,
+          sources: result.sources,
+        });
+        conversation_id = saved.conversation_id;
+      } catch (e) {
+        logger.warn({ detail: (e as Error).message }, "[Documents] Failed to persist conversation:");
+      }
+    }
+    return res.json({ ...result, conversation_id, retrieval: isEmbeddingEnabled() ? "hybrid" : "keyword" });
   } catch (e) {
     logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Query failed: " + (e as Error).message });

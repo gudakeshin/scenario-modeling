@@ -5,6 +5,7 @@
 import { decryptSecret } from "../services/secretVault.js";
 import { MockConnector } from "./mockConnector.js";
 import { SacConnector } from "./sacConnector.js";
+import { AnaplanConnector } from "./anaplanConnector.js";
 import type {
   AuthKind,
   ConnectionCredentials,
@@ -47,6 +48,7 @@ function connectorFromCreds(creds: ConnectionCredentials): PlanningConnector {
     case "mock":
       return new MockConnector(creds);
     case "anaplan":
+      return new AnaplanConnector(creds);
     case "oracle_pbcs":
       throw new Error(`Provider '${creds.provider}' is not implemented yet`);
     default:

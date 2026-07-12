@@ -1,6 +1,6 @@
 "use client";
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Sidebar } from "./Sidebar";
 import { MessageList } from "./MessageList";
 import { ChatComposer } from "./ChatComposer";
@@ -9,10 +9,13 @@ import { AnalysisPanelStrip } from "./AnalysisPanelStrip";
 import { RoleSwitcher } from "./RoleSwitcher";
 import { useScenarioWorkflow } from "@/hooks/useScenarioWorkflow";
 import { useUiStore } from "@/stores/uiStore";
+import { useChatStore } from "@/stores/chatStore";
 import { strings } from "@/lib/strings";
+import { getAgentStatus, type AgentStatus } from "@/lib/api";
 
 export function ChatContainer() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
+  const [agentStatus, setAgentStatus] = useState<AgentStatus | null>(null);
 
   const {
     conversations,
@@ -26,22 +29,43 @@ export function ChatContainer() {
     handleSelect,
     handleRename,
     handleDelete,
+    handleDeleteMany,
     handleSend,
     handleApproved,
     handleFollowUpAnswers,
     handleTemplateCloned,
   } = useScenarioWorkflow();
 
+  useEffect(() => {
+    let cancelled = false;
+    getAgentStatus()
+      .then((s) => {
+        if (!cancelled) setAgentStatus(s);
+      })
+      .catch(() => {
+        /* non-fatal */
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   const {
     showReview, showComparison, showAudit, showMonteCarlo, showTornado,
+    showAttribution, showDriverTree, showGoalSeek,
+    showVersionHistory, showActualsCompare, showLiveWhatIf,
     showTemplates, showInsights, showPeriods, showCharts, showSharing,
     showRoles, showDocuments, showDocManager,
     periodData, chartData, expandedPanel,
     setShowReview, setShowComparison, setShowAudit, setShowMonteCarlo,
-    setShowTornado, setShowTemplates, setShowInsights, setShowPeriods,
+    setShowTornado, setShowAttribution, setShowDriverTree, setShowGoalSeek,
+    setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
+    setShowTemplates, setShowInsights, setShowPeriods,
     setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
     setShowDocManager, setPreloadedInsight, setExpandedPanel,
   } = useUiStore();
+
+  const assistantMode = useChatStore((s) => s.assistantMode);
 
   // Toggle helper: activate+expand or deactivate+collapse
   const tp = (id: string, show: boolean, setShow: (v: boolean) => void) => () => {
@@ -77,6 +101,7 @@ export function ChatContainer() {
         onNewChat={handleNewChat}
         onRename={handleRename}
         onDelete={handleDelete}
+        onDeleteMany={handleDeleteMany}
         mobileOpen={mobileSidebarOpen}
         onMobileClose={() => setMobileSidebarOpen(false)}
       />
@@ -99,7 +124,20 @@ export function ChatContainer() {
             </button>
             <h1 className="text-sm font-semibold text-[var(--text-primary)]">{strings.app.name}</h1>
           </div>
-          <RoleSwitcher />
+          <div className="flex items-center gap-3">
+            {agentStatus && !agentStatus.ready && (
+              <span
+                className="hidden sm:inline text-[11px] text-[var(--text-muted)] max-w-[220px] truncate"
+                title={agentStatus.reasons.join(" · ")}
+              >
+                Agent: {agentStatus.enabled ? "needs validated model" : "off"}
+              </span>
+            )}
+            {agentStatus?.ready && (
+              <span className="hidden sm:inline text-[11px] text-accent">Agent ready</span>
+            )}
+            <RoleSwitcher />
+          </div>
         </div>
 
         <main id="main-content" className="flex flex-col flex-1 min-h-0 min-w-0">
@@ -156,6 +194,24 @@ export function ChatContainer() {
               </button>
               <button type="button" onClick={tp("tornado", showTornado, setShowTornado)} disabled={isLoading} className={actionBtn(showTornado)}>
                 {showTornado ? "Hide Tornado" : "Sensitivity"}
+              </button>
+              <button type="button" onClick={tp("attribution", showAttribution, setShowAttribution)} disabled={isLoading} className={actionBtn(showAttribution)}>
+                {showAttribution ? "Hide Attribution" : "Attribution"}
+              </button>
+              <button type="button" onClick={tp("driverTree", showDriverTree, setShowDriverTree)} disabled={isLoading} className={actionBtn(showDriverTree)}>
+                {showDriverTree ? "Hide Drivers" : "Driver Tree"}
+              </button>
+              <button type="button" onClick={tp("goalSeek", showGoalSeek, setShowGoalSeek)} disabled={isLoading} className={actionBtn(showGoalSeek)}>
+                {showGoalSeek ? "Hide Goal Seek" : "Goal Seek"}
+              </button>
+              <button type="button" onClick={tp("versions", showVersionHistory, setShowVersionHistory)} disabled={isLoading} className={actionBtn(showVersionHistory)}>
+                {showVersionHistory ? "Hide Versions" : "Versions"}
+              </button>
+              <button type="button" onClick={tp("actuals", showActualsCompare, setShowActualsCompare)} disabled={isLoading} className={actionBtn(showActualsCompare)}>
+                {showActualsCompare ? "Hide Actuals" : "Actuals"}
+              </button>
+              <button type="button" onClick={tp("whatIf", showLiveWhatIf, setShowLiveWhatIf)} disabled={isLoading} className={actionBtn(showLiveWhatIf)}>
+                {showLiveWhatIf ? "Hide What-If" : "What-If"}
               </button>
               {periodData && (
                 <button type="button" onClick={tp("periods", showPeriods, setShowPeriods)} disabled={isLoading} className={actionBtn(showPeriods)}>
@@ -252,7 +308,9 @@ export function ChatContainer() {
             onSend={handleSend}
             disabled={isLoading}
             placeholder={
-              sessionId
+              assistantMode === "documents"
+                ? strings.chat.placeholderDocuments
+                : sessionId
                 ? strings.chat.placeholderFollowUp
                 : onboardingStatus && !onboardingStatus.ready
                 ? strings.chat.placeholderOnboarding

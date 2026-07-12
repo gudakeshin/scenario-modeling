@@ -3,11 +3,16 @@ import { buildContext as buildTextContext } from "./contextEngine.js";
 import { buildExcelContext } from "./excelContextEngine.js";
 import type { Scope } from "../middleware/workspace.js";
 
+/**
+ * Prefer executable XLSX spreadsheet models over newer CSV/text uploads.
+ * CSV/text may enrich Excel context (business narrative) but must not
+ * supersede an XLSX model as the executable engine.
+ */
 export async function buildContextForUser(scope: Scope) {
   let docsRes;
   try {
     docsRes = await pool.query(
-      `SELECT document_id
+      `SELECT document_id, document_kind
        FROM documents
        WHERE workspace_id = $1
          AND status = 'ready'
@@ -23,6 +28,7 @@ export async function buildContextForUser(scope: Scope) {
   }
 
   if (docsRes.rows.length > 0) {
+    // Excel path also merges PDF/text narrative inside buildExcelContext
     return buildExcelContext(scope);
   }
   return buildTextContext(scope);

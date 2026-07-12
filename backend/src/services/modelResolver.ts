@@ -41,6 +41,7 @@ interface SpreadsheetDocRow {
   updated_at: string;
   model_schema: XlsxModelSchemaLike;
   workbook_graph: WorkbookGraph | null;
+  workbook_snapshot: import("./ingestionArtifacts.js").SparseWorkbookSnapshot | null;
   validation_status: string | null;
 }
 
@@ -53,7 +54,7 @@ interface ActiveUserModelRow {
 
 async function findSpreadsheetModelDoc(workspaceId: string): Promise<SpreadsheetDocRow | null> {
   const r = await pool.query(
-    `SELECT document_id, updated_at, model_schema, workbook_graph, validation_status
+    `SELECT document_id, updated_at, model_schema, workbook_graph, workbook_snapshot, validation_status
      FROM documents
      WHERE workspace_id = $1
        AND status = 'ready'
@@ -165,7 +166,7 @@ export async function getEvaluableModelForScenario(scenarioId: string): Promise<
     return resolveExternalModel(active);
   }
 
-  // 3. Validated spreadsheet model document
+  // 3. Validated spreadsheet model document (HyperFormula — never use xlsx_catalog DAG)
   const doc = await findSpreadsheetModelDoc(workspaceId);
   if (doc) {
     if (doc.validation_status !== "ready") {
@@ -174,12 +175,17 @@ export async function getEvaluableModelForScenario(scenarioId: string): Promise<
       );
     }
     const runtime = doc.workbook_graph
-      ? getXlsxRuntime(`${doc.document_id}:${doc.updated_at}`, doc.workbook_graph, doc.model_schema)
+      ? getXlsxRuntime(
+          `${doc.document_id}:${doc.updated_at}`,
+          doc.workbook_graph,
+          doc.model_schema,
+          doc.workbook_snapshot,
+        )
       : null;
     if (!runtime) {
       throw new ModelResolutionError(
-        "This spreadsheet was ingested before cell-level simulation was available (or is too large to snapshot). " +
-          "Please re-upload the XLSX file and rebuild the model context.",
+        "Spreadsheet runtime could not be built from the stored formula snapshot. " +
+          "Please re-upload the XLSX file (or run reprocess-workbooks.ts) and rebuild the model context.",
       );
     }
     return {
@@ -190,7 +196,34 @@ export async function getEvaluableModelForScenario(scenarioId: string): Promise<
     };
   }
 
-  // 4. Formula DAG from user_models / registry
+  // 4. Formula DAG from user_models / registry (skip non-executable XLSX catalogs)
+  const activeCatalog = await findActiveUserModel(workspaceId);
+  if (activeCatalog?.source_kind === "xlsx_catalog") {
+    throw new ModelResolutionError(
+      "Active XLSX model catalog is not executable without a validated spreadsheet snapshot. " +
+        "Re-upload the workbook and complete model validation.",
+    );
+  }
+
+  // Text/PDF-derived models with unresolved tie-out variances are not executable.
+  try {
+    const ctxRes = await pool.query(
+      `SELECT context_data FROM company_context
+       WHERE workspace_id = $1 AND status = 'active'
+       ORDER BY created_at DESC LIMIT 1`,
+      [workspaceId],
+    );
+    const usability = (ctxRes.rows[0]?.context_data as { usability?: string } | undefined)?.usability;
+    if (usability === "needs_review") {
+      throw new ModelResolutionError(
+        "Text-derived model has unresolved tie-out variances (needs_review). " +
+          "Review cross-foot discrepancies or rebuild context before simulation.",
+      );
+    }
+  } catch (e) {
+    if (e instanceof ModelResolutionError) throw e;
+  }
+
   const modelDef = await getModelDefinition(modelVersion);
   if (!modelDef) {
     throw new ModelResolutionError("No model found. Please build a model from your documents first.");

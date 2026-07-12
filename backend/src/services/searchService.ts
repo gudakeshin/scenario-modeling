@@ -62,6 +62,55 @@ export function needsExternalSearch(nlInput: string): boolean {
 }
 
 /**
+ * Detect open-ended / qualitative questions that benefit from the agentic
+ * reasoning loop (vs. a direct %/absolute lever extraction).
+ */
+export function isOpenEndedQuestion(nlInput: string): boolean {
+  const input = nlInput.toLowerCase().trim();
+  if (!input || input.length < 8) return false;
+
+  // Explicit numeric lever changes are the fast path — not open-ended.
+  if (isExplicitLeverChange(nlInput)) return false;
+
+  if (needsExternalSearch(input)) return true;
+
+  const OPEN_ENDED = [
+    /\bwhat\s+if\b/,
+    /\bhow\s+(?:would|will|might|could)\b/,
+    /\b(?:impact|effect|implications?)\s+of\b/,
+    /\bmodel\s+(?:a|the|this)?\s*(?:scenario|case)\b/,
+    /\b(?:best|worst|base)\s*case\b/,
+    /\b(?:stress\s*test|sensitivity)\b/,
+    /\b(?:qualitative|strateg(?:y|ic)|macro)\b/,
+    /\b(?:explore|analyze|analyse|assess)\b/,
+  ];
+  return OPEN_ENDED.some((re) => re.test(input));
+}
+
+/**
+ * True when the user stated an explicit percent/absolute lever change
+ * suitable for the fast parser path (not a macro / open-ended narrative).
+ */
+export function isExplicitLeverChange(nlInput: string): boolean {
+  const input = nlInput.trim();
+  const hasNumeric =
+    /\b\d+(?:\.\d+)?\s*%/.test(input) ||
+    /\bset\s+[\w\s]+\s+to\s+-?\d+/i.test(input) ||
+    /\b(?:by\s+)?\d+(?:\.\d+)?\b/.test(input);
+  if (!hasNumeric) return false;
+
+  // Macro / open framing with research triggers stays on the agentic path
+  if (
+    needsExternalSearch(input) &&
+    /\b(?:what\s+if|how\s+(?:would|will|might|could)|impact\s+of|effect\s+of|model\s+a)\b/i.test(input)
+  ) {
+    return false;
+  }
+
+  return /\b(?:increases?|decreases?|raises?|cuts?|reduces?|boosts?|grows?|drops?|lowers?|sets?)\b/i.test(input);
+}
+
+/**
  * Search Perplexity for real-time macro/financial context.
  * Returns structured research that the parser can use.
  */

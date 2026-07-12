@@ -6,6 +6,12 @@ import { ComparisonView } from "./ComparisonView";
 import { AuditTrailViewer } from "./AuditTrailViewer";
 import { MonteCarloView } from "./MonteCarloView";
 import { TornadoChart } from "./TornadoChart";
+import { AttributionView } from "./AttributionView";
+import { DriverTreeView } from "./DriverTreeView";
+import { GoalSeekView } from "./GoalSeekView";
+import { VersionHistoryPanel } from "./VersionHistoryPanel";
+import { ActualsCompareView } from "./ActualsCompareView";
+import { LiveWhatIfPanel } from "./LiveWhatIfPanel";
 import { TemplateGallery } from "./TemplateGallery";
 import { BusinessInsights } from "./BusinessInsights";
 import { PeriodBreakdownView } from "./PeriodBreakdownView";
@@ -22,7 +28,12 @@ import { useUiStore } from "@/stores/uiStore";
 
 const CARD_COLORS: Record<string, string> = {
   review: "bg-accent", comparison: "bg-[var(--info)]", monteCarlo: "bg-accent",
-  tornado: "bg-[var(--warning)]", periods: "bg-accent", charts: "bg-accent",
+  tornado: "bg-[var(--warning)]", attribution: "bg-[var(--success)]", driverTree: "bg-accent",
+  goalSeek: "bg-[var(--info)]",
+  versions: "bg-accent",
+  actuals: "bg-[var(--success)]",
+  whatIf: "bg-[var(--warning)]",
+  periods: "bg-accent", charts: "bg-accent",
   sharing: "bg-[var(--info)]", audit: "bg-[var(--text-muted)]",
   templates: "bg-[var(--info)]", roles: "bg-[var(--warning)]",
   insights: "bg-[var(--success)]", followUp: "bg-accent",
@@ -47,12 +58,16 @@ export function AnalysisPanelStrip({
 }: AnalysisPanelStripProps) {
   const {
     showReview, showComparison, showAudit, showMonteCarlo, showTornado,
+    showAttribution, showDriverTree, showGoalSeek,
+    showVersionHistory, showActualsCompare, showLiveWhatIf,
     showTemplates, showInsights, showPeriods, showCharts, showSharing,
     showRoles, showDocuments, showDocManager,
     preloadedInsight, periodData, chartData, pendingQuestions,
     refineKey, expandedPanel,
     setShowReview, setShowComparison, setShowAudit, setShowMonteCarlo,
-    setShowTornado, setShowTemplates, setShowInsights, setShowPeriods,
+    setShowTornado, setShowAttribution, setShowDriverTree, setShowGoalSeek,
+    setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
+    setShowTemplates, setShowInsights, setShowPeriods,
     setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
     setShowDocManager,
     setPreloadedInsight, setPendingQuestions,
@@ -71,6 +86,12 @@ export function AnalysisPanelStrip({
     if (showComparison && scenarioId) cards.push({ id: "comparison", title: "Comparison", close: () => setShowComparison(false) });
     if (showMonteCarlo && scenarioId) cards.push({ id: "monteCarlo", title: "Monte Carlo", close: () => setShowMonteCarlo(false) });
     if (showTornado && scenarioId) cards.push({ id: "tornado", title: "Sensitivity", close: () => setShowTornado(false) });
+    if (showAttribution && scenarioId) cards.push({ id: "attribution", title: "Attribution", close: () => setShowAttribution(false) });
+    if (showDriverTree && scenarioId) cards.push({ id: "driverTree", title: "Driver Tree", close: () => setShowDriverTree(false) });
+    if (showGoalSeek && scenarioId) cards.push({ id: "goalSeek", title: "Goal Seek", close: () => setShowGoalSeek(false) });
+    if (showVersionHistory && scenarioId) cards.push({ id: "versions", title: "Versions", close: () => setShowVersionHistory(false) });
+    if (showActualsCompare && scenarioId) cards.push({ id: "actuals", title: "Actuals", close: () => setShowActualsCompare(false) });
+    if (showLiveWhatIf && scenarioId) cards.push({ id: "whatIf", title: "What-If", close: () => setShowLiveWhatIf(false) });
     if (showPeriods && periodData) cards.push({ id: "periods", title: "Periods", close: () => setShowPeriods(false) });
     if (showCharts && chartData) cards.push({ id: "charts", title: "Charts", close: () => setShowCharts(false) });
     if (showSharing && scenarioId) cards.push({ id: "sharing", title: "Sharing", close: () => setShowSharing(false) });
@@ -83,10 +104,14 @@ export function AnalysisPanelStrip({
     if (showDocManager) cards.push({ id: "docManager", title: "Document Manager", close: () => setShowDocManager(false) });
     return cards;
   }, [
-    showReview, showComparison, showMonteCarlo, showTornado, showPeriods, showCharts,
+    showReview, showComparison, showMonteCarlo, showTornado, showAttribution, showDriverTree, showGoalSeek,
+    showVersionHistory, showActualsCompare, showLiveWhatIf,
+    showPeriods, showCharts,
     showSharing, showAudit, showTemplates, showRoles, showInsights, pendingQuestions,
     showDocuments, showDocManager, scenarioId, periodData, chartData,
-    setShowReview, setShowComparison, setShowMonteCarlo, setShowTornado, setShowPeriods,
+    setShowReview, setShowComparison, setShowMonteCarlo, setShowTornado, setShowAttribution,
+    setShowDriverTree, setShowGoalSeek, setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
+    setShowPeriods,
     setShowCharts, setShowSharing, setShowAudit, setShowTemplates, setShowRoles,
     setShowInsights, setPreloadedInsight, setPendingQuestions, setShowDocuments, setShowDocManager,
   ]);
@@ -109,6 +134,18 @@ export function AnalysisPanelStrip({
         return sid ? <MonteCarloView scenarioId={sid} onClose={() => closePanel("monteCarlo", () => setShowMonteCarlo(false))} onMinimize={collapseModal} /> : null;
       case "tornado":
         return sid ? <TornadoChart scenarioId={sid} onClose={() => closePanel("tornado", () => setShowTornado(false))} onMinimize={collapseModal} /> : null;
+      case "attribution":
+        return sid ? <AttributionView scenarioId={sid} onClose={() => closePanel("attribution", () => setShowAttribution(false))} onMinimize={collapseModal} /> : null;
+      case "driverTree":
+        return sid ? <DriverTreeView scenarioId={sid} onClose={() => closePanel("driverTree", () => setShowDriverTree(false))} onMinimize={collapseModal} /> : null;
+      case "goalSeek":
+        return sid ? <GoalSeekView scenarioId={sid} onClose={() => closePanel("goalSeek", () => setShowGoalSeek(false))} onMinimize={collapseModal} /> : null;
+      case "versions":
+        return sid ? <VersionHistoryPanel scenarioId={sid} onClose={() => closePanel("versions", () => setShowVersionHistory(false))} onMinimize={collapseModal} /> : null;
+      case "actuals":
+        return sid ? <ActualsCompareView scenarioId={sid} onClose={() => closePanel("actuals", () => setShowActualsCompare(false))} onMinimize={collapseModal} /> : null;
+      case "whatIf":
+        return sid ? <LiveWhatIfPanel scenarioId={sid} onClose={() => closePanel("whatIf", () => setShowLiveWhatIf(false))} onMinimize={collapseModal} /> : null;
       case "periods":
         return periodData ? <PeriodBreakdownView periods={periodData.periods} granularity={periodData.granularity} totalPl={periodData.pl} onClose={() => closePanel("periods", () => setShowPeriods(false))} onMinimize={collapseModal} /> : null;
       case "charts":

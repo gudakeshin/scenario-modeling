@@ -2,8 +2,8 @@
  * Cross-foot / tie-out validation for extracted P&L metrics.
  *
  * Warns when a calculated metric's extracted typical_value disagrees with
- * evaluating its formula against extracted inputs — extraction errors stay
- * authoritative; we never block simulation.
+ * evaluating its formula against extracted inputs. Material variances mark
+ * the context as needs_review and block simulation until resolved/override.
  */
 
 import { compileFormula } from "./expression.js";
@@ -135,4 +135,18 @@ export function crossFootExtractedPL(
   }
 
   return variances;
+}
+
+/**
+ * Tie-out gate: material cross-foot variances mark context as needs_review
+ * so analysts are not silently treated as usable.
+ */
+export function applyTieOutGate(variances: TieOutVariance[]): {
+  tie_out_status: "ok" | "variances";
+  usability: "usable" | "needs_review";
+} {
+  if (variances.length === 0) {
+    return { tie_out_status: "ok", usability: "usable" };
+  }
+  return { tie_out_status: "variances", usability: "needs_review" };
 }

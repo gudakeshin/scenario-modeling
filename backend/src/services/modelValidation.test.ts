@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
-import { crossFootExtractedPL } from "./modelValidation.js";
+import { crossFootExtractedPL, applyTieOutGate } from "./modelValidation.js";
 
 test("cross-foot: consistent P&L → no variances", () => {
   const variances = crossFootExtractedPL([
@@ -89,4 +89,22 @@ test("cross-foot: ebit == ebitda while D&A > 0 → variance", () => {
   assert.strictEqual(variances.length, 1);
   assert.strictEqual(variances[0].variable_id, "ebit");
   assert.ok(/D&A|depreciation/i.test(variances[0].message));
+});
+
+test("applyTieOutGate: variances → needs_review", () => {
+  const ok = applyTieOutGate([]);
+  assert.strictEqual(ok.tie_out_status, "ok");
+  assert.strictEqual(ok.usability, "usable");
+
+  const bad = applyTieOutGate([
+    {
+      variable_id: "gross_profit",
+      extracted: 100,
+      computed: 90,
+      variance_pct: 10,
+      message: "tie-out",
+    },
+  ]);
+  assert.strictEqual(bad.tie_out_status, "variances");
+  assert.strictEqual(bad.usability, "needs_review");
 });

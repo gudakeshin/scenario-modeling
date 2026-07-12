@@ -29,7 +29,7 @@ sessionsRouter.post("/", validateBody(createSessionSchema), async (req, res) => 
 
 // Get session
 sessionsRouter.get("/:id", async (req, res) => {
-  const s = getSession(req.params.id);
+  const s = await getSession(req.params.id);
   if (!s) return res.status(404).json({ error: "Session not found or expired" });
   if (s.user_id !== req.user!.userId && req.user!.role !== "admin") return res.status(403).json({ error: "Forbidden" });
   return res.json(s);
@@ -37,14 +37,14 @@ sessionsRouter.get("/:id", async (req, res) => {
 
 // List sessions
 sessionsRouter.get("/", async (req, res) => {
-  return res.json({ sessions: listSessions(req.user!.userId) });
+  return res.json({ sessions: await listSessions(req.user!.userId) });
 });
 
 // Follow-up turn
 sessionsRouter.post("/:id/follow-up", validateBody(followUpSchema), async (req, res) => {
   try {
     const { nl_input } = req.body;
-    const session = getSession(req.params.id);
+    const session = await getSession(req.params.id);
     if (!session) return res.status(404).json({ error: "Session not found or expired" });
     if (session.user_id !== req.user!.userId && req.user!.role !== "admin") return res.status(403).json({ error: "Forbidden" });
     await assertCanWriteScenario(req.user!.userId, req.user!.role, session.scenario_id);
@@ -62,8 +62,10 @@ sessionsRouter.post("/:id/follow-up", validateBody(followUpSchema), async (req, 
 
 // Reset session
 sessionsRouter.delete("/:id", async (req, res) => {
-  const session = getSession(req.params.id);
-  if (session && session.user_id !== req.user!.userId && req.user!.role !== "admin") return res.status(403).json({ error: "Forbidden" });
-  resetSession(req.params.id);
+  const session = await getSession(req.params.id);
+  if (session && session.user_id !== req.user!.userId && req.user!.role !== "admin") {
+    return res.status(403).json({ error: "Forbidden" });
+  }
+  await resetSession(req.params.id);
   return res.json({ ok: true });
 });

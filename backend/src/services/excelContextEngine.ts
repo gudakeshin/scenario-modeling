@@ -5,6 +5,8 @@ import type { ModelDefinition } from "../models/registry.js";
 import type { WorkbookGraph } from "./excelExtractor.js";
 import type { CompanyContext } from "./contextEngine.js";
 import type { Scope } from "../middleware/workspace.js";
+import { getDocumentChunksFromDb } from "./documentService.js";
+import { logger } from "../logger.js";
 
 const modelSchemaZ = z.object({
   company: z.string().default(""),
@@ -24,12 +26,15 @@ const modelSchemaZ = z.object({
     }).default({}),
     affectsSheets: z.array(z.string()).default([]),
     unit: z.string().default("value"),
+    sheet: z.string().optional(),
+    cell: z.string().optional(),
   })).default([]),
   outputMetrics: z.array(z.object({
     id: z.string(),
     label: z.string(),
     sheet: z.string().default(""),
     row: z.number().default(0),
+    cell: z.string().optional(),
     isKPI: z.boolean().default(false),
   })).default([]),
   timeDimension: z.object({
@@ -48,6 +53,8 @@ interface ModelSchemaLever {
   scenarios?: { base?: number; bull?: number; bear?: number };
   affectsSheets: string[];
   unit: string;
+  sheet?: string;
+  cell?: string;
 }
 
 interface ModelSchemaOutput {
@@ -55,6 +62,7 @@ interface ModelSchemaOutput {
   label: string;
   sheet: string;
   row: number;
+  cell?: string;
   isKPI: boolean;
 }
 
@@ -89,32 +97,35 @@ function safeNumber(value: unknown, fallback = 0): number {
 }
 
 function normalizeModelSchema(schema: ModelSchema, docName: string, graph: WorkbookGraph): ModelSchema {
-  const inputCandidateById = new Map(
-    (graph.inputCandidates || []).map((c) => [toId(c.id || c.label || "input"), safeNumber(c.value, 0)]),
+  const inputCandidates = new Map(
+    (graph.inputCandidates || []).map((c) => [toId(c.id || c.label || "input"), c]),
   );
-  const outputCandidateById = new Map(
-    (graph.outputCandidates || []).map((c) => [toId(c.id || c.label || "metric"), safeNumber(c.value, 0)]),
+  const outputCandidates = new Map(
+    (graph.outputCandidates || []).map((c) => [toId(c.id || c.label || "metric"), c]),
   );
 
   const parsedLevers: ModelSchemaLever[] = (schema.scenarioLevers || [])
     .filter((l): l is ModelSchemaLever => !!l && typeof l === "object")
-    .map((l) => ({
-      id: toId(l.id || l.label || "lever"),
-      label: l.label || l.id || "Lever",
-      type: l.type || "input_driver",
-      category: l.category || "driver",
-      scenarios: {
-        base: (() => {
-          const parsedBase = safeNumber(l.scenarios?.base, 0);
-          if (Math.abs(parsedBase) > 0) return parsedBase;
-          return inputCandidateById.get(toId(l.id || l.label || "lever")) ?? parsedBase;
-        })(),
-        bull: safeNumber(l.scenarios?.bull, safeNumber(l.scenarios?.base, 0)),
-        bear: safeNumber(l.scenarios?.bear, safeNumber(l.scenarios?.base, 0)),
-      },
-      affectsSheets: Array.isArray(l.affectsSheets) ? l.affectsSheets : [],
-      unit: l.unit || "value",
-    }));
+    .map((l) => {
+      const id = toId(l.id || l.label || "lever");
+      const cand = inputCandidates.get(id);
+      const parsedBase = safeNumber(l.scenarios?.base, 0);
+      return {
+        id,
+        label: l.label || l.id || "Lever",
+        type: l.type || "input_driver",
+        category: l.category || "driver",
+        scenarios: {
+          base: Math.abs(parsedBase) > 0 ? parsedBase : safeNumber(cand?.value, parsedBase),
+          bull: safeNumber(l.scenarios?.bull, safeNumber(l.scenarios?.base, 0)),
+          bear: safeNumber(l.scenarios?.bear, safeNumber(l.scenarios?.base, 0)),
+        },
+        affectsSheets: Array.isArray(l.affectsSheets) ? l.affectsSheets : (cand ? [cand.sheet] : []),
+        unit: l.unit || "value",
+        sheet: l.sheet || cand?.sheet,
+        cell: l.cell || cand?.cell,
+      };
+    });
   const fallbackLevers: ModelSchemaLever[] = (graph.inputCandidates || []).slice(0, 25).map((c) => ({
     id: toId(c.id || c.label || "input"),
     label: c.label || c.id,
@@ -127,23 +138,31 @@ function normalizeModelSchema(schema: ModelSchema, docName: string, graph: Workb
     },
     affectsSheets: [c.sheet],
     unit: "value",
+    sheet: c.sheet,
+    cell: c.cell,
   }));
   const normalizedLevers = parsedLevers.length > 0 ? parsedLevers : fallbackLevers;
 
   const parsedOutputs: ModelSchemaOutput[] = (schema.outputMetrics || [])
     .filter((m): m is ModelSchemaOutput => !!m && typeof m === "object")
-    .map((m, idx) => ({
-      id: toId(m.id || m.label || `metric_${idx + 1}`),
-      label: m.label || m.id || `Metric ${idx + 1}`,
-      sheet: m.sheet || Object.keys(graph.sheets)[0] || "Sheet1",
-      row: Number(m.row || idx + 1),
-      isKPI: Boolean(m.isKPI),
-    }));
+    .map((m, idx) => {
+      const id = toId(m.id || m.label || `metric_${idx + 1}`);
+      const cand = outputCandidates.get(id);
+      return {
+        id,
+        label: m.label || m.id || `Metric ${idx + 1}`,
+        sheet: m.sheet || cand?.sheet || Object.keys(graph.sheets)[0] || "Sheet1",
+        row: Number(m.row || cand?.row || idx + 1),
+        cell: m.cell || cand?.cell,
+        isKPI: Boolean(m.isKPI),
+      };
+    });
   const fallbackOutputs: ModelSchemaOutput[] = (graph.outputCandidates || []).slice(0, 20).map((c) => ({
     id: toId(c.id || c.label || "metric"),
     label: c.label || c.id,
     sheet: c.sheet,
     row: c.row,
+    cell: c.cell,
     isKPI: true,
   }));
   const normalizedOutputs = parsedOutputs.length > 0 ? parsedOutputs : fallbackOutputs;
@@ -157,8 +176,8 @@ function normalizeModelSchema(schema: ModelSchema, docName: string, graph: Workb
     const parsed = safeNumber(v, 0);
     if (Math.abs(parsed) > 0) {
       normalizedBaseValues[k] = parsed;
-    } else if (outputCandidateById.has(k)) {
-      normalizedBaseValues[k] = outputCandidateById.get(k) || 0;
+    } else if (outputCandidates.has(k)) {
+      normalizedBaseValues[k] = safeNumber(outputCandidates.get(k)?.value, 0);
     } else {
       normalizedBaseValues[k] = parsed;
     }
@@ -187,7 +206,6 @@ function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelS
   const leverById = new Map(schema.scenarioLevers.map((l) => [toId(l.id), l]));
   const outputById = new Map(schema.outputMetrics.map((m) => [toId(m.id), m]));
 
-  // Fill and add levers from candidates.
   for (const c of graph.inputCandidates || []) {
     const cid = toId(c.id || c.label || "input");
     const cVal = safeNumber(c.value, 0);
@@ -201,6 +219,8 @@ function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelS
           bear: safeNumber(existing.scenarios?.bear, cVal * 0.9),
         };
       }
+      if (!existing.sheet) existing.sheet = c.sheet;
+      if (!existing.cell) existing.cell = c.cell;
       continue;
     }
     if (Math.abs(cVal) > 0) {
@@ -212,22 +232,28 @@ function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelS
         scenarios: { base: cVal, bull: cVal * 1.1, bear: cVal * 0.9 },
         affectsSheets: [c.sheet],
         unit: "value",
+        sheet: c.sheet,
+        cell: c.cell,
       };
       schema.scenarioLevers.push(newLever);
       leverById.set(cid, newLever);
     }
   }
 
-  // Fill and add outputs from candidates.
   for (const c of graph.outputCandidates || []) {
     const cid = toId(c.id || c.label || "metric");
     const cVal = safeNumber(c.value, 0);
-    if (!outputById.has(cid) && Math.abs(cVal) > 0) {
+    const existing = outputById.get(cid);
+    if (existing) {
+      if (!existing.cell && c.cell) existing.cell = c.cell;
+      if (!existing.sheet) existing.sheet = c.sheet;
+    } else if (Math.abs(cVal) > 0) {
       const metric: ModelSchemaOutput = {
         id: cid,
         label: c.label || c.id,
         sheet: c.sheet,
         row: c.row,
+        cell: c.cell,
         isKPI: true,
       };
       schema.outputMetrics.push(metric);
@@ -353,6 +379,8 @@ function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema
     },
     affectsSheets: [c.sheet],
     unit: "value",
+    sheet: c.sheet,
+    cell: c.cell,
   }));
   if (scenarioLevers.length === 0 && graph.scenarioToggle) {
     scenarioLevers.push({
@@ -371,6 +399,7 @@ function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema
     label: c.label,
     sheet: c.sheet || summarySheet,
     row: c.row,
+    cell: c.cell,
     isKPI: true,
   }));
   if (outputMetrics.length === 0) {
@@ -400,20 +429,22 @@ function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema
 }
 
 function toModelDefinition(schema: ModelSchema): ModelDefinition {
+  // Catalog/summary only — NOT an executable formula DAG for XLSX models.
+  // Simulation must use HyperFormula via workbook_snapshot (xlsx_cell_graph).
   const variables = [
     ...schema.scenarioLevers.map((lever) => ({
       id: lever.id,
       name: lever.label,
       formula: String(lever.scenarios?.base ?? 0),
       dependencies: [] as string[],
-      tags: ["input", "percent_delta"],
+      tags: ["input", "percent_delta", "xlsx_catalog_only", ...(lever.cell ? [`cell:${lever.sheet}!${lever.cell}`] : [])],
     })),
     ...schema.outputMetrics.map((m) => ({
       id: m.id,
       name: m.label,
       formula: String(schema.baseValues[m.id] ?? 0),
       dependencies: [] as string[],
-      tags: ["pl_metric", "output"],
+      tags: ["pl_metric", "output", "xlsx_catalog_only", ...(m.cell ? [`cell:${m.sheet}!${m.cell}`] : [])],
     })),
   ];
 
@@ -429,6 +460,22 @@ function toModelDefinition(schema: ModelSchema): ModelDefinition {
   };
 }
 
+/** Bounded summary for LLM — excludes dense/sparse cell grids. */
+function graphSummaryForLlm(graph: WorkbookGraph): Record<string, unknown> {
+  return {
+    sheets: graph.sheets,
+    dependencies: graph.dependencies.slice(0, 400),
+    inputCandidates: graph.inputCandidates,
+    outputCandidates: graph.outputCandidates,
+    scenarioToggle: graph.scenarioToggle,
+    timeAxis: graph.timeAxis,
+    currency: graph.currency,
+    unit: graph.unit,
+    namedRanges: graph.namedRanges,
+    largeWorkbook: graph.largeWorkbook,
+  };
+}
+
 async function llmModelSchema(graph: WorkbookGraph, docName: string): Promise<ModelSchema> {
   if (!getApiKey()) return fallbackModelSchema(graph, docName);
 
@@ -438,14 +485,15 @@ Required keys:
 company, industry, currency, unit, fiscalYear, scenarioLevers, outputMetrics, timeDimension, baseValues
 
 Rules:
-- scenarioLevers must use ids in snake_case.
+- scenarioLevers must use ids in snake_case and include sheet + cell when known from inputCandidates.
+- outputMetrics should include sheet, row, and cell from outputCandidates when available.
 - Use numeric defaults for base/bull/bear.
-- outputMetrics should include KPI-like metrics from summary sheets.
+- Preserve document denomination (Crore/Lakh/Million) — do not convert values.
 - Keep arrays concise and deterministic.`;
 
   const parsed = await callClaudeStructured({
     system,
-    userMessage: `Document name: ${docName}\nWorkbookGraph:\n${JSON.stringify(graph).slice(0, 120000)}`,
+    userMessage: `Document name: ${docName}\nWorkbookGraphSummary:\n${JSON.stringify(graphSummaryForLlm(graph)).slice(0, 120000)}`,
     schema: modelSchemaZ,
     toolName: "submit_model_schema",
     toolDescription: "Submit the extracted financial model schema",
@@ -456,11 +504,88 @@ Rules:
   return normalizeModelSchema(parsed, docName, graph);
 }
 
+const businessNarrativeSchema = z.object({
+  business_model: z.string().default(""),
+  revenue_streams: z.array(z.string()).default([]),
+  competitive_landscape: z.string().default(""),
+  key_risks: z.array(z.string()).default([]),
+});
+
+type BusinessNarrative = z.infer<typeof businessNarrativeSchema>;
+
+/** Heuristic narrative from workbook sheet names + candidate labels when no text docs. */
+export function heuristicBusinessNarrative(
+  graph: WorkbookGraph,
+  company: string,
+): BusinessNarrative {
+  const sheetNames = Object.keys(graph.sheets || {});
+  const labels = [
+    ...(graph.inputCandidates || []).map((c) => c.label),
+    ...(graph.outputCandidates || []).map((c) => c.label),
+  ].filter(Boolean);
+
+  const revenueLike = labels.filter((l) =>
+    /revenue|sales|subscription|licensing|service|product/i.test(l),
+  );
+  const streams = [...new Set(revenueLike.map((l) => l.trim()))].slice(0, 6);
+
+  const modelBits: string[] = [];
+  if (sheetNames.some((s) => /volume|plan/i.test(s))) modelBits.push("volume-driven planning");
+  if (sheetNames.some((s) => /p&l|profit|income/i.test(s))) modelBits.push("integrated P&L");
+  if (sheetNames.some((s) => /assum/i.test(s))) modelBits.push("explicit assumption drivers");
+
+  const business_model =
+    modelBits.length > 0
+      ? `${company || "Company"} financial model with ${modelBits.join(", ")} (derived from workbook structure).`
+      : `${company || "Company"} financial model extracted from spreadsheet structure.`;
+
+  return {
+    business_model,
+    revenue_streams: streams,
+    competitive_landscape: "",
+    key_risks: [],
+  };
+}
+
+async function extractBusinessNarrativeFromText(
+  textExcerpt: string,
+  companyHint: string,
+): Promise<BusinessNarrative | null> {
+  if (!textExcerpt.trim() || !getApiKey()) return null;
+  try {
+    return await callClaudeStructured({
+      system: `Extract concise business narrative from document excerpts. Return JSON only.
+Focus on business_model (1-2 sentences), revenue_streams, competitive_landscape, key_risks.
+Company hint: ${companyHint || "unknown"}`,
+      userMessage: textExcerpt.slice(0, 60000),
+      schema: businessNarrativeSchema,
+      toolName: "submit_business_narrative",
+      toolDescription: "Submit business narrative extracted from documents",
+      temperature: 0.1,
+      maxTokens: 800,
+      purpose: "context_build",
+    });
+  } catch (e) {
+    logger.warn({ err: e }, "[ExcelContext] Business narrative LLM extract failed");
+    return null;
+  }
+}
+
+function takeDistributedSlices(text: string, budget: number): string {
+  if (text.length <= budget) return text;
+  const part = Math.max(200, Math.floor(budget / 3));
+  const start = text.slice(0, part);
+  const midStart = Math.max(0, Math.floor(text.length / 2) - Math.floor(part / 2));
+  const middle = text.slice(midStart, midStart + part);
+  const end = text.slice(Math.max(0, text.length - part));
+  return `${start}\n...\n${middle}\n...\n${end}`;
+}
+
 export async function buildExcelContext(scope: Scope): Promise<CompanyContext> {
   const userId = await resolveUserId(scope.userId);
   const { workspaceId } = scope;
   const docsRes = await pool.query(
-    `SELECT document_id, name, workbook_graph
+    `SELECT document_id, name, workbook_graph, workbook_snapshot, ingestion_report
      FROM documents
      WHERE workspace_id = $1
        AND status = 'ready'
@@ -473,10 +598,80 @@ export async function buildExcelContext(scope: Scope): Promise<CompanyContext> {
     throw new Error("No processed XLSX model found. Upload an XLSX model first.");
   }
 
-  const doc = docsRes.rows[0] as { document_id: string; name: string; workbook_graph: WorkbookGraph };
+  const doc = docsRes.rows[0] as {
+    document_id: string;
+    name: string;
+    workbook_graph: WorkbookGraph;
+    workbook_snapshot: unknown;
+    ingestion_report: unknown;
+  };
   const workbookGraph = doc.workbook_graph;
   if (!workbookGraph || !workbookGraph.sheets) {
     throw new Error("Workbook graph is not available for the selected XLSX document.");
+  }
+
+  // Load companion PDF/text docs for business narrative (keep executable structure from XLSX)
+  const textDocsRes = await pool.query(
+    `SELECT document_id, name, document_kind
+     FROM documents
+     WHERE workspace_id = $1
+       AND status = 'ready'
+       AND document_kind IN ('document_text', 'tabular_data')
+     ORDER BY created_at DESC
+     LIMIT 20`,
+    [workspaceId],
+  );
+  const textDocIds = textDocsRes.rows.map((r: { document_id: string }) => r.document_id);
+  const allSourceIds = [...new Set([doc.document_id, ...textDocIds])];
+
+  let narrative: BusinessNarrative = heuristicBusinessNarrative(workbookGraph, doc.name);
+  if (textDocIds.length > 0) {
+    const chunks = await getDocumentChunksFromDb(textDocIds);
+    const byDoc = new Map<string, string[]>();
+    for (const c of chunks) {
+      const arr = byDoc.get(c.document_id) || [];
+      arr.push(c.text);
+      byDoc.set(c.document_id, arr);
+    }
+    const blocks: string[] = [];
+    for (const row of textDocsRes.rows as Array<{ document_id: string; name: string }>) {
+      const texts = byDoc.get(row.document_id) || [];
+      const joined = texts.join("\n");
+      if (!joined.trim()) continue;
+      blocks.push(`[Document: ${row.name}]\n${takeDistributedSlices(joined, 8000)}`);
+    }
+    const excerpt = blocks.join("\n\n").slice(0, 60000);
+    const fromLlm = await extractBusinessNarrativeFromText(excerpt, doc.name);
+    if (fromLlm && (fromLlm.business_model || fromLlm.revenue_streams.length > 0)) {
+      narrative = {
+        business_model: fromLlm.business_model || narrative.business_model,
+        revenue_streams:
+          fromLlm.revenue_streams.length > 0 ? fromLlm.revenue_streams : narrative.revenue_streams,
+        competitive_landscape: fromLlm.competitive_landscape || "",
+        key_risks: fromLlm.key_risks || [],
+      };
+    }
+  } else {
+    // No text docs — optional LLM pass over workbook labels/notes
+    const labelBlob = [
+      `Company: ${doc.name}`,
+      `Sheets: ${Object.keys(workbookGraph.sheets).join(", ")}`,
+      `Inputs: ${(workbookGraph.inputCandidates || []).map((c) => c.label).join("; ")}`,
+      `Outputs: ${(workbookGraph.outputCandidates || []).map((c) => c.label).join("; ")}`,
+    ].join("\n");
+    const fromLabels = await extractBusinessNarrativeFromText(labelBlob, doc.name);
+    if (fromLabels?.business_model) {
+      narrative = {
+        ...narrative,
+        business_model: fromLabels.business_model,
+        revenue_streams:
+          fromLabels.revenue_streams.length > 0
+            ? fromLabels.revenue_streams
+            : narrative.revenue_streams,
+        competitive_landscape: fromLabels.competitive_landscape || narrative.competitive_landscape,
+        key_risks: fromLabels.key_risks.length > 0 ? fromLabels.key_risks : narrative.key_risks,
+      };
+    }
   }
 
   let modelSchema: ModelSchema;
@@ -487,7 +682,6 @@ export async function buildExcelContext(scope: Scope): Promise<CompanyContext> {
   }
   modelSchema = enrichFromCandidates(modelSchema, workbookGraph);
 
-  // Validation + feedback loop (deterministic repair + LLM-assisted correction)
   const qualityIterations: ExtractionQualityReport[] = [];
   const MAX_REPAIR_LOOPS = 3;
   for (let i = 1; i <= MAX_REPAIR_LOOPS; i++) {
@@ -519,19 +713,23 @@ export async function buildExcelContext(scope: Scope): Promise<CompanyContext> {
     industry: modelSchema.industry,
     currency: modelSchema.currency,
     currency_unit: modelSchema.unit,
-    business_model: "Extracted from XLSX structural interpretation",
-    revenue_streams: [],
+    business_model: narrative.business_model,
+    revenue_streams: narrative.revenue_streams,
     financial_metrics: [],
-    competitive_landscape: "",
-    key_risks: [],
+    competitive_landscape: narrative.competitive_landscape,
+    key_risks: narrative.key_risks,
     benchmarks: {},
     model_schema: modelSchema,
     workbook_graph: workbookGraph,
+    ingestion_report: doc.ingestion_report || null,
+    executable_engine: "xlsx_cell_graph",
+    catalog_only_model_definition: true,
     extraction_quality: {
       final: finalQuality,
       iterations: qualityIterations,
     },
     validation_status: "needs_validation",
+    usability: "usable" as const,
   };
 
   await pool.query("UPDATE company_context SET status = 'superseded' WHERE workspace_id = $1 AND status = 'active'", [workspaceId]);
@@ -539,14 +737,14 @@ export async function buildExcelContext(scope: Scope): Promise<CompanyContext> {
     `INSERT INTO company_context (created_by, workspace_id, company_name, industry, context_data, source_document_ids, status)
      VALUES ($1, $2, $3, $4, $5, $6, 'active')
      RETURNING *`,
-    [userId, workspaceId, modelSchema.company, modelSchema.industry, JSON.stringify(contextData), [doc.document_id]],
+    [userId, workspaceId, modelSchema.company, modelSchema.industry, JSON.stringify(contextData), allSourceIds],
   );
 
   await pool.query("UPDATE user_models SET is_active = false WHERE workspace_id = $1 AND is_active = true", [workspaceId]);
   const modelDef = toModelDefinition(modelSchema);
   await pool.query(
-    `INSERT INTO user_models (created_by, workspace_id, name, model_definition, source_context_id, is_active)
-     VALUES ($1, $2, $3, $4, $5, true)`,
+    `INSERT INTO user_models (created_by, workspace_id, name, model_definition, source_context_id, is_active, source_kind)
+     VALUES ($1, $2, $3, $4, $5, true, 'xlsx_catalog')`,
     [userId, workspaceId, `${modelSchema.company} XLSX Model`, JSON.stringify(modelDef), ctxInsert.rows[0].context_id],
   );
 

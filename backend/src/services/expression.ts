@@ -162,6 +162,11 @@ export interface ModelInput {
   metricType?: MetricType;
 }
 
+export interface PeriodSlice {
+  period: string;
+  values: Record<string, number>;
+}
+
 /**
  * A model that can be evaluated with absolute input overrides.
  * Implemented by CompiledModel (formula DAG) and XlsxModelRuntime (HyperFormula).
@@ -178,6 +183,70 @@ export interface EvaluableModel {
    * Returns a map containing at least all outputIds and all input ids.
    */
   evaluate(absoluteOverrides: Record<string, number>): Record<string, number>;
+  /** True when evaluatePeriods yields more than a single FY slice. */
+  supportsPeriods?: boolean;
+  /** Multi-period evaluation when the model has a time axis / horizon. */
+  evaluatePeriods?(absoluteOverrides: Record<string, number>): PeriodSlice[];
+}
+
+// ── Time horizon helpers (kept here to avoid circular imports) ──
+
+export function generatePeriodLabels(horizon: ModelDefinition["time_horizon"]): string[] {
+  const labels: string[] = [];
+  if (horizon.granularity === "quarterly") {
+    const startMatch = horizon.start.match(/(\d{4})-Q(\d)/);
+    const endMatch = horizon.end.match(/(\d{4})-Q(\d)/);
+    if (!startMatch || !endMatch) return [horizon.start];
+    let year = parseInt(startMatch[1], 10);
+    let quarter = parseInt(startMatch[2], 10);
+    const endYear = parseInt(endMatch[1], 10);
+    const endQuarter = parseInt(endMatch[2], 10);
+    while (year < endYear || (year === endYear && quarter <= endQuarter)) {
+      labels.push(`${year}-Q${quarter}`);
+      quarter++;
+      if (quarter > 4) {
+        quarter = 1;
+        year++;
+      }
+    }
+  } else {
+    const startMatch = horizon.start.match(/(\d{4})-Q(\d)/);
+    const endMatch = horizon.end.match(/(\d{4})-Q(\d)/);
+    if (startMatch && endMatch) {
+      let year = parseInt(startMatch[1], 10);
+      let month = (parseInt(startMatch[2], 10) - 1) * 3 + 1;
+      const endYear = parseInt(endMatch[1], 10);
+      const endMonth = parseInt(endMatch[2], 10) * 3;
+      while (year < endYear || (year === endYear && month <= endMonth)) {
+        labels.push(`${year}-${String(month).padStart(2, "0")}`);
+        month++;
+        if (month > 12) {
+          month = 1;
+          year++;
+        }
+      }
+    } else {
+      const sMatch = horizon.start.match(/(\d{4})-(\d{2})/);
+      const eMatch = horizon.end.match(/(\d{4})-(\d{2})/);
+      if (sMatch && eMatch) {
+        let year = parseInt(sMatch[1], 10);
+        let month = parseInt(sMatch[2], 10);
+        const endYear = parseInt(eMatch[1], 10);
+        const endMonth = parseInt(eMatch[2], 10);
+        while (year < endYear || (year === endYear && month <= endMonth)) {
+          labels.push(`${year}-${String(month).padStart(2, "0")}`);
+          month++;
+          if (month > 12) {
+            month = 1;
+            year++;
+          }
+        }
+      } else {
+        labels.push(horizon.start);
+      }
+    }
+  }
+  return labels.length > 0 ? labels : [horizon.start];
 }
 
 // ── CompiledModel: formula-DAG implementation ──
@@ -186,12 +255,16 @@ export class CompiledModel implements EvaluableModel {
   readonly kind = "formula" as const;
   readonly inputs: ModelInput[];
   readonly outputIds: string[];
+  readonly supportsPeriods: boolean;
   private order: string[];
   private varsById: Map<string, ModelVariable>;
   private compiled: Map<string, CompiledFn>;
   private baseCtx: Record<string, number>;
+  private modelDef: ModelDefinition;
+  private periodLabels: string[];
 
   constructor(model: ModelDefinition) {
+    this.modelDef = model;
     this.varsById = new Map(model.variables.map((v) => [v.id, v]));
     this.order = topologicalSort(model.variables);
     const knownIds = new Set(model.variables.map((v) => v.id));
@@ -211,6 +284,13 @@ export class CompiledModel implements EvaluableModel {
     this.outputIds = model.variables
       .filter((v) => v.tags?.includes("pl_metric"))
       .map((v) => v.id);
+    this.periodLabels = generatePeriodLabels(model.time_horizon);
+    this.supportsPeriods = this.periodLabels.length > 1;
+  }
+
+  /** Expose definition for driver-tree / period-growth consumers. */
+  get definition(): ModelDefinition {
+    return this.modelDef;
   }
 
   baseValues(): Record<string, number> {
@@ -240,5 +320,34 @@ export class CompiledModel implements EvaluableModel {
       ctx[id] = val;
     }
     return ctx;
+  }
+
+  evaluatePeriods(absoluteOverrides: Record<string, number>): PeriodSlice[] {
+    const hasGrowth = this.modelDef.variables.some(
+      (v) =>
+        v.dependencies.length === 0 &&
+        v.period_growth_pct != null &&
+        Number.isFinite(v.period_growth_pct) &&
+        v.period_growth_pct !== 0,
+    );
+
+    return this.periodLabels.map((period, t) => {
+      let abs = absoluteOverrides;
+      if (hasGrowth) {
+        abs = { ...absoluteOverrides };
+        for (const v of this.modelDef.variables) {
+          if (v.dependencies.length > 0) continue;
+          if (v.period_growth_pct == null || !Number.isFinite(v.period_growth_pct) || v.period_growth_pct === 0) {
+            continue;
+          }
+          const mt = v.metric_type ?? inferMetricTypeFromId(v.id, v.name);
+          if (mt === "percent" || mt === "ratio") continue;
+          const base = absoluteOverrides[v.id] ?? this.baseCtx[v.id];
+          if (base == null || !Number.isFinite(base)) continue;
+          abs[v.id] = base * Math.pow(1 + v.period_growth_pct / 100, t);
+        }
+      }
+      return { period, values: this.evaluate(abs) };
+    });
   }
 }

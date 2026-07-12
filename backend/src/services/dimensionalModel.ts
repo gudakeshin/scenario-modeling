@@ -209,6 +209,51 @@ export class DimensionalModel implements EvaluableModel {
     return this.evaluateDimensional(dimOverrides).totals;
   }
 
+  /**
+   * Period-aware evaluation via the time dimension leaves (when configured).
+   * Falls back to a single "Total" slice from evaluate().
+   */
+  get supportsPeriods(): boolean {
+    return !!this.def.time_dimension_id && this.dimIndexes.has(this.def.time_dimension_id);
+  }
+
+  evaluatePeriods(absoluteOverrides: Record<string, number>): import("./expression.js").PeriodSlice[] {
+    const timeDimId = this.def.time_dimension_id;
+    if (!timeDimId || !this.dimIndexes.has(timeDimId)) {
+      return [{ period: "Total", values: this.evaluate(absoluteOverrides) }];
+    }
+
+    const dimOverrides: DimensionalOverride[] = [];
+    for (const [variableId, value] of Object.entries(absoluteOverrides)) {
+      if (!Number.isFinite(value)) continue;
+      dimOverrides.push({
+        variableId,
+        value,
+        delta_type: "absolute",
+      });
+    }
+    const result = this.evaluateDimensional(dimOverrides);
+    const timeIdx = this.dimIndexes.get(timeDimId)!;
+    const leaves = [...timeIdx.leaves].sort((a, b) => a.ordinal - b.ordinal);
+    if (leaves.length === 0) {
+      return [{ period: "Total", values: result.totals }];
+    }
+
+    return leaves.map((leaf) => {
+      const values: Record<string, number> = {};
+      for (const id of this.outputIds) {
+        const v = result.valueAt(id, { [timeDimId]: leaf.id });
+        if (v !== undefined && Number.isFinite(v)) values[id] = v;
+      }
+      // Also include input totals at that POV when available
+      for (const input of this.inputs) {
+        const v = result.valueAt(input.id, { [timeDimId]: leaf.id });
+        if (v !== undefined && Number.isFinite(v)) values[input.id] = v;
+      }
+      return { period: leaf.name, values };
+    });
+  }
+
   evaluateDimensional(overrides: DimensionalOverride[]): DimensionalEvalResult {
     // Per-pass leaf stores + rollup memo
     const leaves = new Map<string, Map<CellKey, number>>();

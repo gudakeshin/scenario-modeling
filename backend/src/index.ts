@@ -24,7 +24,10 @@ import { resolveWorkspace } from "./middleware/workspace.js";
 import { workspacesRouter } from "./routes/workspaces.js";
 import { connectionsRouter } from "./routes/connections.js";
 import { configRouter } from "./routes/config.js";
+import { portfolioRouter } from "./routes/portfolio.js";
+import { organizationsRouter } from "./routes/organizations.js";
 import { startServer } from "./server.js";
+import { initSentry } from "./errorReporter.js";
 
 const app = express();
 
@@ -123,9 +126,11 @@ app.use("/api/v1/documents", documentsRouter);
 app.use("/api/v1/context", contextRouter);
 app.use("/api/v1/config", configRouter);
 app.use("/api/v1/connections", connectionsRouter);
+app.use("/api/v1/portfolio", portfolioRouter);
+app.use("/api/v1/organizations", organizationsRouter);
 
 export { app };
 
 if (config.NODE_ENV !== "test") {
-  startServer(app);
+  void initSentry().finally(() => startServer(app));
 }

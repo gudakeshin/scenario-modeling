@@ -27,8 +27,13 @@ export interface LoginInput {
 export interface AuthProvider {
   readonly name: string;
   register(input: RegisterInput): Promise<AuthUser>;
-  login(input: LoginInput): Promise<{ user: AuthUser; tokens: TokenPair }>;
-  refresh(refreshToken: string): Promise<TokenPair>;
+  /** Optional admin-gated registration (local provider). */
+  registerByAdmin?(input: RegisterInput & { role?: Role }, admin: AuthUser): Promise<AuthUser>;
+  login(
+    input: LoginInput,
+    meta?: { userAgent?: string; ip?: string },
+  ): Promise<{ user: AuthUser; tokens: TokenPair }>;
+  refresh(refreshToken: string, meta?: { userAgent?: string; ip?: string }): Promise<TokenPair>;
   logout(refreshToken: string): Promise<void>;
   verifyAccessToken(token: string): Promise<AuthUser>;
 }

@@ -5,7 +5,7 @@ import {
   parseScenario,
   refineScenario,
   runScenario,
-  generateNarrative,
+  generateNarrativeStream,
   generateBusinessAnalysis,
   createSession,
   addFollowUp,
@@ -13,10 +13,11 @@ import {
   initUserContext,
   listScenarios,
   getOnboardingStatus,
+  queryAllDocuments,
 } from "@/lib/api";
 import { probePlanningConnectors } from "@/lib/features";
 import { setCurrency, getCurrencySymbol, getCurrencyLabel } from "@/lib/metrics";
-import type { Message, ThinkingData } from "@/types/chat";
+import type { Message, ThinkingData, CausalChainStep, AgentTraceStep } from "@/types/chat";
 import { useChatStore } from "@/stores/chatStore";
 import { useUiStore } from "@/stores/uiStore";
 import { useSessionStore } from "@/stores/sessionStore";
@@ -41,6 +42,10 @@ export function useScenarioWorkflow() {
   const selectConversation = useChatStore((s) => s.selectConversation);
   const renameConversation = useChatStore((s) => s.renameConversation);
   const deleteConversation = useChatStore((s) => s.deleteConversation);
+  const deleteConversations = useChatStore((s) => s.deleteConversations);
+  const assistantMode = useChatStore((s) => s.assistantMode);
+  const documentConversationId = useChatStore((s) => s.documentConversationId);
+  const setDocumentConversationId = useChatStore((s) => s.setDocumentConversationId);
 
   const {
     onboardingStatus, isLoading,
@@ -139,12 +144,60 @@ export function useScenarioWorkflow() {
   );
 
   const handleDelete = useCallback(
-    (id: string) => {
-      const wasActive = activeId === id;
-      deleteConversation(id);
-      if (wasActive) closeAllPanels();
+    async (id: string) => {
+      const conv = useChatStore.getState().conversations.find((c) => c.id === id);
+      const scenarioId = conv?.scenarioId ?? null;
+      try {
+        if (scenarioId) {
+          const { deleteScenario } = await import("@/lib/api");
+          await deleteScenario(scenarioId);
+        }
+        const wasActive = activeId === id;
+        deleteConversation(id);
+        if (wasActive) closeAllPanels();
+      } catch (e) {
+        window.alert((e as Error).message || "Failed to delete scenario");
+      }
     },
     [activeId, deleteConversation, closeAllPanels]
+  );
+
+  const handleDeleteMany = useCallback(
+    async (ids: string[]) => {
+      const convs = useChatStore.getState().conversations;
+      const idToScenario = new Map<string, string>();
+      for (const id of ids) {
+        const conv = convs.find((c) => c.id === id);
+        if (conv?.scenarioId) idToScenario.set(id, conv.scenarioId);
+      }
+      const remoteIds = Array.from(idToScenario.values());
+      try {
+        let deletedRemote = new Set<string>();
+        if (remoteIds.length > 0) {
+          const { deleteScenarios } = await import("@/lib/api");
+          const result = await deleteScenarios(remoteIds);
+          deletedRemote = new Set(result.deleted);
+          if (result.failed.length > 0 && result.deleted.length === 0) {
+            throw new Error(result.failed[0]?.error || "Failed to delete scenarios");
+          }
+          if (result.failed.length > 0) {
+            window.alert(
+              `Deleted ${result.deleted.length}; ${result.failed.length} could not be deleted.`,
+            );
+          }
+        }
+        const toRemove = ids.filter((id) => {
+          const sid = idToScenario.get(id);
+          return !sid || deletedRemote.has(sid);
+        });
+        const wasActive = activeId != null && toRemove.includes(activeId);
+        deleteConversations(toRemove);
+        if (wasActive) closeAllPanels();
+      } catch (e) {
+        window.alert((e as Error).message || "Failed to delete scenarios");
+      }
+    },
+    [activeId, deleteConversations, closeAllPanels]
   );
 
   const persistSession = useCallback(
@@ -174,6 +227,29 @@ export function useScenarioWorkflow() {
 
       setIsLoading(true);
       const cId = convId;
+
+      // ── Document Q&A path (auth'd RAG; does not create/approve scenarios) ──
+      if (assistantMode === "documents") {
+        try {
+          const result = await queryAllDocuments(text, documentConversationId ?? undefined);
+          if (result.conversation_id) setDocumentConversationId(result.conversation_id);
+          const sources =
+            result.sources?.length > 0
+              ? "\n\n_Sources: " +
+                result.sources
+                  .slice(0, 4)
+                  .map((s) => s.document_name)
+                  .filter(Boolean)
+                  .join(", ") +
+                "_"
+              : "";
+          addAssistantMessage(cId, result.answer + sources);
+        } catch (e) {
+          addAssistantMessage(cId, "Document Q&A failed: " + (e as Error).message);
+        }
+        setIsLoading(false);
+        return;
+      }
 
       // ── Conversational follow-up path ──
       if (sessionId && active?.scenarioId) {
@@ -206,6 +282,13 @@ export function useScenarioWorkflow() {
       let assistantContent: string;
       let scenarioIdFromApi: string | undefined;
       let thinkingData: ThinkingData | undefined;
+      let causalChain: CausalChainStep[] | undefined;
+      let agentTrace: AgentTraceStep[] | undefined;
+      let agentConfidence: number | undefined;
+      let agentCitations: Message["agentCitations"];
+      let previewPl: Record<string, number> | undefined;
+      let previewReconciliation: Message["previewReconciliation"];
+      let constraintViolations: Message["constraintViolations"];
       try {
         const data = await parseScenario(text);
         scenarioIdFromApi = data.scenario_id ?? undefined;
@@ -220,6 +303,20 @@ export function useScenarioWorkflow() {
             duration_ms: data.reflection.duration_ms,
           };
         }
+
+        if (data.causal_chain?.length) causalChain = data.causal_chain;
+        if (data.agent_trace?.length) agentTrace = data.agent_trace;
+        if (data.agent_confidence != null) agentConfidence = data.agent_confidence;
+        if (data.citations?.length) agentCitations = data.citations;
+        if (data.preview_pl && Object.keys(data.preview_pl).length > 0) previewPl = data.preview_pl;
+        if (data.preview_reconciliation) {
+          previewReconciliation = {
+            reconciled: !!data.preview_reconciliation.reconciled,
+            max_abs_diff: Number(data.preview_reconciliation.max_abs_diff) || 0,
+            message: data.preview_reconciliation.message,
+          };
+        }
+        if (data.constraint_violations?.length) constraintViolations = data.constraint_violations;
 
         const parts: string[] = [];
 
@@ -313,7 +410,20 @@ export function useScenarioWorkflow() {
         }
       }
 
-      const assistantMessage: Message = { id: generateId(), role: "assistant", content: assistantContent, timestamp: new Date(), thinking: thinkingData };
+      const assistantMessage: Message = {
+        id: generateId(),
+        role: "assistant",
+        content: assistantContent,
+        timestamp: new Date(),
+        thinking: thinkingData,
+        causalChain,
+        agentTrace,
+        agentConfidence,
+        agentCitations,
+        previewPl,
+        previewReconciliation,
+        constraintViolations,
+      };
       updateConversation(cId, (c) => ({
         ...c,
         messages: [...c.messages, assistantMessage],
@@ -330,7 +440,7 @@ export function useScenarioWorkflow() {
       activeId, active?.scenarioId, sessionId, addAssistantMessage,
       setConversations, setActiveId, updateConversation, setIsLoading,
       setShowReview, setExpandedPanel, setPendingQuestions, setShowDocManager,
-      persistSession,
+      persistSession, assistantMode, documentConversationId, setDocumentConversationId,
     ]
   );
 
@@ -364,6 +474,17 @@ export function useScenarioWorkflow() {
         addAssistantMessage(convId, warningText);
       }
 
+      // Surface non-finite / formula-error metrics (Wave 0 finite-output contract)
+      if (result.formula_error_metrics && result.formula_error_metrics.length > 0) {
+        const errText =
+          "**Formula / numeric errors:**\n" +
+          result.formula_error_metrics
+            .map((e) => `- **${e.metric_id}**: ${e.reason}${e.raw_value != null ? ` (${String(e.raw_value)})` : ""}`)
+            .join("\n") +
+          "\n\n_Non-finite core metrics fail the run; other invalid metrics are omitted from the P&L map._";
+        addAssistantMessage(convId, errText);
+      }
+
       // Store period data for interactive view
       if (result.periods && result.periods.length > 1) {
         setPeriodData({ periods: result.periods, granularity: result.granularity || "quarterly", pl: result.pl });
@@ -393,7 +514,8 @@ export function useScenarioWorkflow() {
       }
 
       try {
-        const narrative = await generateNarrative(scenarioId);
+        addAssistantMessage(convId, "_Writing executive summary…_");
+        const narrative = await generateNarrativeStream(scenarioId);
         addAssistantMessage(convId, "**Executive Summary:**\n\n" + narrative);
       } catch {
         // narrative is optional
@@ -562,10 +684,12 @@ export function useScenarioWorkflow() {
     sessionId,
     isLoading,
     onboardingStatus,
+    assistantMode,
     handleNewChat,
     handleSelect,
     handleRename,
     handleDelete,
+    handleDeleteMany,
     handleSend,
     handleApproved,
     handleFollowUpAnswers,

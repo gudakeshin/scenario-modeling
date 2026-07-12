@@ -91,8 +91,9 @@ async function buildMinimalXlsxBuffer(): Promise<Buffer> {
   const wb = new ExcelJS.Workbook();
   const assumptions = wb.addWorksheet("Assumptions");
   assumptions.getCell("A1").value = "All figures in INR Million";
+  assumptions.getCell("A2").value = "Volume Growth";
+  assumptions.getCell("B2").value = 0.06;
   assumptions.getCell("B4").value = "Base";
-  assumptions.getCell("B8").value = 0.06;
 
   const volume = wb.addWorksheet("Volume_Plan");
   volume.getCell("A1").value = "Product";
@@ -100,7 +101,7 @@ async function buildMinimalXlsxBuffer(): Promise<Buffer> {
   volume.getCell("C1").value = "May-24";
   volume.getCell("D1").value = "FY Total";
   volume.getCell("A2").value = "Bullet";
-  volume.getCell("B2").value = { formula: "Assumptions!B8*1000", result: 60 };
+  volume.getCell("B2").value = { formula: "Assumptions!B2*1000", result: 60 };
 
   const pnl = wb.addWorksheet("P&L");
   pnl.getCell("A1").value = "Revenue";
@@ -806,6 +807,11 @@ test("E2E: Search detection identifies macro and competitor keywords", async () 
   assert.ok(!needsExternalSearch("Cut opex by 15%"), "simple opex cut should not trigger search");
   assert.ok(!needsExternalSearch("Set unit price to 60"), "simple absolute set should not trigger search");
   assert.ok(!needsExternalSearch("Delay APAC launch by one quarter"), "simple timeline should not trigger search");
+
+  const { isOpenEndedQuestion, isExplicitLeverChange } = await import("../services/searchService.js");
+  assert.ok(isOpenEndedQuestion("How would a recession affect our margins?"), "recession how-would is open-ended");
+  assert.ok(isExplicitLeverChange("Revenue increases 10%"), "explicit % is lever change");
+  assert.ok(!isExplicitLeverChange("What if inflation rises to 5%?"), "macro what-if with % is not fast-path lever");
 });
 
 // ═══════════════════════════════════════════════════════════════
@@ -959,6 +965,30 @@ test("E2E: XLSX upload stores structural metadata", async () => {
   assert.ok(xlsxDoc, "uploaded XLSX should exist");
   assert.strictEqual(xlsxDoc.document_kind, "spreadsheet_model");
   assert.ok(xlsxDoc.workbook_graph, "XLSX should persist workbook_graph");
+  assert.ok(xlsxDoc.workbook_snapshot, "XLSX should persist sparse workbook_snapshot");
+  assert.ok(xlsxDoc.ingestion_report, "XLSX should persist ingestion_report");
+  assert.ok(xlsxDoc.ingestion_report.formulaCount >= 1, "should count formulas");
+  assert.strictEqual(xlsxDoc.validation_status, "needs_validation");
+});
+
+test("E2E: CSV upload is tabular_data without formulas", async () => {
+  const csv = Buffer.from("Metric,Value\nRevenue,1000\nCOGS,600\nAll figures in INR Lacs\n", "utf-8");
+  await agent
+    .post("/api/v1/documents/upload")
+    .attach("file", csv, "pnl_lacs.csv")
+    .expect(201);
+
+  const docs = await agent.get("/api/v1/documents").expect(200);
+  const csvDoc = docs.body.documents.find((d: { original_filename: string }) => d.original_filename === "pnl_lacs.csv");
+  assert.ok(csvDoc, "uploaded CSV should exist");
+  assert.strictEqual(csvDoc.document_kind, "tabular_data");
+  assert.ok(csvDoc.tabular_artifact, "CSV should persist tabular_artifact");
+  assert.strictEqual(csvDoc.tabular_artifact.dataOnly, true);
+  assert.ok(!csvDoc.workbook_snapshot, "CSV must not invent a workbook snapshot");
+  assert.ok(
+    csvDoc.ingestion_report?.unit === "Lakh" || csvDoc.tabular_artifact?.unit === "Lakh",
+    "should detect Lac/Lacs denomination",
+  );
 });
 
 test("E2E: XLSX context build sets needs_validation and validate endpoint marks ready", async () => {
@@ -967,6 +997,7 @@ test("E2E: XLSX context build sets needs_validation and validate endpoint marks 
     .post("/api/v1/context/build")
     .expect(201);
   assert.ok(build.body.context_data, "context should be returned");
+  assert.strictEqual(build.body.context_data.executable_engine, "xlsx_cell_graph");
 
   const statusBefore = await agent
     .get("/api/v1/context/status")
@@ -982,4 +1013,136 @@ test("E2E: XLSX context build sets needs_validation and validate endpoint marks 
     .send({})
     .expect(200);
   assert.strictEqual(validate.body.validation_status, "ready");
+  assert.ok(Array.isArray(validate.body.bound_levers), "validation should return bound levers");
+  assert.ok(Array.isArray(validate.body.bound_outputs), "validation should return bound outputs");
+});
+
+// ═══════════════════════════════════════════════════════════════
+// WAVE 2 ANALYSIS ENDPOINTS
+// ═══════════════════════════════════════════════════════════════
+
+async function ensureE2eFormulaModelActive(): Promise<void> {
+  // XLSX upload/validate tests leave a spreadsheet_model document that wins
+  // model resolution over the formula DAG. Park those docs so Wave 2 stays
+  // on the deterministic E2E Formula Model.
+  await pool.query(
+    `UPDATE documents
+     SET status = 'archived'
+     WHERE workspace_id = $1
+       AND document_kind = 'spreadsheet_model'
+       AND status = 'ready'`,
+    [e2eWorkspaceId],
+  );
+  await pool.query(
+    `UPDATE user_models SET is_active = false WHERE workspace_id = $1 AND is_active`,
+    [e2eWorkspaceId],
+  );
+  const existing = await pool.query(
+    `SELECT model_id FROM user_models
+     WHERE workspace_id = $1 AND name = 'E2E Formula Model'
+     ORDER BY created_at DESC LIMIT 1`,
+    [e2eWorkspaceId],
+  );
+  if (existing.rows[0]?.model_id) {
+    await pool.query(`UPDATE user_models SET is_active = true WHERE model_id = $1`, [
+      existing.rows[0].model_id,
+    ]);
+  } else {
+    await pool.query(
+      `INSERT INTO user_models (created_by, workspace_id, name, model_definition, source_kind, is_active)
+       VALUES ($1, $2, $3, $4, 'documents', true)`,
+      [e2eUserId, e2eWorkspaceId, "E2E Formula Model", JSON.stringify(E2E_FORMULA_MODEL)],
+    );
+  }
+}
+
+test("E2E: Attribution (Shapley) returns bars summing toward total delta", async () => {
+  await ensureE2eFormulaModelActive();
+  const { scenarioId } = await createAndRunScenario("Revenue increase 8%");
+
+  const res = await agent
+    .post(`/api/v1/scenarios/${scenarioId}/attribution`)
+    .send({ target_metric: "net_income" })
+    .expect(200);
+
+  assert.strictEqual(res.body.target_metric, "net_income");
+  assert.ok(typeof res.body.total_delta === "number");
+  assert.ok(Array.isArray(res.body.bars));
+  assert.ok(res.body.bars.length > 0, "should return attribution bars");
+  const sum = res.body.bars.reduce((s: number, b: { contribution: number }) => s + b.contribution, 0);
+  assert.ok(Math.abs(sum - res.body.total_delta) < 1, `contributions ${sum} vs delta ${res.body.total_delta}`);
+});
+
+test("E2E: Goal-seek solves and apply-lever upserts parameter", async () => {
+  await ensureE2eFormulaModelActive();
+  const { scenarioId, parameters } = await createAndRunScenario("OpEx increase 5%");
+  const lever = parameters.find((p) => p.mapped_variable_id)?.mapped_variable_id || "opex";
+
+  const seek = await agent
+    .post(`/api/v1/scenarios/${scenarioId}/goal-seek`)
+    .send({
+      variable_id: lever,
+      target_metric: "net_income",
+      target_value: 1000,
+    })
+    .expect(200);
+
+  assert.strictEqual(seek.body.variable_id, lever);
+  assert.ok(typeof seek.body.converged === "boolean");
+  assert.ok("solved_value" in seek.body);
+
+  if (seek.body.solved_value != null) {
+    const applied = await agent
+      .post(`/api/v1/scenarios/${scenarioId}/parameters/apply-lever`)
+      .send({
+        variable_id: lever,
+        scenario_value: seek.body.solved_value,
+        delta_type: "absolute",
+        reason: "e2e goal-seek apply",
+      })
+      .expect(200);
+    assert.strictEqual(applied.body.mapped_variable_id, lever);
+    assert.ok(applied.body.parameter_id);
+  }
+});
+
+test("E2E: Two-way sensitivity returns grid", async () => {
+  await ensureE2eFormulaModelActive();
+  const { scenarioId, parameters } = await createAndRunScenario("Raw materials increase 3%");
+  const ids = [...new Set(parameters.map((p) => p.mapped_variable_id).filter(Boolean))];
+  const varA = ids[0] || "revenue";
+  const varB = ids[1] || ids[0] || "opex";
+  if (varA === varB) {
+    // Need two distinct vars — use revenue + opex from the formula model
+  }
+
+  const res = await agent
+    .post(`/api/v1/scenarios/${scenarioId}/sensitivity/two-way`)
+    .send({
+      target_metric: "net_income",
+      variable_a: varA === varB ? "revenue" : varA,
+      variable_b: varA === varB ? "opex" : varB,
+      swings: [-0.1, 0, 0.1],
+    })
+    .expect(200);
+
+  assert.ok(Array.isArray(res.body.grid));
+  assert.strictEqual(res.body.grid.length, 3);
+  assert.strictEqual(res.body.grid[0].length, 3);
+  assert.ok(typeof res.body.base_metric_value === "number");
+});
+
+test("E2E: Driver tree returns nested root", async () => {
+  await ensureE2eFormulaModelActive();
+  const { scenarioId } = await createAndRunScenario("Revenue increase 2%");
+
+  const res = await agent
+    .get(`/api/v1/scenarios/${scenarioId}/driver-tree`)
+    .query({ metric: "net_income" })
+    .expect(200);
+
+  assert.strictEqual(res.body.target_metric, "net_income");
+  assert.ok(res.body.root);
+  assert.ok(typeof res.body.root.value === "number");
+  assert.ok(res.body.apply_path, "should document apply path");
 });

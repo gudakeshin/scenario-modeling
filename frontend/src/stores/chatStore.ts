@@ -2,9 +2,18 @@ import { create } from "zustand";
 import type { Conversation, Message } from "@/types/chat";
 import { useSessionStore } from "./sessionStore";
 
+/** Unified assistant mode: scenario modeling (approval-gated) vs document Q&A. */
+export type AssistantMode = "scenario" | "documents";
+
 interface ChatState {
   conversations: Conversation[];
   activeId: string | null;
+  /** Chat surface mode — Document Q&A does not bypass scenario approval. */
+  assistantMode: AssistantMode;
+  /** RAG conversation id when in documents mode (auth'd API). */
+  documentConversationId: string | null;
+  setAssistantMode: (mode: AssistantMode) => void;
+  setDocumentConversationId: (id: string | null) => void;
   setConversations: (
     next: Conversation[] | ((prev: Conversation[]) => Conversation[])
   ) => void;
@@ -17,11 +26,17 @@ interface ChatState {
   selectConversation: (id: string) => void;
   renameConversation: (id: string, title: string) => void;
   deleteConversation: (id: string) => void;
+  deleteConversations: (ids: string[]) => void;
 }
 
 export const useChatStore = create<ChatState>((set, get) => ({
   conversations: [],
   activeId: null,
+  assistantMode: "scenario",
+  documentConversationId: null,
+
+  setAssistantMode: (mode) => set({ assistantMode: mode }),
+  setDocumentConversationId: (id) => set({ documentConversationId: id }),
 
   setConversations: (next) =>
     set((state) => ({
@@ -68,6 +83,28 @@ export const useChatStore = create<ChatState>((set, get) => ({
     const state = get();
     const next = state.conversations.filter((c) => c.id !== id);
     const wasActive = state.activeId === id;
+    set({
+      conversations: next,
+      activeId: wasActive ? (next[0]?.id ?? null) : state.activeId,
+    });
+    if (wasActive) {
+      const nextActive = next[0];
+      useSessionStore
+        .getState()
+        .setSession(nextActive?.sessionId ?? null, nextActive?.scenarioId ?? null);
+    }
+  },
+
+  deleteConversations: (ids) => {
+    if (ids.length === 0) return;
+    if (ids.length === 1) {
+      get().deleteConversation(ids[0]);
+      return;
+    }
+    const remove = new Set(ids);
+    const state = get();
+    const next = state.conversations.filter((c) => !remove.has(c.id));
+    const wasActive = state.activeId != null && remove.has(state.activeId);
     set({
       conversations: next,
       activeId: wasActive ? (next[0]?.id ?? null) : state.activeId,

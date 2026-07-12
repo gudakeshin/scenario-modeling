@@ -1,7 +1,12 @@
 import test from "node:test";
 import assert from "node:assert";
 import { CompiledModel } from "./expression.js";
-import { applySampled, buildAutoDistributions, type DistributionConfig } from "./monteCarloService.js";
+import {
+  applySampled,
+  buildAutoDistributions,
+  fitDistributionsFromHistory,
+  type DistributionConfig,
+} from "./monteCarloService.js";
 import { mulberry32, lognormalRandom } from "./random.js";
 
 test("MC auto: percent delta stddev is 5pp not 0.15×delta", () => {
@@ -38,6 +43,27 @@ test("MC applySampled: clamped currency never negative", () => {
   applySampled(absVals, dist, -50, new Map([["revenue", 1000]]), notices, inputById, clamps);
   assert.strictEqual(absVals.revenue, 0);
   assert.strictEqual(clamps.get("revenue"), 1);
+});
+
+test("MC fitDistributionsFromHistory: deterministic means, stddevs, correlations", () => {
+  // Linear series — Pearson ρ = 1 between revenue and cogs
+  const samples = {
+    revenue: [100, 110, 120, 130, 140],
+    cogs: [40, 44, 48, 52, 56],
+    noise: [1, 9, 2, 8, 3],
+  };
+  const fitted = fitDistributionsFromHistory(samples);
+  assert.strictEqual(fitted.distributions.length, 3);
+  const rev = fitted.distributions.find((d) => d.variable_id === "revenue")!;
+  assert.ok(Math.abs(rev.base_value - 120) < 1e-9);
+  assert.ok(rev.stddev != null && rev.stddev > 0);
+  assert.strictEqual(rev.type, "lognormal");
+  const corr = fitted.correlations.find((c) =>
+    (c.a === "revenue" && c.b === "cogs") || (c.a === "cogs" && c.b === "revenue"),
+  );
+  assert.ok(corr, "revenue–cogs correlation expected");
+  assert.ok(Math.abs(corr!.rho - 1) < 0.01, `rho ${corr!.rho}`);
+  assert.strictEqual(fitted.sample_counts.revenue, 5);
 });
 
 test("MC lognormal default: all-positive over 2000 seeded iterations", () => {

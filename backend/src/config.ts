@@ -16,7 +16,10 @@ const envSchema = z.object({
   ANTHROPIC_API_KEY: z.string().min(1).optional(),
   ANTHROPIC_MODEL: z.string().default("claude-haiku-4-5-20251001"),
   ANTHROPIC_MODEL_PARSE: z.string().optional(),
+  /** Defaults to Sonnet 5 when unset — analysis / context_build quality tier. */
   ANTHROPIC_MODEL_ANALYSIS: z.string().optional(),
+  /** Defaults to Opus 4.8 when unset — QA judge / agentic reasoner tier. */
+  ANTHROPIC_MODEL_QA: z.string().optional(),
   PERPLEXITY_API_KEY: z.string().optional(),
   PERPLEXITY_MODEL: z.string().default("sonar"),
   LLAMA_CLOUD_API_KEY: z.string().optional(),
@@ -37,6 +40,34 @@ const envSchema = z.object({
   RATE_LIMIT_MAX_REQUESTS: z.coerce.number().int().positive().default(120),
   AUTH_RATE_LIMIT_MAX: z.coerce.number().int().positive().default(20),
   SESSION_TTL_MS: z.coerce.number().int().positive().default(3_600_000),
+  /** Optional Redis URL for shared session/context cache (horizontal scale). */
+  REDIS_URL: z
+    .string()
+    .optional()
+    .transform((v) => (v && v.trim() ? v.trim() : undefined)),
+  /** S3-compatible object storage for workbook bytes (optional). */
+  OBJECT_STORAGE_ENDPOINT: z.string().url().optional(),
+  OBJECT_STORAGE_BUCKET: z.string().optional(),
+  OBJECT_STORAGE_ACCESS_KEY: z.string().optional(),
+  OBJECT_STORAGE_SECRET_KEY: z.string().optional(),
+  OBJECT_STORAGE_REGION: z.string().default("us-east-1"),
+  OBJECT_STORAGE_FORCE_PATH_STYLE: z
+    .string()
+    .optional()
+    .transform((v) => v === "1" || v?.toLowerCase() === "true"),
+  /** OIDC (optional — AUTH_PROVIDER=oidc) */
+  OIDC_ISSUER: z.string().url().optional(),
+  OIDC_CLIENT_ID: z.string().optional(),
+  OIDC_CLIENT_SECRET: z.string().optional(),
+  OIDC_AUDIENCE: z.string().optional(),
+  /** Registered callback URL, e.g. http://localhost:4000/api/v1/auth/oidc/callback */
+  OIDC_REDIRECT_URI: z.string().url().optional(),
+  /** Optional IdP authorize/token overrides (defaults: issuer + standard paths). */
+  OIDC_AUTHORIZATION_ENDPOINT: z.string().url().optional(),
+  OIDC_TOKEN_ENDPOINT: z.string().url().optional(),
+  AUTH_PROVIDER: z.enum(["local", "oidc"]).default("local"),
+  /** Optional — Sentry DSN; SDK soft-loaded when set. */
+  SENTRY_DSN: z.string().optional(),
   MAX_INPUT_LENGTH: z.coerce.number().int().positive().default(2000),
   DEMO_MODE: z
     .string()
@@ -52,14 +83,41 @@ const envSchema = z.object({
   SAC_DEFAULT_PAGE_SIZE: z.coerce.number().int().positive().default(1000),
   SAC_MAX_FACT_PAGES: z.coerce.number().int().positive().default(10_000),
   SAC_HTTP_MAX_RETRIES: z.coerce.number().int().nonnegative().default(4),
-  AUTH_PROVIDER: z.enum(["local"]).default("local"),
-  /** Optional — reserved for future Sentry; see errorReporter.ts (no hard @sentry/node dep yet). */
-  SENTRY_DSN: z.string().optional(),
+  /** Absolute / relative absurdity threshold (%) for simulation notices. */
+  ABSURDITY_THRESHOLD_PCT: z.coerce.number().positive().default(200),
+  /** Cross-foot / identity-repair relative tolerance (fraction, e.g. 0.01 = 1%). */
+  IDENTITY_REPAIR_TOLERANCE: z.coerce.number().positive().default(0.01),
+  /** Fidelity reconciliation absolute tolerance (canonical units). */
+  FIDELITY_ABS_TOLERANCE: z.coerce.number().nonnegative().default(0.5),
+  /** Fidelity reconciliation relative tolerance (fraction). */
+  FIDELITY_REL_TOLERANCE: z.coerce.number().positive().default(0.01),
+  /** Minimum fidelity score (0–1) required for validation_status=ready. */
+  FIDELITY_READY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.95),
+  MC_DEFAULT_PERCENT_SPREAD_PP: z.coerce.number().positive().default(5),
+  MC_DEFAULT_RELATIVE_STDDEV: z.coerce.number().positive().default(0.1),
+  AGENT_MAX_STEPS: z.coerce.number().int().positive().default(8),
+  AGENT_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
+  GOAL_SEEK_MAX_ITERATIONS: z.coerce.number().int().positive().default(40),
+  SHOWCASE_AGENT_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === "1" || v?.toLowerCase() === "true"),
+  /**
+   * Deployment profile for showcase capabilities.
+   * - standard: core FP&A (agent off unless SHOWCASE_AGENT_ENABLED)
+   * - showcase: enables agentic reasoning + hybrid RAG expectations
+   * - enterprise: showcase + Redis/OIDC/object-store oriented defaults
+   */
+  DEPLOYMENT_PROFILE: z.enum(["standard", "showcase", "enterprise"]).default("standard"),
 });
+
+const DEFAULT_ANALYSIS_MODEL = "claude-sonnet-5";
+const DEFAULT_QA_MODEL = "claude-opus-4-8";
 
 export type AppConfig = z.infer<typeof envSchema> & {
   anthropicModelParse: string;
   anthropicModelAnalysis: string;
+  anthropicModelQa: string;
 };
 
 function loadConfig(): AppConfig {
@@ -92,7 +150,8 @@ function loadConfig(): AppConfig {
   return {
     ...env,
     anthropicModelParse: env.ANTHROPIC_MODEL_PARSE || env.ANTHROPIC_MODEL,
-    anthropicModelAnalysis: env.ANTHROPIC_MODEL_ANALYSIS || env.ANTHROPIC_MODEL,
+    anthropicModelAnalysis: env.ANTHROPIC_MODEL_ANALYSIS || DEFAULT_ANALYSIS_MODEL,
+    anthropicModelQa: env.ANTHROPIC_MODEL_QA || DEFAULT_QA_MODEL,
   };
 }
 

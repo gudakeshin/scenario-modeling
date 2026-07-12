@@ -270,6 +270,9 @@ export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloVi
         >
           {loading ? "Running..." : "Run Monte Carlo"}
         </button>
+        <span className="text-[10px] text-[var(--text-faint)]">
+          Fits distributions from historical samples when provided; otherwise auto-loads workspace tabular / planning facts.
+        </span>
       </div>
 
       {error && <p className="text-xs text-[var(--danger)] mb-2 bg-[var(--danger-bg)] px-3 py-1.5 rounded-lg">{error}</p>}
@@ -286,6 +289,34 @@ export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloVi
               {result.notices.map((n, i) => (
                 <p key={i} className="text-[11px] text-[var(--warning)] bg-[var(--warning-bg)] px-2.5 py-1 rounded-lg">{n}</p>
               ))}
+            </div>
+          )}
+
+          {result.fitted_assumptions && (
+            <div className="mb-4 p-3 rounded-xl bg-[var(--panel-bg)] border border-[var(--panel-border)]">
+              <h4 className="text-[11px] font-semibold mb-2 text-[var(--text-muted)] uppercase tracking-wider">
+                Fitted Assumptions (from history)
+              </h4>
+              <ul className="text-xs text-[var(--text-secondary)] space-y-1 mb-2">
+                {result.fitted_assumptions.distributions.map((d) => (
+                  <li key={d.variable_id}>
+                    <span className="text-[var(--text-primary)] font-medium">{d.variable_id}</span>
+                    {" · "}{d.type} μ={d.base_value.toFixed(2)}
+                    {d.stddev != null ? ` σ=${d.stddev.toFixed(2)}` : ""}
+                    {result.fitted_assumptions!.sample_counts[d.variable_id] != null
+                      ? ` (n=${result.fitted_assumptions!.sample_counts[d.variable_id]})`
+                      : ""}
+                  </li>
+                ))}
+              </ul>
+              {result.fitted_assumptions.correlations.length > 0 && (
+                <p className="text-[11px] text-[var(--text-faint)]">
+                  Correlations:{" "}
+                  {result.fitted_assumptions.correlations
+                    .map((c) => `${c.a}↔${c.b} ρ=${c.rho.toFixed(2)}`)
+                    .join(", ")}
+                </p>
+              )}
             </div>
           )}
 

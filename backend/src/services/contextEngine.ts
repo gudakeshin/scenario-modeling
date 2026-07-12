@@ -16,9 +16,18 @@ import { callClaudeStructured, getApiKey } from "./llmClient.js";
 import type { ModelDefinition, ModelVariable } from "../models/registry.js";
 import type { Scope } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
-import { CompiledModel } from "./expression.js";
+import { CompiledModel, compileFormula } from "./expression.js";
 import { inferMetricTypeFromId, type MetricType, type VariableProvenance } from "./metricTypes.js";
-import { crossFootExtractedPL, type TieOutVariance } from "./modelValidation.js";
+import { crossFootExtractedPL, applyTieOutGate, type TieOutVariance } from "./modelValidation.js";
+import {
+  CANONICAL_UNIT,
+  MixedCurrencyError,
+  detectDenominationFromText,
+  normalizeCurrencyCode,
+  normalizeCurrencyUnit,
+  toCanonical,
+  type CurrencyUnit,
+} from "./denomination.js";
 
 const financialMetricSchema = z.object({
   name: z.string(),
@@ -67,6 +76,9 @@ export interface ContextData {
   industry: string;
   currency?: string;
   currency_unit?: string;
+  /** Store unit after denomination reconciliation (always Million when rescaled). */
+  canonical_unit?: string;
+  fx_assumption?: string;
   business_model: string;
   revenue_streams: string[];
   financial_metrics: FinancialMetric[];
@@ -78,6 +90,8 @@ export interface ContextData {
   model_warnings?: string[];
   tie_out_variances?: TieOutVariance[];
   tie_out_status?: "ok" | "variances";
+  /** When tie-out finds material variances, context is not silently usable. */
+  usability?: "usable" | "needs_review";
 }
 
 export interface HeaderMappingSuggestion {
@@ -283,15 +297,17 @@ Rules for financial_metrics:
   // 5. Generate and store a dynamic model definition
   const modelDef = buildModelFromContext(contextData);
 
-  // Cross-foot extracted P&L against repaired formulas (warn only)
+  // Cross-foot extracted P&L against repaired formulas — gate usability on variances
   const tieOuts = crossFootExtractedPL(contextData.financial_metrics);
   const buildWarnings = [...(modelDef.build_warnings ?? [])];
   for (const v of tieOuts) buildWarnings.push(v.message);
   modelDef.build_warnings = buildWarnings.length > 0 ? buildWarnings : undefined;
 
+  const gate = applyTieOutGate(tieOuts);
   contextData.model_warnings = modelDef.build_warnings;
   contextData.tie_out_variances = tieOuts.length > 0 ? tieOuts : undefined;
-  contextData.tie_out_status = tieOuts.length > 0 ? "variances" : "ok";
+  contextData.tie_out_status = gate.tie_out_status;
+  contextData.usability = gate.usability;
 
   await pool.query(
     "UPDATE company_context SET context_data = $1, updated_at = NOW() WHERE context_id = $2",
@@ -301,10 +317,23 @@ Rules for financial_metrics:
   // Deactivate existing models
   await pool.query("UPDATE user_models SET is_active = false WHERE workspace_id = $1 AND is_active = true", [workspaceId]);
 
+  // Only activate an executable model when tie-out gate passes; needs_review stays inactive.
+  const activate = gate.usability === "usable";
   await pool.query(
     `INSERT INTO user_models (created_by, workspace_id, name, model_definition, source_context_id, is_active)
-     VALUES ($1, $2, $3, $4, $5, true)`,
-    [userId, workspaceId, `${contextData.company_name || "Company"} P&L Model`, JSON.stringify(modelDef), ctx.context_id]
+     VALUES ($1, $2, $3, $4, $5, $6)`,
+    [
+      userId,
+      workspaceId,
+      `${contextData.company_name || "Company"} P&L Model`,
+      JSON.stringify({
+        ...modelDef,
+        usability: gate.usability,
+        tie_out_status: gate.tie_out_status,
+      }),
+      ctx.context_id,
+      activate,
+    ],
   );
 
   return {
@@ -488,10 +517,76 @@ function findKnownFormula(
   variableId: string,
   availableVars: Set<string>,
 ): { formula: string; deps: string[] } | null {
-  // Hardcoded P&L formula map is demo scaffolding only — production models
-  // must come from workbook graphs or LLM extraction.
-  if (!config.DEMO_MODE) return null;
+  // Production-safe: known P&L identities may be proposed as candidates.
+  // Acceptance is gated by tryIdentityRepair() which requires cross-foot tie-out.
+  // DEMO_MODE still enables seed mappings elsewhere; identity candidates are always available.
   return selectKnownFormula(variableId, availableVars);
+}
+
+/**
+ * Accept a known-identity formula only when it reproduces the metric's
+ * stated typical_value within tolerance (cross-foot tie-out).
+ */
+function tryIdentityRepair(
+  metric: FinancialMetric,
+  metrics: FinancialMetric[],
+  availableVars: Set<string>,
+): { formula: string; deps: string[]; provenance: "identity_repair" } | null {
+  const candidate = findKnownFormula(metric.variable_id, availableVars);
+  if (!candidate) return null;
+
+  const byId = new Map(metrics.map((m) => [m.variable_id, m]));
+  const ctx: Record<string, number> = {};
+  for (const d of candidate.deps) {
+    const dep = byId.get(d);
+    if (!dep || dep.typical_value == null || !Number.isFinite(dep.typical_value)) {
+      // Cannot verify — only accept in DEMO_MODE without tie-out
+      if (config.DEMO_MODE) {
+        return { ...candidate, provenance: "identity_repair" };
+      }
+      return null;
+    }
+    ctx[d] = dep.typical_value;
+  }
+
+  // If metric has no stated value, accept candidate only in DEMO_MODE
+  if (metric.typical_value == null || !Number.isFinite(metric.typical_value)) {
+    if (config.DEMO_MODE) return { ...candidate, provenance: "identity_repair" };
+    return null;
+  }
+
+  try {
+    const knownIds = new Set(metrics.map((m) => m.variable_id));
+    const fn = compileFormula(candidate.formula, knownIds, metric.variable_id);
+    const computed = fn(ctx, {
+      min: Math.min,
+      max: Math.max,
+      abs: Math.abs,
+      round: Math.round,
+      floor: Math.floor,
+      ceil: Math.ceil,
+      sqrt: Math.sqrt,
+      pow: Math.pow,
+    });
+    if (!Number.isFinite(computed)) return null;
+    const extracted = metric.typical_value;
+    const denom = Math.abs(extracted) > 1e-9 ? Math.abs(extracted) : Math.abs(computed);
+    if (denom < 1e-9) return null;
+    const tolerance = (config.IDENTITY_REPAIR_TOLERANCE ?? 0.01) * 100; // percent
+    const variancePct = (Math.abs(extracted - computed) / denom) * 100;
+    if (variancePct > tolerance) {
+      logger.info(
+        `[ContextEngine] Rejected identity repair for ${metric.variable_id}: variance ${variancePct.toFixed(2)}% > ${tolerance}%`,
+      );
+      return null;
+    }
+    return { ...candidate, provenance: "identity_repair" };
+  } catch (e) {
+    logger.warn(
+      `[ContextEngine] Identity repair compile failed for ${metric.variable_id}: ${(e as Error).message}`,
+    );
+    return null;
+  }
 }
 
 function buildFormulaFromDependencies(
@@ -531,22 +626,27 @@ function validateAndRepairMetrics(metrics: FinancialMetric[]): void {
     // Pass 1: calculated variable with listed deps but formula is just a number
     if (!m.is_input && m.dependencies && m.dependencies.length > 0 && numeric) {
       const repaired =
-        findKnownFormula(m.variable_id, varIds) ||
+        tryIdentityRepair(m, metrics, varIds) ||
         buildFormulaFromDependencies(m.dependencies, m.category, varIds);
       if (repaired) {
         m.formula = repaired.formula;
         m.dependencies = repaired.deps;
+        if ("provenance" in repaired && typeof (repaired as { provenance?: unknown }).provenance === "string") {
+          (m as FinancialMetric & { provenance?: string }).provenance =
+            (repaired as { provenance: string }).provenance;
+        }
         logger.info(`[ContextEngine] Repaired formula for ${m.variable_id}: ${m.formula}`);
       }
     }
 
     // Pass 2: marked as input but should be calculated — always try for TYPICALLY_CALCULATED vars
     if (m.is_input && TYPICALLY_CALCULATED.has(m.variable_id)) {
-      const repaired = findKnownFormula(m.variable_id, varIds);
+      const repaired = tryIdentityRepair(m, metrics, varIds);
       if (repaired) {
         m.is_input = false;
         m.formula = repaired.formula;
         m.dependencies = repaired.deps;
+        (m as FinancialMetric & { provenance?: string }).provenance = repaired.provenance;
         logger.info(
           `[ContextEngine] Converted ${m.variable_id} from input(${m.typical_value ?? 0}) to calculated: ${m.formula}`,
         );
@@ -561,11 +661,15 @@ function validateAndRepairMetrics(metrics: FinancialMetric[]): void {
       );
       if (!refsAnyDep) {
         const repaired =
-          findKnownFormula(m.variable_id, varIds) ||
+          tryIdentityRepair(m, metrics, varIds) ||
           buildFormulaFromDependencies(m.dependencies, m.category, varIds);
         if (repaired) {
           m.formula = repaired.formula;
           m.dependencies = repaired.deps;
+          if ("provenance" in repaired && typeof (repaired as { provenance?: unknown }).provenance === "string") {
+            (m as FinancialMetric & { provenance?: string }).provenance =
+              (repaired as { provenance: string }).provenance;
+          }
           logger.info(`[ContextEngine] Fixed detached formula for ${m.variable_id}: ${m.formula}`);
         }
       }
@@ -588,7 +692,31 @@ function sanityCheckVariables(
     if (!v.tags.includes("output")) continue;
     if (!isNumericFormula(v.formula)) continue;
 
-    const repaired = findKnownFormula(v.id, varIds);
+    const repaired = tryIdentityRepair(
+      {
+        name: v.name,
+        variable_id: v.id,
+        description: "",
+        typical_value: typeof v.formula === "string" && /^-?\d/.test(v.formula) ? Number(v.formula) : undefined,
+        unit: "",
+        category: "other",
+        is_input: false,
+        formula: v.formula,
+        dependencies: v.dependencies,
+      },
+      variables.map((x) => ({
+        name: x.name,
+        variable_id: x.id,
+        description: "",
+        typical_value: undefined,
+        unit: "",
+        category: "other" as const,
+        is_input: x.dependencies.length === 0,
+        formula: x.formula,
+        dependencies: x.dependencies,
+      })),
+      varIds,
+    );
     if (repaired) {
       v.formula = repaired.formula;
       v.dependencies = repaired.deps;
@@ -900,6 +1028,37 @@ function applyDenominationFallback(ctx: ContextData, hints: DenominationHints): 
 
   if (!ctx.currency) ctx.currency = "USD";
   if (!ctx.currency_unit) ctx.currency_unit = "Million";
+
+  // Rescale currency metric values into the canonical store unit (Million).
+  const sourceUnit = ctx.currency_unit as CurrencyUnit;
+  const sourceCurrency = ctx.currency;
+  const warnings: string[] = [...(ctx.model_warnings ?? [])];
+  for (const m of ctx.financial_metrics) {
+    if (m.typical_value == null || !Number.isFinite(m.typical_value)) continue;
+    const metricType = m.metric_type || inferMetricType(m);
+    if (metricType !== "currency" && metricType !== "unknown") continue;
+    // Percent / count / ratio / volume must not be rescaled.
+    if (metricType === "unknown") {
+      const text = `${m.name} ${m.unit} ${m.variable_id}`.toLowerCase();
+      if (/%|percent|ratio|count|headcount|volume|units/.test(text)) continue;
+    }
+    try {
+      const scaled = toCanonical(m.typical_value, {
+        unit: sourceUnit,
+        currency: sourceCurrency,
+      });
+      m.typical_value = scaled.value;
+      if (scaled.source_unit && scaled.source_unit !== CANONICAL_UNIT) {
+        m.unit = `${sourceCurrency} ${CANONICAL_UNIT}`;
+      }
+    } catch (e) {
+      if (e instanceof MixedCurrencyError) {
+        warnings.push(e.message);
+      }
+    }
+  }
+  ctx.canonical_unit = CANONICAL_UNIT;
+  if (warnings.length > 0) ctx.model_warnings = warnings;
 }
 
 function inferMetricType(m: FinancialMetric): "currency" | "count" | "percent" | "ratio" | "volume" | "unknown" {
@@ -969,67 +1128,12 @@ function buildHeaderMappingSuggestions(metrics: FinancialMetric[]): HeaderMappin
   return suggestions;
 }
 
-function normalizeCurrencyCode(value?: string): string | undefined {
-  if (!value) return undefined;
-  const v = value.trim().toUpperCase();
-  if (v.includes("INR") || v.includes("RS") || v.includes("RUPEE") || v.includes("₹")) return "INR";
-  if (v.includes("USD") || v.includes("US$") || v.includes("$")) return "USD";
-  if (v.includes("EUR") || v.includes("€")) return "EUR";
-  if (v.includes("GBP") || v.includes("£")) return "GBP";
-  if (v.includes("AED")) return "AED";
-  if (v.includes("SGD")) return "SGD";
-  return v.length <= 5 ? v : undefined;
-}
-
-function normalizeCurrencyUnit(value?: string): string | undefined {
-  if (!value) return undefined;
-  const v = value.trim().toLowerCase();
-  if (/\bmillion\b|\bmillions\b|\bmn\b|\bmio\b/.test(v)) return "Million";
-  if (/\bbillion\b|\bbillions\b|\bbn\b/.test(v)) return "Billion";
-  if (/\bthousand\b|\bthousands\b|\bk\b/.test(v)) return "Thousand";
-  if (/\bcrore\b|\bcrores\b|\bcr\b/.test(v)) return "Crore";
-  if (/\blakh\b|\blakhs\b|\blac\b|\blacs\b/.test(v)) return "Lakh";
-  return undefined;
-}
-
 function detectDenominationHints(text: string): DenominationHints {
-  const lines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
-  const currencyScore = new Map<string, number>();
-  const unitScore = new Map<string, number>();
-  const evidence: string[] = [];
-
-  const addScore = (map: Map<string, number>, key: string, weight: number) => {
-    map.set(key, (map.get(key) || 0) + weight);
-  };
-
-  for (const line of lines) {
-    const lower = line.toLowerCase();
-    const isHintLine = /\ball figures in\b|\bfigures in\b|\bamounts? in\b|\bcurrency\b|\bdenomination\b|\bunit\b/.test(lower);
-    const weight = isHintLine ? 5 : 1;
-
-    if (/\binr\b|₹|\brupees?\b|\brs\.?\b/.test(lower)) addScore(currencyScore, "INR", weight);
-    if (/\busd\b|\bus\$\b|\$/.test(line)) addScore(currencyScore, "USD", weight);
-    if (/\beur\b|€/.test(line)) addScore(currencyScore, "EUR", weight);
-    if (/\bgbp\b|£/.test(line)) addScore(currencyScore, "GBP", weight);
-    if (/\baed\b/.test(lower)) addScore(currencyScore, "AED", weight);
-    if (/\bsgd\b/.test(lower)) addScore(currencyScore, "SGD", weight);
-
-    if (/\bmillion\b|\bmillions\b|\bmn\b|\bmio\b/.test(lower)) addScore(unitScore, "Million", weight);
-    if (/\bbillion\b|\bbillions\b|\bbn\b/.test(lower)) addScore(unitScore, "Billion", weight);
-    if (/\bthousand\b|\bthousands\b/.test(lower)) addScore(unitScore, "Thousand", weight);
-    if (/\bcrore\b|\bcrores\b|\bcr\b/.test(lower)) addScore(unitScore, "Crore", weight);
-    if (/\blakh\b|\blakhs\b|\blac\b|\blacs\b/.test(lower)) addScore(unitScore, "Lakh", weight);
-
-    if (isHintLine && evidence.length < 15) evidence.push(line);
-  }
-
-  const top = (map: Map<string, number>) =>
-    [...map.entries()].sort((a, b) => b[1] - a[1])[0]?.[0];
-
+  const detected = detectDenominationFromText(text);
   return {
-    currency: top(currencyScore),
-    currency_unit: top(unitScore),
-    evidence,
+    currency: detected.currency,
+    currency_unit: detected.unit,
+    evidence: detected.evidence,
   };
 }
 
@@ -1080,6 +1184,45 @@ export async function deleteContext(scope: Scope): Promise<void> {
 /**
  * Build a text description of the company context for injection into LLM prompts.
  */
+/** Summarize revenue vs cost makeup for agent / analysis prompts. */
+export function describeCostRevenueComposition(d: ContextData): string | null {
+  const metrics = d.financial_metrics || [];
+  if (metrics.length === 0 && !(d.revenue_streams?.length)) return null;
+
+  const lines: string[] = ["COST-REVENUE COMPOSITION:"];
+  if (d.revenue_streams?.length) {
+    lines.push(`Revenue streams: ${d.revenue_streams.join(", ")}`);
+  }
+
+  const fmt = (m: FinancialMetric) =>
+    `${m.name || m.variable_id}${m.typical_value != null ? ` (${m.typical_value}${m.unit ? ` ${m.unit}` : ""})` : ""}${m.is_input ? " [input]" : " [calc]"}`;
+
+  const revenue = metrics.filter((m) => m.category === "revenue" || m.category === "income");
+  const costs = metrics.filter((m) => m.category === "cost" || m.category === "expense");
+  const margins = metrics.filter((m) => m.category === "margin");
+
+  if (revenue.length) lines.push(`Revenue line items: ${revenue.map(fmt).join("; ")}`);
+  if (costs.length) lines.push(`Cost / expense line items: ${costs.map(fmt).join("; ")}`);
+  if (margins.length) lines.push(`Margin metrics: ${margins.map(fmt).join("; ")}`);
+
+  const revTotal = revenue
+    .filter((m) => m.is_input && typeof m.typical_value === "number")
+    .reduce((s, m) => s + (m.typical_value || 0), 0);
+  const costTotal = costs
+    .filter((m) => m.is_input && typeof m.typical_value === "number")
+    .reduce((s, m) => s + (m.typical_value || 0), 0);
+  if (revTotal > 0 && costTotal > 0) {
+    lines.push(
+      `Input-lever totals (approx): revenue ${revTotal.toLocaleString()}, costs ${costTotal.toLocaleString()}, cost/revenue ${(
+        (costTotal / revTotal) *
+        100
+      ).toFixed(1)}%`,
+    );
+  }
+
+  return lines.length > 1 ? lines.join("\n") : null;
+}
+
 export async function describeContextForLLM(scope: Scope): Promise<string | null> {
   const ctx = await getActiveContext(scope);
   if (!ctx) return null;
@@ -1092,6 +1235,10 @@ export async function describeContextForLLM(scope: Scope): Promise<string | null
   ];
   if (d.revenue_streams?.length) {
     lines.push(`Revenue Streams: ${d.revenue_streams.join(", ")}`);
+  }
+  const composition = describeCostRevenueComposition(d);
+  if (composition) {
+    lines.push(composition);
   }
   if (d.competitive_landscape) {
     lines.push(`Competitive Landscape: ${d.competitive_landscape}`);

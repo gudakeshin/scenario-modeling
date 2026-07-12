@@ -2,6 +2,7 @@
 
 import type { Message } from "@/types/chat";
 import { ThinkingBlock } from "./ThinkingBlock";
+import { AgentTracePanel } from "./AgentTracePanel";
 import { MarkdownContent } from "./MarkdownContent";
 
 interface MessageBubbleProps {
@@ -17,6 +18,23 @@ export function MessageBubble({ message }: MessageBubbleProps) {
       {!isUser && message.thinking && (
         <ThinkingBlock data={message.thinking} />
       )}
+      {!isUser &&
+      (message.causalChain?.length ||
+        message.agentTrace?.length ||
+        message.previewPl ||
+        message.agentCitations?.length ||
+        message.constraintViolations?.length ||
+        message.agentConfidence != null) ? (
+        <AgentTracePanel
+          causalChain={message.causalChain}
+          agentTrace={message.agentTrace}
+          confidence={message.agentConfidence}
+          citations={message.agentCitations}
+          previewPl={message.previewPl}
+          previewReconciliation={message.previewReconciliation}
+          constraintViolations={message.constraintViolations}
+        />
+      ) : null}
       <div
         className={`flex w-full ${isUser ? "justify-end" : "justify-start"} px-4 py-2`}
       >

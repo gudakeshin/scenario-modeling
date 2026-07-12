@@ -26,9 +26,17 @@ import { isDimensionalModelDefinition, type DimensionalModelDefinition } from ".
 import { pool } from "../db/index.js";
 import { describeContextForLLM } from "./contextEngine.js";
 import type { Scope } from "../middleware/workspace.js";
-import { needsExternalSearch, searchPerplexity, type SearchResult } from "./searchService.js";
+import { needsExternalSearch, searchPerplexity, isOpenEndedQuestion, isExplicitLeverChange, type SearchResult } from "./searchService.js";
 import { reflect, type ReflectionResult } from "./reflectionService.js";
 import { logger } from "../logger.js";
+import { config } from "../config.js";
+import {
+  describeContextForLLM as describeScenarioContextForLLM,
+  getScenarioContext,
+  hydrateScenarioContext,
+} from "./scenarioContextService.js";
+import { runScenarioReasoning } from "./scenarioReasoningAgent.js";
+import type { AgentTraceStep } from "./scenarioReasoningAgent.js";
 
 const llmParseResponseSchema = z.object({
   parameters: z.array(z.object({
@@ -119,6 +127,31 @@ export interface ParseResult {
     sources: string[];
   };
   notices?: { type: "warning" | "info"; message: string }[];
+  /** Agentic reasoning trace (tool steps). */
+  agent_trace?: AgentTraceStep[];
+  /** Causal chain from the reasoning agent. */
+  causal_chain?: Array<{
+    step: string;
+    detail?: string;
+    kind?: "decomposition" | "research" | "levers" | "preview" | "other";
+  }>;
+  citations?: Array<{ source: string; snippet?: string; url?: string }>;
+  agent_confidence?: number;
+  /** Optional in-loop what-if P&L from the reasoning agent (not persisted as a run). */
+  preview_pl?: Record<string, number>;
+  preview_reconciliation?: {
+    reconciled: boolean;
+    max_abs_diff: number;
+    diffs?: Record<string, { preview: number; final: number; abs_diff: number }>;
+    message?: string;
+  };
+  constraint_violations?: Array<{ lever: string; reason: string }>;
+  agent_readiness?: {
+    enabled: boolean;
+    model_validated: boolean;
+    ready: boolean;
+    reasons: string[];
+  };
 }
 
 // ── LLM-powered parsing ──
@@ -204,7 +237,8 @@ async function llmParse(
   nlInput: string,
   scope: Scope | undefined,
   searchContext?: SearchResult | null,
-  reflectionResult?: ReflectionResult | null
+  reflectionResult?: ReflectionResult | null,
+  scenarioId?: string,
 ): Promise<ParseResult> {
   if (!getApiKey()) throw new Error("No API key");
   if (!scope) throw new Error("No user — authentication required");
@@ -218,7 +252,17 @@ async function llmParse(
     ? describeDimensionalModelForLLM(rawModel)
     : describeModelForLLM(rawModel as ModelDefinition);
   const contextDesc = await describeContextForLLM(scope);
+
+  let scenarioContextDesc: string | null = null;
+  if (scenarioId) {
+    await hydrateScenarioContext(scenarioId);
+    scenarioContextDesc = describeScenarioContextForLLM(getScenarioContext(scenarioId));
+  }
+
   let systemPrompt = buildSystemPrompt(modelDesc, contextDesc);
+  if (scenarioContextDesc) {
+    systemPrompt += `\n\nACTIVE SCENARIO CONTEXT (additive — do not re-extract locked/touched levers unless the user changes them):\n${scenarioContextDesc}`;
+  }
   if (isDim) {
     systemPrompt += `\n\nDIMENSIONAL SCOPE: When the user mentions a geography, product, account, or time member (e.g. "EMEA revenue +10%"), set member_scope to {dimension_id: member_id} using ONLY ids from the catalog above. Map the variable to the measure/input id. Unknown members must be omitted.`;
   }
@@ -390,7 +434,11 @@ function heuristicParse(nlInput: string, model: ModelDefinition | null): ParseRe
 
 // ── Main entry point ──
 
-export async function parseScenario(nlInput: string, scope?: Scope): Promise<ParseResult> {
+export async function parseScenario(
+  nlInput: string,
+  scope?: Scope,
+  scenarioId?: string,
+): Promise<ParseResult> {
   const apiKey = getApiKey();
   const trimmed = nlInput.trim();
   const notices: { type: "warning" | "info"; message: string }[] = [];
@@ -409,6 +457,53 @@ export async function parseScenario(nlInput: string, scope?: Scope): Promise<Par
     notices.push({
       type: "info",
       message: "No financial model found. Please upload documents and build your company context to enable scenario modeling.",
+    });
+  }
+
+  // Agentic path for open-ended questions (when enabled); keep fast path for explicit % levers
+  const agentProfileOn =
+    config.DEPLOYMENT_PROFILE === "showcase" || config.DEPLOYMENT_PROFILE === "enterprise";
+  const useAgent =
+    !!scope &&
+    !!apiKey &&
+    (!!config.SHOWCASE_AGENT_ENABLED || agentProfileOn) &&
+    isOpenEndedQuestion(trimmed) &&
+    !isExplicitLeverChange(trimmed);
+
+  if (useAgent) {
+    logger.info("[Parser] Routing to agentic scenario reasoning...");
+    const agentResult = await runScenarioReasoning(trimmed, scope!, scenarioId);
+    const result: ParseResult = {
+      parameters: agentResult.parameters,
+      clarification_needed: agentResult.clarification_needed,
+      agent_trace: agentResult.agent_trace,
+      causal_chain: agentResult.causal_chain,
+      citations: agentResult.citations,
+      agent_confidence: agentResult.confidence,
+      preview_pl: agentResult.final_preview_pl ?? agentResult.preview_pl,
+      preview_reconciliation: agentResult.preview_reconciliation,
+      constraint_violations: agentResult.constraint_violations,
+      agent_readiness: agentResult.readiness
+        ? {
+            enabled: agentResult.readiness.enabled,
+            model_validated: agentResult.readiness.model_validated,
+            ready: agentResult.readiness.ready,
+            reasons: agentResult.readiness.reasons,
+          }
+        : undefined,
+    };
+    if (agentResult.error) {
+      notices.push({ type: "warning", message: agentResult.error });
+    }
+    if (notices.length > 0) result.notices = notices;
+
+    // If agent produced parameters (or a clear clarification), return; else fall through
+    if (result.parameters.length > 0 || result.clarification_needed) {
+      return result;
+    }
+    notices.push({
+      type: "info",
+      message: "Agentic analysis did not yield parameters — falling back to standard parser.",
     });
   }
 
@@ -469,10 +564,10 @@ export async function parseScenario(nlInput: string, scope?: Scope): Promise<Par
     });
   }
 
-  // Step 3: LLM parse (enriched with reflection + search context)
+  // Step 3: LLM parse (enriched with reflection + search context + scenario context)
   if (apiKey && trimmed.length >= 5) {
     try {
-      const result = await llmParse(trimmed, scope, searchContext, reflectionResult);
+      const result = await llmParse(trimmed, scope, searchContext, reflectionResult, scenarioId);
       llmAvailable = true;
 
       if (reflectionResult) {

@@ -76,8 +76,7 @@ ABSURDITY CHECK (CRITICAL — do this FIRST):
 
 Dimensions: completeness, specificity, actionability, consistency, business_relevance, risk_coverage.
 
-Return ONLY valid JSON (no markdown). Keep feedback strings SHORT (under 100 chars each):
-{"overall_score":N,"dimensions":[{"name":"completeness","score":N,"feedback":"..."},{"name":"specificity","score":N,"feedback":"..."},{"name":"actionability","score":N,"feedback":"..."},{"name":"consistency","score":N,"feedback":"..."},{"name":"business_relevance","score":N,"feedback":"..."},{"name":"risk_coverage","score":N,"feedback":"..."}],"improvement_guidance":"numbered instructions","summary":"2 sentence assessment"}`;
+Keep feedback strings SHORT (under 100 chars each). Submit scores and guidance via the structured tool.`
 
 /**
  * Build scenario context string for QA evaluation.

@@ -13,6 +13,18 @@ export interface ThinkingData {
   duration_ms: number;
 }
 
+export interface CausalChainStep {
+  step: string;
+  detail?: string;
+  kind?: "decomposition" | "research" | "levers" | "preview" | "other";
+}
+
+export interface AgentTraceStep {
+  tool: string;
+  input: unknown;
+  output: unknown;
+}
+
 export interface Message {
   id: string;
   role: MessageRole;
@@ -20,6 +32,18 @@ export interface Message {
   timestamp: Date;
   /** Optional: visible thinking/reasoning from the LLM reflection loop */
   thinking?: ThinkingData;
+  /** Optional: agentic causal chain + tool trace */
+  agentTrace?: AgentTraceStep[];
+  causalChain?: CausalChainStep[];
+  agentConfidence?: number;
+  agentCitations?: Array<{ source: string; snippet?: string; url?: string }>;
+  previewPl?: Record<string, number>;
+  previewReconciliation?: {
+    reconciled: boolean;
+    max_abs_diff: number;
+    message?: string;
+  };
+  constraintViolations?: Array<{ lever: string; reason: string }>;
 }
 
 export interface Conversation {

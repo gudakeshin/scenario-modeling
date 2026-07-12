@@ -1,12 +1,18 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState, type PointerEvent as ReactPointerEvent } from "react";
 import Link from "next/link";
 import type { Conversation } from "@/types/chat";
 import { ThemeToggle } from "./ThemeToggle";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
+import { ConfirmDialog } from "./data/ConfirmDialog";
 import { strings } from "@/lib/strings";
 import { usePlanningConnectorsEnabled } from "@/lib/features";
+
+const SIDEBAR_WIDTH_KEY = "scenario-sidebar-width";
+const DEFAULT_WIDTH = 256;
+const MIN_WIDTH = 200;
+const MAX_WIDTH = 480;
 
 interface SidebarProps {
   conversations: Conversation[];
@@ -15,6 +21,7 @@ interface SidebarProps {
   onNewChat: () => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
+  onDeleteMany: (ids: string[]) => void;
   /** Mobile drawer open state (below md) */
   mobileOpen?: boolean;
   onMobileClose?: () => void;
@@ -29,16 +36,31 @@ function formatDate(d: Date) {
   return d.toLocaleDateString();
 }
 
+function clampWidth(n: number) {
+  return Math.min(MAX_WIDTH, Math.max(MIN_WIDTH, Math.round(n)));
+}
+
+function readStoredWidth(): number {
+  if (typeof window === "undefined") return DEFAULT_WIDTH;
+  const raw = window.localStorage.getItem(SIDEBAR_WIDTH_KEY);
+  const n = raw ? Number(raw) : NaN;
+  return Number.isFinite(n) ? clampWidth(n) : DEFAULT_WIDTH;
+}
+
 function ConversationRow({
   conversation: c,
   active,
+  selected,
   onSelect,
+  onToggleSelect,
   onRename,
   onDelete,
 }: {
   conversation: Conversation;
   active: boolean;
+  selected: boolean;
   onSelect: () => void;
+  onToggleSelect: (shiftKey: boolean) => void;
   onRename: (title: string) => void;
   onDelete: () => void;
 }) {
@@ -91,13 +113,29 @@ function ConversationRow({
           className={`flex items-center rounded-xl transition-all ${
             active
               ? "bg-[var(--sidebar-active)] border-l-2 border-accent"
-              : "hover:bg-[var(--sidebar-hover)]"
+              : selected
+                ? "bg-[var(--sidebar-hover)]"
+                : "hover:bg-[var(--sidebar-hover)]"
           }`}
         >
+          <label className="flex items-center pl-2 pr-1 shrink-0 cursor-pointer">
+            <span className="sr-only">Select {c.title || strings.sidebar.untitled}</span>
+            <input
+              type="checkbox"
+              checked={selected}
+              onClick={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                onToggleSelect(e.shiftKey);
+              }}
+              onChange={() => {}}
+              className="h-3.5 w-3.5 rounded border-[var(--sidebar-border)] accent-[var(--accent)]"
+            />
+          </label>
           <button
             type="button"
             onClick={onSelect}
-            className={`flex-1 min-w-0 text-left px-3 py-2.5 text-sm truncate ${
+            className={`flex-1 min-w-0 text-left px-2 py-2.5 text-sm truncate ${
               active
                 ? "text-[var(--sidebar-text)] font-medium"
                 : "text-[var(--sidebar-text-muted)] hover:text-[var(--sidebar-text)]"
@@ -147,9 +185,13 @@ function SidebarContent({
   onNewChat,
   onRename,
   onDelete,
+  onDeleteMany,
   collapsed,
   setCollapsed,
   showCollapse,
+  width,
+  onWidthChange,
+  resizable,
 }: {
   conversations: Conversation[];
   activeId: string | null;
@@ -157,11 +199,19 @@ function SidebarContent({
   onNewChat: () => void;
   onRename: (id: string, title: string) => void;
   onDelete: (id: string) => void;
+  onDeleteMany: (ids: string[]) => void;
   collapsed: boolean;
   setCollapsed: (v: boolean) => void;
   showCollapse: boolean;
+  width: number;
+  onWidthChange: (w: number) => void;
+  resizable: boolean;
 }) {
   const [query, setQuery] = useState("");
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [confirmBulk, setConfirmBulk] = useState(false);
+  const lastClickedId = useRef<string | null>(null);
+  const dragRef = useRef<{ startX: number; startWidth: number } | null>(null);
   const planningConnectorsEnabled = usePlanningConnectorsEnabled();
 
   const filtered = useMemo(() => {
@@ -171,6 +221,84 @@ function SidebarContent({
       (c.title || "").toLowerCase().includes(q)
     );
   }, [conversations, query]);
+
+  // Drop selections for conversations that no longer exist
+  useEffect(() => {
+    setSelectedIds((prev) => {
+      if (prev.size === 0) return prev;
+      const alive = new Set(conversations.map((c) => c.id));
+      let changed = false;
+      const next = new Set<string>();
+      for (const id of Array.from(prev)) {
+        if (alive.has(id)) next.add(id);
+        else changed = true;
+      }
+      return changed ? next : prev;
+    });
+  }, [conversations]);
+
+  const toggleSelect = useCallback(
+    (id: string, shiftKey: boolean) => {
+      setSelectedIds((prev) => {
+        const next = new Set(prev);
+        if (shiftKey && lastClickedId.current) {
+          const ids = filtered.map((c) => c.id);
+          const a = ids.indexOf(lastClickedId.current);
+          const b = ids.indexOf(id);
+          if (a >= 0 && b >= 0) {
+            const [lo, hi] = a < b ? [a, b] : [b, a];
+            for (let i = lo; i <= hi; i++) next.add(ids[i]);
+            lastClickedId.current = id;
+            return next;
+          }
+        }
+        if (next.has(id)) next.delete(id);
+        else next.add(id);
+        lastClickedId.current = id;
+        return next;
+      });
+    },
+    [filtered],
+  );
+
+  const selectAllFiltered = () => {
+    setSelectedIds(new Set(filtered.map((c) => c.id)));
+  };
+
+  const clearSelection = () => setSelectedIds(new Set());
+
+  const selectedCount = selectedIds.size;
+
+  const confirmBulkDelete = () => {
+    const ids: string[] = [];
+    selectedIds.forEach((id) => ids.push(id));
+    onDeleteMany(ids);
+    setSelectedIds(new Set());
+    setConfirmBulk(false);
+  };
+
+  const onResizePointerDown = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!resizable) return;
+    e.preventDefault();
+    dragRef.current = { startX: e.clientX, startWidth: width };
+    e.currentTarget.setPointerCapture(e.pointerId);
+  };
+
+  const onResizePointerMove = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    const delta = e.clientX - dragRef.current.startX;
+    onWidthChange(clampWidth(dragRef.current.startWidth + delta));
+  };
+
+  const onResizePointerUp = (e: ReactPointerEvent<HTMLDivElement>) => {
+    if (!dragRef.current) return;
+    dragRef.current = null;
+    try {
+      e.currentTarget.releasePointerCapture(e.pointerId);
+    } catch {
+      // already released
+    }
+  };
 
   if (collapsed) {
     return (
@@ -209,22 +337,37 @@ function SidebarContent({
             </svg>
           </Link>
         )}
+        <Link
+          href="/dashboard"
+          className="mt-2 p-2 rounded-lg hover:bg-[var(--sidebar-hover)] text-[var(--sidebar-text)] transition-colors"
+          aria-label="Portfolio dashboard"
+        >
+          <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+            <rect x="3" y="3" width="7" height="9" rx="1" />
+            <rect x="14" y="3" width="7" height="5" rx="1" />
+            <rect x="14" y="12" width="7" height="9" rx="1" />
+            <rect x="3" y="16" width="7" height="5" rx="1" />
+          </svg>
+        </Link>
       </div>
     );
   }
 
   return (
-    <div className="w-64 flex-shrink-0 flex flex-col h-full border-r border-[var(--sidebar-border)] bg-[var(--sidebar-bg)]">
+    <div
+      className="relative flex-shrink-0 flex flex-col h-full border-r border-[var(--sidebar-border)] bg-[var(--sidebar-bg)]"
+      style={{ width }}
+    >
       {/* Header with Deloitte branding */}
       <div className="p-4 flex items-center justify-between border-b border-[var(--sidebar-border)]">
-        <div className="flex items-center gap-2.5">
-          <div className="w-7 h-7 rounded-lg deloitte-gradient flex items-center justify-center shadow-sm">
+        <div className="flex items-center gap-2.5 min-w-0">
+          <div className="w-7 h-7 rounded-lg deloitte-gradient flex items-center justify-center shadow-sm shrink-0">
             <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="white" strokeWidth="2.5">
               <path d="M3 3h18v18H3V3z" />
               <path d="M3 9h18M9 3v18" />
             </svg>
           </div>
-          <div>
+          <div className="min-w-0">
             <span className="font-semibold text-[var(--sidebar-text)] text-sm tracking-tight">Scenarios</span>
             <span className="block text-[10px] text-[var(--sidebar-text-muted)] leading-none mt-0.5">{strings.sidebar.brand}</span>
           </div>
@@ -233,7 +376,7 @@ function SidebarContent({
           <button
             type="button"
             onClick={() => setCollapsed(true)}
-            className="p-1.5 rounded-lg hover:bg-[var(--sidebar-hover)] text-[var(--sidebar-text-muted)] transition-colors"
+            className="p-1.5 rounded-lg hover:bg-[var(--sidebar-hover)] text-[var(--sidebar-text-muted)] transition-colors shrink-0"
             aria-label={strings.sidebar.collapse}
           >
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
@@ -243,14 +386,12 @@ function SidebarContent({
         )}
       </div>
 
-      {/* Workspace selector — isolated documents/model/scenarios per workspace */}
       <WorkspaceSwitcher />
 
-      {/* New scenario button */}
       <button
         type="button"
         onClick={onNewChat}
-        className="m-3 flex items-center gap-2 rounded-xl bg-accent hover:bg-accent-hover px-3 py-2.5 text-sm font-medium text-white transition-colors shadow-sm"
+        className="m-3 flex items-center gap-2 rounded-xl bg-accent hover:bg-accent-hover px-3 py-2.5 text-sm font-medium text-[var(--on-accent)] transition-colors shadow-sm"
       >
         <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5">
           <line x1="12" y1="5" x2="12" y2="19" />
@@ -259,7 +400,6 @@ function SidebarContent({
         {strings.sidebar.newChat}
       </button>
 
-      {/* Data & Models hub — planning connectors */}
       {planningConnectorsEnabled && (
         <Link
           href="/connections"
@@ -274,7 +414,6 @@ function SidebarContent({
         </Link>
       )}
 
-      {/* Search filter */}
       <div className="px-3 pb-2">
         <label className="sr-only" htmlFor="sidebar-search">
           {strings.sidebar.searchLabel}
@@ -304,7 +443,35 @@ function SidebarContent({
         </div>
       </div>
 
-      {/* Conversation list */}
+      {selectedCount > 0 && (
+        <div className="mx-3 mb-2 flex flex-wrap items-center gap-1.5 rounded-xl border border-[var(--sidebar-border)] bg-[var(--sidebar-hover)] px-2 py-1.5">
+          <span className="text-[11px] font-medium text-[var(--sidebar-text)] px-1">
+            {strings.sidebar.selectedCount.replace("{count}", String(selectedCount))}
+          </span>
+          <button
+            type="button"
+            onClick={selectAllFiltered}
+            className="rounded-lg px-2 py-1 text-[11px] text-[var(--sidebar-text-muted)] hover:text-[var(--sidebar-text)] hover:bg-[var(--sidebar-bg)]"
+          >
+            {strings.sidebar.selectAll}
+          </button>
+          <button
+            type="button"
+            onClick={clearSelection}
+            className="rounded-lg px-2 py-1 text-[11px] text-[var(--sidebar-text-muted)] hover:text-[var(--sidebar-text)] hover:bg-[var(--sidebar-bg)]"
+          >
+            {strings.sidebar.clearSelection}
+          </button>
+          <button
+            type="button"
+            onClick={() => setConfirmBulk(true)}
+            className="ml-auto rounded-lg px-2 py-1 text-[11px] font-medium text-[var(--danger)] hover:bg-[var(--danger-bg)]"
+          >
+            {strings.sidebar.deleteSelected}
+          </button>
+        </div>
+      )}
+
       <nav className="flex-1 overflow-y-auto chat-scroll px-2 pb-4" aria-label="Conversations">
         {conversations.length === 0 ? (
           <p className="px-3 py-4 text-xs text-[var(--sidebar-text-muted)] text-center">
@@ -323,7 +490,9 @@ function SidebarContent({
                 key={c.id}
                 conversation={c}
                 active={activeId === c.id}
+                selected={selectedIds.has(c.id)}
                 onSelect={() => onSelect(c.id)}
+                onToggleSelect={(shiftKey) => toggleSelect(c.id, shiftKey)}
                 onRename={(title) => onRename(c.id, title)}
                 onDelete={() => onDelete(c.id)}
               />
@@ -332,13 +501,50 @@ function SidebarContent({
         )}
       </nav>
 
-      {/* Footer with branding */}
       <div className="p-3 border-t border-[var(--sidebar-border)] flex items-center justify-between">
-        <p className="text-[10px] text-[var(--sidebar-text-muted)] opacity-50">
+        <p className="text-[10px] text-[var(--sidebar-text-muted)] opacity-50 truncate">
           {strings.sidebar.footer}
         </p>
         <ThemeToggle />
       </div>
+
+      {resizable && (
+        <div
+          role="separator"
+          aria-orientation="vertical"
+          aria-label={strings.sidebar.resizeSidebar}
+          aria-valuenow={width}
+          aria-valuemin={MIN_WIDTH}
+          aria-valuemax={MAX_WIDTH}
+          tabIndex={0}
+          onPointerDown={onResizePointerDown}
+          onPointerMove={onResizePointerMove}
+          onPointerUp={onResizePointerUp}
+          onPointerCancel={onResizePointerUp}
+          onKeyDown={(e) => {
+            if (e.key === "ArrowLeft") {
+              e.preventDefault();
+              onWidthChange(clampWidth(width - 16));
+            } else if (e.key === "ArrowRight") {
+              e.preventDefault();
+              onWidthChange(clampWidth(width + 16));
+            }
+          }}
+          className="absolute inset-y-0 right-0 w-1.5 cursor-col-resize touch-none group/resize z-10"
+        >
+          <span className="absolute inset-y-0 right-0 w-px bg-transparent group-hover/resize:bg-accent/50 group-focus-visible/resize:bg-accent transition-colors" />
+        </div>
+      )}
+
+      <ConfirmDialog
+        open={confirmBulk}
+        title={strings.sidebar.deleteSelected}
+        description={strings.sidebar.deleteSelectedConfirm.replace("{count}", String(selectedCount))}
+        confirmLabel={strings.sidebar.deleteSelected}
+        danger
+        onCancel={() => setConfirmBulk(false)}
+        onConfirm={confirmBulkDelete}
+      />
     </div>
   );
 }
@@ -350,10 +556,26 @@ export function Sidebar({
   onNewChat,
   onRename,
   onDelete,
+  onDeleteMany,
   mobileOpen = false,
   onMobileClose,
 }: SidebarProps) {
   const [collapsed, setCollapsed] = useState(false);
+  const [width, setWidth] = useState(DEFAULT_WIDTH);
+
+  useEffect(() => {
+    setWidth(readStoredWidth());
+  }, []);
+
+  const handleWidthChange = useCallback((w: number) => {
+    const next = clampWidth(w);
+    setWidth(next);
+    try {
+      window.localStorage.setItem(SIDEBAR_WIDTH_KEY, String(next));
+    } catch {
+      // ignore quota / private mode
+    }
+  }, []);
 
   const selectAndClose = (id: string) => {
     onSelect(id);
@@ -367,7 +589,6 @@ export function Sidebar({
 
   return (
     <>
-      {/* Desktop: fixed sidebar */}
       <aside className="hidden md:flex flex-shrink-0 h-full">
         <SidebarContent
           conversations={conversations}
@@ -376,13 +597,16 @@ export function Sidebar({
           onNewChat={onNewChat}
           onRename={onRename}
           onDelete={onDelete}
+          onDeleteMany={onDeleteMany}
           collapsed={collapsed}
           setCollapsed={setCollapsed}
           showCollapse
+          width={width}
+          onWidthChange={handleWidthChange}
+          resizable
         />
       </aside>
 
-      {/* Mobile: overlay drawer */}
       {mobileOpen && (
         <div className="fixed inset-0 z-40 md:hidden" role="dialog" aria-modal="true" aria-label="Sidebar">
           <button
@@ -391,7 +615,7 @@ export function Sidebar({
             aria-label={strings.sidebar.closeMenu}
             onClick={onMobileClose}
           />
-          <aside className="absolute inset-y-0 left-0 z-10 shadow-panel-lg">
+          <aside className="absolute inset-y-0 left-0 z-10 shadow-panel-lg max-w-[85vw]">
             <SidebarContent
               conversations={conversations}
               activeId={activeId}
@@ -399,9 +623,13 @@ export function Sidebar({
               onNewChat={newChatAndClose}
               onRename={onRename}
               onDelete={onDelete}
+              onDeleteMany={onDeleteMany}
               collapsed={false}
               setCollapsed={() => {}}
               showCollapse={false}
+              width={Math.min(width, typeof window !== "undefined" ? window.innerWidth * 0.85 : width)}
+              onWidthChange={handleWidthChange}
+              resizable={false}
             />
           </aside>
         </div>

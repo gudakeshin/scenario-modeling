@@ -22,12 +22,22 @@ jobs:
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     defaults:
       run:
         working-directory: backend
     env:
       NODE_ENV: test
       DATABASE_URL: postgresql://postgres:postgres@localhost:5432/scenario_modeling
+      REDIS_URL: redis://localhost:6379
       JWT_SECRET: ci-test-jwt-secret-at-least-32-characters-long
       FRONTEND_ORIGIN: http://localhost:3000
       # Intentionally unset — unit tests must pass without Anthropic
@@ -42,9 +52,11 @@ jobs:
           cache-dependency-path: backend/package-lock.json
       - run: npm ci
       - run: npx node-pg-migrate up
+      - name: Verify Redis
+        run: redis-cli -u "$REDIS_URL" ping | grep -q PONG
       - run: npm run lint
-      - run: npm test
-
+      - run: npm run db:seed
+      - run: npm run test:all
   frontend:
     runs-on: ubuntu-latest
     defaults:

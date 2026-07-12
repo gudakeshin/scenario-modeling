@@ -101,17 +101,82 @@ export const monteCarloSchema = z.object({
     .optional(),
   correlations: z
     .array(
-      z.object({
-        variable_a: z.string().min(1),
-        variable_b: z.string().min(1),
-        correlation: z.number().min(-1).max(1),
-      })
+      z
+        .object({
+          a: z.string().min(1).optional(),
+          b: z.string().min(1).optional(),
+          rho: z.number().min(-1).max(1).optional(),
+          // Legacy aliases
+          variable_a: z.string().min(1).optional(),
+          variable_b: z.string().min(1).optional(),
+          correlation: z.number().min(-1).max(1).optional(),
+        })
+        .transform((c) => ({
+          a: c.a ?? c.variable_a ?? "",
+          b: c.b ?? c.variable_b ?? "",
+          rho: c.rho ?? c.correlation ?? 0,
+        }))
+        .pipe(
+          z.object({
+            a: z.string().min(1),
+            b: z.string().min(1),
+            rho: z.number().min(-1).max(1),
+          }),
+        ),
     )
     .optional(),
+  /** Historical samples keyed by variable_id — used to fit distributions + correlations. */
+  historical_samples: z.record(z.string(), z.array(z.number().finite())).optional(),
 });
 
 export const sensitivitySchema = z.object({
   target_metric: z.string().min(1).max(255).optional(),
   swing_pct: z.number().positive().max(100).optional(),
   percent_swing_pp: z.number().positive().max(100).optional(),
+});
+
+export const twoWaySensitivitySchema = z.object({
+  target_metric: z.string().min(1).max(255).optional(),
+  variable_a: z.string().min(1),
+  variable_b: z.string().min(1),
+  swings: z.array(z.number().finite()).min(2).max(21).optional(),
+  swing_by_variable: z.record(z.string(), z.array(z.number().finite())).optional(),
+  percent_swing_pp: z.number().positive().max(100).optional(),
+});
+
+export const attributionSchema = z.object({
+  target_metric: z.string().min(1).max(255).optional(),
+});
+
+export const goalSeekSchema = z.object({
+  target_metric: z.string().min(1).max(255).optional(),
+  target_value: z.number().finite(),
+  variable_id: z.string().min(1).max(255),
+  low: z.number().finite().optional(),
+  high: z.number().finite().optional(),
+  tolerance: z.number().positive().optional(),
+});
+
+export const driverTreeSchema = z.object({
+  metric: z.string().min(1).max(255).optional(),
+  target_metric: z.string().min(1).max(255).optional(),
+  /** Optional lever edits applied before returning the tree. */
+  apply_levers: z
+    .array(
+      z.object({
+        variable_id: z.string().min(1).max(255),
+        scenario_value: z.number().finite(),
+        delta_type: z.enum(["percent", "absolute"]).optional(),
+      }),
+    )
+    .max(50)
+    .optional(),
+});
+
+export const applyLeverSchema = z.object({
+  variable_id: z.string().min(1).max(255),
+  scenario_value: z.number().finite(),
+  delta_type: z.enum(["percent", "absolute"]).optional(),
+  reason: z.string().max(1000).optional(),
+  status: z.enum(["pending", "accepted", "modified"]).optional(),
 });

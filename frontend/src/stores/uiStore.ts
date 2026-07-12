@@ -28,6 +28,9 @@ interface UiState {
   showAudit: boolean;
   showMonteCarlo: boolean;
   showTornado: boolean;
+  showAttribution: boolean;
+  showDriverTree: boolean;
+  showGoalSeek: boolean;
   showTemplates: boolean;
   showInsights: boolean;
   showPeriods: boolean;
@@ -36,6 +39,9 @@ interface UiState {
   showRoles: boolean;
   showDocuments: boolean;
   showDocManager: boolean;
+  showVersionHistory: boolean;
+  showActualsCompare: boolean;
+  showLiveWhatIf: boolean;
 
   preloadedInsight: BusinessInsight | null;
   periodData: PeriodData | null;
@@ -54,6 +60,9 @@ interface UiState {
   setShowAudit: (v: boolean) => void;
   setShowMonteCarlo: (v: boolean) => void;
   setShowTornado: (v: boolean) => void;
+  setShowAttribution: (v: boolean) => void;
+  setShowDriverTree: (v: boolean) => void;
+  setShowGoalSeek: (v: boolean) => void;
   setShowTemplates: (v: boolean) => void;
   setShowInsights: (v: boolean) => void;
   setShowPeriods: (v: boolean) => void;
@@ -62,12 +71,18 @@ interface UiState {
   setShowRoles: (v: boolean) => void;
   setShowDocuments: (v: boolean) => void;
   setShowDocManager: (v: boolean) => void;
+  setShowVersionHistory: (v: boolean) => void;
+  setShowActualsCompare: (v: boolean) => void;
+  setShowLiveWhatIf: (v: boolean) => void;
 
   toggleShowReview: () => void;
   toggleShowComparison: () => void;
   toggleShowAudit: () => void;
   toggleShowMonteCarlo: () => void;
   toggleShowTornado: () => void;
+  toggleShowAttribution: () => void;
+  toggleShowDriverTree: () => void;
+  toggleShowGoalSeek: () => void;
   toggleShowTemplates: () => void;
   toggleShowInsights: () => void;
   toggleShowPeriods: () => void;
@@ -76,6 +91,9 @@ interface UiState {
   toggleShowRoles: () => void;
   toggleShowDocuments: () => void;
   toggleShowDocManager: () => void;
+  toggleShowVersionHistory: () => void;
+  toggleShowActualsCompare: () => void;
+  toggleShowLiveWhatIf: () => void;
 
   setPreloadedInsight: (v: BusinessInsight | null) => void;
   setPeriodData: (v: PeriodData | null) => void;
@@ -96,6 +114,9 @@ export const useUiStore = create<UiState>((set) => ({
   showAudit: false,
   showMonteCarlo: false,
   showTornado: false,
+  showAttribution: false,
+  showDriverTree: false,
+  showGoalSeek: false,
   showTemplates: false,
   showInsights: false,
   showPeriods: false,
@@ -104,6 +125,9 @@ export const useUiStore = create<UiState>((set) => ({
   showRoles: false,
   showDocuments: false,
   showDocManager: false,
+  showVersionHistory: false,
+  showActualsCompare: false,
+  showLiveWhatIf: false,
 
   preloadedInsight: null,
   periodData: null,
@@ -121,6 +145,9 @@ export const useUiStore = create<UiState>((set) => ({
   setShowAudit: (v) => set({ showAudit: v }),
   setShowMonteCarlo: (v) => set({ showMonteCarlo: v }),
   setShowTornado: (v) => set({ showTornado: v }),
+  setShowAttribution: (v) => set({ showAttribution: v }),
+  setShowDriverTree: (v) => set({ showDriverTree: v }),
+  setShowGoalSeek: (v) => set({ showGoalSeek: v }),
   setShowTemplates: (v) => set({ showTemplates: v }),
   setShowInsights: (v) => set({ showInsights: v }),
   setShowPeriods: (v) => set({ showPeriods: v }),
@@ -129,12 +156,18 @@ export const useUiStore = create<UiState>((set) => ({
   setShowRoles: (v) => set({ showRoles: v }),
   setShowDocuments: (v) => set({ showDocuments: v }),
   setShowDocManager: (v) => set({ showDocManager: v }),
+  setShowVersionHistory: (v) => set({ showVersionHistory: v }),
+  setShowActualsCompare: (v) => set({ showActualsCompare: v }),
+  setShowLiveWhatIf: (v) => set({ showLiveWhatIf: v }),
 
   toggleShowReview: () => set((s) => ({ showReview: !s.showReview })),
   toggleShowComparison: () => set((s) => ({ showComparison: !s.showComparison })),
   toggleShowAudit: () => set((s) => ({ showAudit: !s.showAudit })),
   toggleShowMonteCarlo: () => set((s) => ({ showMonteCarlo: !s.showMonteCarlo })),
   toggleShowTornado: () => set((s) => ({ showTornado: !s.showTornado })),
+  toggleShowAttribution: () => set((s) => ({ showAttribution: !s.showAttribution })),
+  toggleShowDriverTree: () => set((s) => ({ showDriverTree: !s.showDriverTree })),
+  toggleShowGoalSeek: () => set((s) => ({ showGoalSeek: !s.showGoalSeek })),
   toggleShowTemplates: () => set((s) => ({ showTemplates: !s.showTemplates })),
   toggleShowInsights: () => set((s) => ({ showInsights: !s.showInsights })),
   toggleShowPeriods: () => set((s) => ({ showPeriods: !s.showPeriods })),
@@ -143,6 +176,9 @@ export const useUiStore = create<UiState>((set) => ({
   toggleShowRoles: () => set((s) => ({ showRoles: !s.showRoles })),
   toggleShowDocuments: () => set((s) => ({ showDocuments: !s.showDocuments })),
   toggleShowDocManager: () => set((s) => ({ showDocManager: !s.showDocManager })),
+  toggleShowVersionHistory: () => set((s) => ({ showVersionHistory: !s.showVersionHistory })),
+  toggleShowActualsCompare: () => set((s) => ({ showActualsCompare: !s.showActualsCompare })),
+  toggleShowLiveWhatIf: () => set((s) => ({ showLiveWhatIf: !s.showLiveWhatIf })),
 
   setPreloadedInsight: (v) => set({ preloadedInsight: v }),
   setPeriodData: (v) => set({ periodData: v }),
@@ -162,6 +198,9 @@ export const useUiStore = create<UiState>((set) => ({
       showAudit: false,
       showMonteCarlo: false,
       showTornado: false,
+      showAttribution: false,
+      showDriverTree: false,
+      showGoalSeek: false,
       showTemplates: false,
       showInsights: false,
       preloadedInsight: null,
@@ -172,6 +211,9 @@ export const useUiStore = create<UiState>((set) => ({
       showRoles: false,
       showDocuments: false,
       showDocManager: false,
+      showVersionHistory: false,
+      showActualsCompare: false,
+      showLiveWhatIf: false,
       pendingQuestions: null,
       expandedPanel: null,
       dimensionalPov: {},

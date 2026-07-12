@@ -1,16 +1,20 @@
 /**
- * Re-extract workbook graphs (incl. cell snapshots) for spreadsheet models
+ * Re-extract workbook graphs + sparse formula snapshots for spreadsheet models
  * that have their original bytes stored. Run after extractor improvements:
  *
  *   npx tsx scripts/reprocess-workbooks.ts
  *
  * Documents uploaded before file persistence landed have no file_bytes and
  * must be re-uploaded by the user — they are listed at the end.
+ *
+ * Pre-v2 / legacy sparse snapshots without Excel-cached `expected` values will
+ * not pass fidelity readiness for key outputs until reprocessed (or re-uploaded).
  */
 
 import "dotenv/config";
 import pg from "pg";
-import { extractWorkbookGraph } from "../src/services/excelExtractor.js";
+import { extractWorkbookArtifact } from "../src/services/excelExtractor.js";
+import { ARTIFACT_VERSION, buildIngestionReport } from "../src/services/ingestionArtifacts.js";
 
 const pool = new pg.Pool({ connectionString: process.env.DATABASE_URL });
 
@@ -31,15 +35,31 @@ async function main() {
       continue;
     }
     try {
-      const graph = await extractWorkbookGraph(row.file_bytes as Buffer);
+      const artifact = await extractWorkbookArtifact(row.file_bytes as Buffer);
+      const report = buildIngestionReport({
+        document_kind: "spreadsheet_model",
+        parser: "local",
+        workbook: artifact,
+      });
       await pool.query(
-        "UPDATE documents SET workbook_graph = $1, updated_at = NOW() WHERE document_id = $2",
-        [JSON.stringify(graph), row.document_id],
+        `UPDATE documents
+         SET workbook_graph = $1,
+             workbook_snapshot = $2,
+             ingestion_report = $3,
+             artifact_version = $4,
+             updated_at = NOW()
+         WHERE document_id = $5`,
+        [
+          JSON.stringify(artifact.graph),
+          JSON.stringify(artifact.snapshot),
+          JSON.stringify(report),
+          ARTIFACT_VERSION,
+          row.document_id,
+        ],
       );
-      const cells = graph.cellSnapshot
-        ? Object.values(graph.cellSnapshot).reduce((s, g) => s + g.reduce((r, c) => r + c.length, 0), 0)
-        : 0;
-      console.log(`✔ ${row.name}: re-extracted (${cells} cells snapshotted)`);
+      console.log(
+        `✔ ${row.name}: re-extracted (${artifact.stats.cellCount} cells, ${artifact.stats.formulaCount} formulas, ${artifact.stats.crossSheetLinkCount} cross-sheet)`,
+      );
       updated++;
     } catch (e) {
       console.error(`✖ ${row.name}: ${(e as Error).message}`);

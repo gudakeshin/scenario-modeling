@@ -237,6 +237,14 @@ export class LocalAuthProvider implements AuthProvider {
     );
   }
 
+  /** Issue local JWT pair for an already-authenticated user (OIDC callback). */
+  async issueTokensForUser(
+    user: AuthUser,
+    meta?: { userAgent?: string; ip?: string },
+  ): Promise<TokenPair> {
+    return issueTokenPair(user, meta);
+  }
+
   async verifyAccessToken(token: string): Promise<AuthUser> {
     try {
       const { payload } = await jwtVerify(token, secretKey(), {
@@ -264,9 +272,3 @@ export class LocalAuthProvider implements AuthProvider {
   }
 }
 
-let _provider: LocalAuthProvider | null = null;
-
-export function getAuthProvider(): LocalAuthProvider {
-  if (!_provider) _provider = new LocalAuthProvider();
-  return _provider;
-}

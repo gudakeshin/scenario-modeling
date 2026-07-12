@@ -2,7 +2,14 @@
 
 import { FormEvent, useMemo, useState, useEffect } from "react";
 import { useRouter, useSearchParams } from "next/navigation";
-import { login, register, isAuthenticated } from "@/lib/api";
+import {
+  login,
+  register,
+  isAuthenticated,
+  getAuthConfig,
+  oidcAuthorizeHref,
+  setTokens,
+} from "@/lib/api";
 
 export default function LoginClient() {
   const router = useRouter();
@@ -18,10 +25,35 @@ export default function LoginClient() {
   const [name, setName] = useState("");
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
+  const [oidcEnabled, setOidcEnabled] = useState(false);
+  const [authProvider, setAuthProvider] = useState<"local" | "oidc">("local");
 
   useEffect(() => {
+    // Capture tokens from OIDC redirect hash (access_token=…&refresh_token=…)
+    if (typeof window !== "undefined" && window.location.hash.length > 1) {
+      const hash = new URLSearchParams(window.location.hash.slice(1));
+      const access = hash.get("access_token");
+      const refresh = hash.get("refresh_token");
+      if (access && refresh) {
+        setTokens(access, refresh);
+        window.history.replaceState(null, "", window.location.pathname + window.location.search);
+        router.replace(nextPath);
+        return;
+      }
+    }
     if (isAuthenticated()) router.replace(nextPath);
   }, [router, nextPath]);
+
+  useEffect(() => {
+    void getAuthConfig()
+      .then((c) => {
+        setOidcEnabled(c.oidc_enabled);
+        setAuthProvider(c.auth_provider);
+      })
+      .catch(() => {
+        /* ignore */
+      });
+  }, []);
 
   async function onSubmit(e: FormEvent) {
     e.preventDefault();
@@ -41,6 +73,8 @@ export default function LoginClient() {
     }
   }
 
+  const showPasswordForm = authProvider === "local";
+
   return (
     <main className="min-h-screen flex items-center justify-center bg-[var(--bg)] px-4">
       <div className="w-full max-w-md border border-[var(--border)] bg-[var(--card-bg)] rounded-2xl p-8 shadow-sm">
@@ -51,72 +85,96 @@ export default function LoginClient() {
           {mode === "login" ? "Sign in" : "Create account"}
         </h1>
         <p className="text-sm text-[var(--text-secondary)] mb-6">
-          {mode === "login"
-            ? "Use your local account credentials."
-            : "First registered user becomes admin. Later accounts require an admin."}
+          {authProvider === "oidc"
+            ? "Use your organization SSO to continue."
+            : mode === "login"
+              ? "Use your local account credentials."
+              : "First registered user becomes admin. Later accounts require an admin."}
         </p>
 
-        <form onSubmit={onSubmit} className="space-y-4">
-          {mode === "register" && (
-            <label className="block text-sm">
-              <span className="text-[var(--text-secondary)]">Name</span>
-              <input
-                className="mt-1 w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-[var(--text-primary)]"
-                value={name}
-                onChange={(e) => setName(e.target.value)}
-                autoComplete="name"
-              />
-            </label>
-          )}
-          <label className="block text-sm">
-            <span className="text-[var(--text-secondary)]">Email</span>
-            <input
-              type="email"
-              required
-              className="mt-1 w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-[var(--text-primary)]"
-              value={email}
-              onChange={(e) => setEmail(e.target.value)}
-              autoComplete="email"
-            />
-          </label>
-          <label className="block text-sm">
-            <span className="text-[var(--text-secondary)]">Password</span>
-            <input
-              type="password"
-              required
-              minLength={8}
-              className="mt-1 w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-[var(--text-primary)]"
-              value={password}
-              onChange={(e) => setPassword(e.target.value)}
-              autoComplete={mode === "login" ? "current-password" : "new-password"}
-            />
-          </label>
-
-          {error && (
-            <p className="text-sm text-red-600" role="alert">
-              {error}
-            </p>
-          )}
-
-          <button
-            type="submit"
-            disabled={loading}
-            className="w-full rounded-lg bg-accent text-white py-2.5 text-sm font-semibold disabled:opacity-60"
+        {oidcEnabled && (
+          <a
+            href={oidcAuthorizeHref(nextPath)}
+            className="mb-4 flex w-full items-center justify-center rounded-lg border border-[var(--border)] py-2.5 text-sm font-semibold text-[var(--text-primary)] hover:bg-[var(--bg)]"
           >
-            {loading ? "Please wait…" : mode === "login" ? "Sign in" : "Register"}
-          </button>
-        </form>
+            Sign in with SSO
+          </a>
+        )}
 
-        <button
-          type="button"
-          className="mt-4 text-sm text-accent underline"
-          onClick={() => {
-            setMode(mode === "login" ? "register" : "login");
-            setError(null);
-          }}
-        >
-          {mode === "login" ? "Need an account? Register" : "Already have an account? Sign in"}
-        </button>
+        {showPasswordForm && (
+          <>
+            {oidcEnabled && (
+              <p className="mb-4 text-center text-xs text-[var(--text-faint)]">or</p>
+            )}
+            <form onSubmit={onSubmit} className="space-y-4">
+              {mode === "register" && (
+                <label className="block text-sm">
+                  <span className="text-[var(--text-secondary)]">Name</span>
+                  <input
+                    className="mt-1 w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-[var(--text-primary)]"
+                    value={name}
+                    onChange={(e) => setName(e.target.value)}
+                    autoComplete="name"
+                  />
+                </label>
+              )}
+              <label className="block text-sm">
+                <span className="text-[var(--text-secondary)]">Email</span>
+                <input
+                  type="email"
+                  required
+                  className="mt-1 w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-[var(--text-primary)]"
+                  value={email}
+                  onChange={(e) => setEmail(e.target.value)}
+                  autoComplete="email"
+                />
+              </label>
+              <label className="block text-sm">
+                <span className="text-[var(--text-secondary)]">Password</span>
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  className="mt-1 w-full rounded-lg border border-[var(--border)] bg-transparent px-3 py-2 text-[var(--text-primary)]"
+                  value={password}
+                  onChange={(e) => setPassword(e.target.value)}
+                  autoComplete={mode === "login" ? "current-password" : "new-password"}
+                />
+              </label>
+
+              {error && (
+                <p className="text-sm text-red-600" role="alert">
+                  {error}
+                </p>
+              )}
+
+              <button
+                type="submit"
+                disabled={loading}
+                className="w-full rounded-lg bg-accent text-white py-2.5 text-sm font-semibold disabled:opacity-60"
+              >
+                {loading ? "Please wait…" : mode === "login" ? "Sign in" : "Register"}
+              </button>
+            </form>
+
+            <button
+              type="button"
+              className="mt-4 text-sm text-accent underline"
+              onClick={() => {
+                setMode(mode === "login" ? "register" : "login");
+                setError(null);
+              }}
+            >
+              {mode === "login" ? "Need an account? Register" : "Already have an account? Sign in"}
+            </button>
+          </>
+        )}
+
+        {!showPasswordForm && error && (
+          <p className="text-sm text-red-600" role="alert">
+            {error}
+          </p>
+        )}
       </div>
     </main>
   );

@@ -38,6 +38,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   const [asking, setAsking] = useState(false);
   const [showSources, setShowSources] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
@@ -93,7 +94,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
           role: "assistant",
           content:
             okCount === 1
-              ? `Document **"${lastDoc.name}"** uploaded and processed successfully! It has been split into ${lastDoc.chunk_count} chunks and vectorized. You can now ask questions about it.`
+              ? `Document **"${lastDoc.name}"** uploaded and processed successfully! It has been split into ${lastDoc.chunk_count} searchable chunks (keyword search by default; hybrid vector search when embeddings are configured). You can now ask questions about it.`
               : `Uploaded **${okCount}** documents successfully. You can now ask questions about them.`,
           timestamp: new Date(),
         },
@@ -151,10 +152,12 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
     try {
       let result: RAGResponse;
       if (selectedDocId) {
-        result = await queryDocument(selectedDocId, userMsg.content);
+        result = await queryDocument(selectedDocId, userMsg.content, conversationId ?? undefined);
       } else {
-        result = await queryAllDocuments(userMsg.content);
+        result = await queryAllDocuments(userMsg.content, conversationId ?? undefined);
       }
+
+      if (result.conversation_id) setConversationId(result.conversation_id);
 
       const assistantMsg: ChatMessage = {
         id: `asst-${Date.now()}`,

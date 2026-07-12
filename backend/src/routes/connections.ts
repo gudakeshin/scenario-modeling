@@ -4,6 +4,7 @@
  */
 
 import { Router } from "express";
+import { z } from "zod";
 import { requireRole } from "../middleware/rbac.js";
 import { scopeOf } from "../middleware/workspace.js";
 import { validateBody } from "../middleware/validate.js";
@@ -277,6 +278,45 @@ connectionsRouter.post(
         req.body.fact_query ?? {},
       );
       return res.status(202).json(result);
+    } catch (e) {
+      return handleConnError(e, res);
+    }
+  },
+);
+
+const writebackSchema = z.object({
+  scenario_id: z.string().uuid(),
+  measure_values: z
+    .array(
+      z.object({
+        measure_id: z.string().min(1),
+        member_key: z.string().min(1),
+        value: z.number().finite(),
+      }),
+    )
+    .min(1),
+  target_version_member: z.string().optional(),
+  idempotency_key: z.string().min(8),
+});
+
+connectionsRouter.post(
+  "/:id/writeback",
+  requireRole("approver"),
+  validateBody(writebackSchema),
+  async (req, res) => {
+    try {
+      const scope = scopeOf(req);
+      const { writeBackToSac } = await import("../connectors/sacWriteback.js");
+      const result = await writeBackToSac({
+        connection_id: req.params.id,
+        workspace_id: scope.workspaceId,
+        scenario_id: req.body.scenario_id,
+        user_id: req.user!.userId,
+        target_version_member: req.body.target_version_member,
+        measure_values: req.body.measure_values,
+        idempotency_key: req.body.idempotency_key,
+      });
+      return res.json(result);
     } catch (e) {
       return handleConnError(e, res);
     }
