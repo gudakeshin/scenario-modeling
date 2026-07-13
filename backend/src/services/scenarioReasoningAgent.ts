@@ -11,7 +11,8 @@ import type { Scope } from "../middleware/workspace.js";
 import { callClaudeAgentLoop, type AgentTool } from "./llmClient.js";
 import { searchPerplexity } from "./searchService.js";
 import { searchDocumentChunksInDb } from "./documentService.js";
-import { previewSimulationForScenario } from "./simulationService.js";
+import { previewSimulationForScenario, ConstraintViolationError } from "./simulationService.js";
+import { getEvaluableModelForScenario, resolveOverridesToAbsolute } from "./modelResolver.js";
 import {
   describeContextForLLM as describeScenarioContext,
   getScenarioContext,
@@ -153,12 +154,19 @@ async function probeModelState(workspaceId: string): Promise<{
   hasActiveUserModel: boolean;
   validatedDocumentKind: string | null;
 }> {
+  // Only spreadsheet_model docs go through a real runtime-validation gate
+  // (POST /context/model/validate builds HyperFormula and proves a baseline
+  // evaluation succeeds before setting validation_status='ready'). CSV/
+  // tabular_data docs are marked validation_status='ready' immediately at
+  // ingest with no runtime check — they enrich context but can never back
+  // an executable simulation, so counting them here would make the agent
+  // report "ready" with no model to actually reason over.
   const doc = await pool.query(
     `SELECT document_kind FROM documents
      WHERE workspace_id = $1
        AND status = 'ready'
        AND validation_status = 'ready'
-       AND document_kind IN ('spreadsheet_model', 'tabular_data')
+       AND document_kind = 'spreadsheet_model'
      ORDER BY created_at DESC
      LIMIT 1`,
     [workspaceId],
@@ -279,6 +287,40 @@ export function filterParametersToInputLevers<
     }
   }
   return { kept, rejected };
+}
+
+/**
+ * Resolve proposed lever deltas (percent or absolute) to true absolute lever
+ * values against the scenario's model input bases, for constraint checking.
+ * Constraints (ceiling/floor) are defined in absolute-value space — a raw
+ * percent magnitude (e.g. 10 meaning "+10%") must never be compared directly
+ * against a constraint's max/min, or ceiling/floor checks become meaningless
+ * (and can silently pass a large absolute-type override, or reject a benign
+ * percent-type one).
+ */
+async function resolveLeverAbsolutesForConstraints(
+  scenarioId: string | undefined,
+  params: Array<{ variableId: string; value: number; delta_type: "percent" | "absolute" }>,
+): Promise<Record<string, number>> {
+  if (!scenarioId || params.length === 0) return {};
+  try {
+    const resolved = await getEvaluableModelForScenario(scenarioId);
+    const { absolute } = resolveOverridesToAbsolute(resolved.model, params);
+    return absolute;
+  } catch (e) {
+    logger.warn(
+      { err: e },
+      "[ScenarioReasoningAgent] Failed to resolve lever bases for constraint check; " +
+        "falling back to absolute-type deltas only",
+    );
+    // Percent deltas cannot be meaningfully checked without a resolved base —
+    // only fall back to raw values for deltas that are already absolute.
+    const probe: Record<string, number> = {};
+    for (const p of params) {
+      if (p.delta_type === "absolute") probe[p.variableId] = p.value;
+    }
+    return probe;
+  }
 }
 
 async function getModelSchemaPayload(workspaceId: string): Promise<unknown> {
@@ -422,8 +464,13 @@ function buildTools(opts: {
         }
       }
 
-      const absoluteProbe: Record<string, number> = {};
-      for (const p of params) absoluteProbe[p.variable_id] = p.value;
+      const overrideParams = params.map((p) => ({
+        variableId: p.variable_id,
+        value: p.value,
+        delta_type: (p.delta_type === "absolute" ? "absolute" : "percent") as "percent" | "absolute",
+      }));
+
+      const absoluteProbe = await resolveLeverAbsolutesForConstraints(scenarioId, overrideParams);
       const validation = validateAgainstConstraints(absoluteProbe, constraints);
       if (!validation.ok) {
         return {
@@ -434,22 +481,16 @@ function buildTools(opts: {
       }
 
       try {
-        const preview = await previewSimulationForScenario(
-          scenarioId,
-          params.map((p) => ({
-            variableId: p.variable_id,
-            value: p.value,
-            delta_type: (p.delta_type === "absolute" ? "absolute" : "percent") as
-              | "percent"
-              | "absolute",
-          })),
-        );
+        const preview = await previewSimulationForScenario(scenarioId, overrideParams);
         return {
           pl: preview.pl,
           simulation_mode: preview.simulation_mode,
           absurdity_warnings: preview.absurdity_warnings,
         };
       } catch (e) {
+        if (e instanceof ConstraintViolationError) {
+          return { blocked: true, violations: e.violations, error: e.message };
+        }
         return { error: (e as Error).message };
       }
     },
@@ -598,11 +639,20 @@ Investigate and call propose_parameters when ready.`;
       );
     }
 
-    // Final constraint check on suggested lever magnitudes
-    const absoluteProbe: Record<string, number> = {};
-    for (const p of kept) {
-      if (p.suggested_variable_id) absoluteProbe[p.suggested_variable_id] = p.magnitude;
-    }
+    // Final constraint check on suggested lever magnitudes — resolve percent/
+    // absolute deltas to true absolute lever values first (constraints are
+    // absolute-value floor/ceiling bounds, not raw magnitude comparisons).
+    const overrideParams = kept
+      .filter((p) => p.suggested_variable_id)
+      .map((p) => ({
+        variableId: p.suggested_variable_id!,
+        value: p.magnitude,
+        delta_type: (p.unit === "absolute" || p.direction === "set"
+          ? "absolute"
+          : "percent") as "percent" | "absolute",
+      }));
+
+    const absoluteProbe = await resolveLeverAbsolutesForConstraints(scenarioId, overrideParams);
     const validation = validateAgainstConstraints(absoluteProbe, constraints);
     if (!validation.ok) {
       return emptyResult({
@@ -639,53 +689,58 @@ Investigate and call propose_parameters when ready.`;
     // Re-run what-if on final proposed levers and reconcile vs last preview
     let final_preview_pl: Record<string, number> | undefined;
     let preview_reconciliation: PreviewReconciliation | undefined;
-    if (scenarioId && kept.length > 0) {
+    if (scenarioId && overrideParams.length > 0) {
       try {
-        const overrideParams = kept
-          .filter((p) => p.suggested_variable_id)
-          .map((p) => ({
-            variableId: p.suggested_variable_id!,
-            value: p.magnitude,
-            delta_type: (p.unit === "absolute" || p.direction === "set"
-              ? "absolute"
-              : "percent") as "percent" | "absolute",
-          }));
-        if (overrideParams.length > 0) {
-          const finalPreview = await previewSimulationForScenario(scenarioId, overrideParams);
-          final_preview_pl = finalPreview.pl;
-          if (preview_pl) {
-            const diffs: PreviewReconciliation["diffs"] = {};
-            let maxAbs = 0;
-            const keys = new Set([...Object.keys(preview_pl), ...Object.keys(final_preview_pl)]);
-            for (const k of keys) {
-              const a = preview_pl[k] ?? 0;
-              const b = final_preview_pl[k] ?? 0;
-              const abs = Math.abs(a - b);
-              if (abs > 1e-6) {
-                diffs[k] = { preview: a, final: b, abs_diff: abs };
-                if (abs > maxAbs) maxAbs = abs;
-              }
+        const finalPreview = await previewSimulationForScenario(scenarioId, overrideParams);
+        final_preview_pl = finalPreview.pl;
+        if (preview_pl) {
+          const diffs: PreviewReconciliation["diffs"] = {};
+          let maxAbs = 0;
+          const keys = new Set([...Object.keys(preview_pl), ...Object.keys(final_preview_pl)]);
+          for (const k of keys) {
+            const a = preview_pl[k] ?? 0;
+            const b = final_preview_pl[k] ?? 0;
+            const abs = Math.abs(a - b);
+            if (abs > 1e-6) {
+              diffs[k] = { preview: a, final: b, abs_diff: abs };
+              if (abs > maxAbs) maxAbs = abs;
             }
-            const reconciled = Object.keys(diffs).length === 0;
-            preview_reconciliation = {
-              reconciled,
-              max_abs_diff: maxAbs,
-              diffs,
-              message: reconciled
-                ? "Final lever set matches last run_what_if preview."
-                : `Preview drift detected (max abs diff ${maxAbs.toFixed(4)}). Prefer final_preview_pl.`,
-            };
-          } else {
-            preview_pl = final_preview_pl;
-            preview_reconciliation = {
-              reconciled: true,
-              max_abs_diff: 0,
-              diffs: {},
-              message: "No prior run_what_if; final preview used as source of truth.",
-            };
           }
+          const reconciled = Object.keys(diffs).length === 0;
+          preview_reconciliation = {
+            reconciled,
+            max_abs_diff: maxAbs,
+            diffs,
+            message: reconciled
+              ? "Final lever set matches last run_what_if preview."
+              : `Preview drift detected (max abs diff ${maxAbs.toFixed(4)}). Prefer final_preview_pl.`,
+          };
+        } else {
+          preview_pl = final_preview_pl;
+          preview_reconciliation = {
+            reconciled: true,
+            max_abs_diff: 0,
+            diffs: {},
+            message: "No prior run_what_if; final preview used as source of truth.",
+          };
         }
       } catch (e) {
+        if (e instanceof ConstraintViolationError) {
+          return emptyResult({
+            causal_chain: proposed.causal_chain,
+            citations: proposed.citations,
+            confidence: proposed.confidence,
+            agent_trace: loop.steps,
+            stopped_reason: "constraint_blocked",
+            readiness,
+            rejected_non_input_levers: rejected.length ? rejected : undefined,
+            constraint_violations: e.violations.map((v) => ({ lever: v.lever, reason: v.reason })),
+            error: e.message,
+            clarification_needed: `Proposed parameters violate constraints: ${e.violations
+              .map((v) => v.reason)
+              .join("; ")}`,
+          });
+        }
         logger.warn(
           { err: e },
           "[ScenarioReasoningAgent] final preview reconciliation failed",
