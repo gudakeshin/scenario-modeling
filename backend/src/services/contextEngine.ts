@@ -301,6 +301,34 @@ Rules for financial_metrics:
   const tieOuts = crossFootExtractedPL(contextData.financial_metrics);
   const buildWarnings = [...(modelDef.build_warnings ?? [])];
   for (const v of tieOuts) buildWarnings.push(v.message);
+
+  // Deterministic + optional LLM fidelity review on extracted P&L snapshot
+  try {
+    const plSnap: Record<string, number> = {};
+    for (const m of contextData.financial_metrics || []) {
+      if (m.variable_id && m.typical_value != null && Number.isFinite(m.typical_value)) {
+        plSnap[m.variable_id] = m.typical_value;
+      }
+    }
+    if (Object.keys(plSnap).length > 0) {
+      const { reviewModelBuildFidelity } = await import("./accountingFidelityAgent.js");
+      const fidelity = await reviewModelBuildFidelity({
+        pl: plSnap,
+        modelDefinition: modelDef,
+        modelSummary: `${contextData.company_name || "Company"} model build`,
+      });
+      for (const n of fidelity.notices) buildWarnings.push(n);
+      if (fidelity.appliedPl) {
+        for (const [id, val] of Object.entries(fidelity.appliedPl)) {
+          const metric = contextData.financial_metrics?.find((m) => m.variable_id === id);
+          if (metric) metric.typical_value = val;
+        }
+      }
+    }
+  } catch (e) {
+    buildWarnings.push(`Fidelity review skipped: ${(e as Error).message}`);
+  }
+
   modelDef.build_warnings = buildWarnings.length > 0 ? buildWarnings : undefined;
 
   const gate = applyTieOutGate(tieOuts);

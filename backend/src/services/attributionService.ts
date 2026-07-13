@@ -13,6 +13,7 @@ import {
   resolveOverridesToAbsolute,
 } from "./modelResolver.js";
 import { mulberry32 } from "./random.js";
+import { pickDefaultTargetMetric } from "./metricTypes.js";
 
 export interface AttributionBar {
   variable_id: string;
@@ -20,6 +21,7 @@ export interface AttributionBar {
   contribution: number;
   /** True for the residual balancing bar. */
   residual?: boolean;
+  rationale?: string;
 }
 
 export interface AttributionResult {
@@ -30,6 +32,8 @@ export interface AttributionResult {
   method: "exact_shapley" | "sampled_shapley";
   bars: AttributionBar[];
   notices?: string[];
+  driver_groups?: Array<{ category: string; variable_ids: string[]; rationale?: string }>;
+  rationale?: string;
 }
 
 class AttributionError extends Error {
@@ -146,6 +150,7 @@ export function computeAttribution(
   scenarioAbs: Record<string, number>,
   targetMetric = "net_income",
 ): Omit<AttributionResult, "notices"> {
+  targetMetric = pickDefaultTargetMetric(model.outputIds, targetMetric);
   const changed = model.inputs
     .map((i) => i.id)
     .filter((id) => {
@@ -218,6 +223,7 @@ export function computeAttribution(
 export async function runAttribution(
   scenarioId: string,
   targetMetric = "net_income",
+  opts?: { reason?: boolean },
 ): Promise<AttributionResult> {
   const resolved = await getEvaluableModelForScenario(scenarioId);
   const model = resolved.model;
@@ -235,19 +241,20 @@ export async function runAttribution(
     );
   }
 
-  await pool.query(
-    `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'attribution', $2)`,
-    [
-      scenarioId,
-      JSON.stringify({
-        ...computed,
-        ...(notices.length > 0 ? { notices } : {}),
-      }),
-    ],
-  );
-
-  return {
+  let result: AttributionResult = {
     ...computed,
     ...(notices.length > 0 ? { notices } : {}),
   };
+
+  if (opts?.reason) {
+    const { reasonAttribution } = await import("./driverReasoningAgent.js");
+    result = await reasonAttribution(result);
+  }
+
+  await pool.query(
+    `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'attribution', $2)`,
+    [scenarioId, JSON.stringify(result)],
+  );
+
+  return result;
 }

@@ -30,9 +30,17 @@ test("parser: revenue 20% marketing 15%", async () => {
 test("parser: qualitative 'supply chain disruption'", async () => {
   const r = await parseScenario("What if there is a supply chain disruption?");
   assert.ok(
-    r.parameters.length >= 1 || !!r.clarification_needed,
-    "should either extract params or ask for clarification",
+    r.parameters.length >= 1 || !!r.clarification_needed || (r.follow_up_questions?.length ?? 0) > 0,
+    "should either extract params, ask for clarification, or probe",
   );
+  if (r.follow_up_questions) {
+    for (const q of r.follow_up_questions) {
+      if (q.recommendation) {
+        assert.ok(q.recommendation.confidence >= 0.6);
+        assert.ok(q.recommendation.evidence.length >= 1);
+      }
+    }
+  }
 });
 
 test("parser: qualitative 'recession scenario'", async () => {

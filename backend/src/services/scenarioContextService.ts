@@ -23,6 +23,8 @@ export interface ScenarioQuestionHistory {
   question: string;
   answer: string;
   parameterImpact: string[];
+  answerKind?: "accepted_recommendation" | "overridden" | "custom" | "comment";
+  recommendedValue?: string;
 }
 
 export interface ScenarioComparisonVersion {
@@ -255,9 +257,19 @@ export function addQuestionHistory(
   question: string,
   answer: string,
   parameterImpact: string[],
+  meta?: {
+    answerKind?: "accepted_recommendation" | "overridden" | "custom" | "comment";
+    recommendedValue?: string;
+  },
 ): ScenarioContext {
   const ctx = ensureScenarioContext(scenarioId);
-  ctx.questionHistory.push({ question, answer, parameterImpact });
+  ctx.questionHistory.push({
+    question,
+    answer,
+    parameterImpact,
+    ...(meta?.answerKind ? { answerKind: meta.answerKind } : {}),
+    ...(meta?.recommendedValue ? { recommendedValue: meta.recommendedValue } : {}),
+  });
   persist(scenarioId);
   return ctx;
 }

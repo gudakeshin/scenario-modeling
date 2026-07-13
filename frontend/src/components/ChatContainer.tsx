@@ -52,13 +52,14 @@ export function ChatContainer() {
 
   const {
     showReview, showComparison, showAudit, showMonteCarlo, showTornado,
-    showAttribution, showDriverTree, showGoalSeek,
+    showAttribution, showDriverTree, showGoalSeek, showFidelity,
     showVersionHistory, showActualsCompare, showLiveWhatIf,
     showTemplates, showInsights, showPeriods, showCharts, showSharing,
     showRoles, showDocuments, showDocManager,
     periodData, chartData, expandedPanel,
     setShowReview, setShowComparison, setShowAudit, setShowMonteCarlo,
     setShowTornado, setShowAttribution, setShowDriverTree, setShowGoalSeek,
+    setShowFidelity,
     setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
     setShowTemplates, setShowInsights, setShowPeriods,
     setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
@@ -204,6 +205,9 @@ export function ChatContainer() {
               <button type="button" onClick={tp("goalSeek", showGoalSeek, setShowGoalSeek)} disabled={isLoading} className={actionBtn(showGoalSeek)}>
                 {showGoalSeek ? "Hide Goal Seek" : "Goal Seek"}
               </button>
+              <button type="button" onClick={tp("fidelity", showFidelity, setShowFidelity)} disabled={isLoading} className={actionBtn(showFidelity)}>
+                {showFidelity ? "Hide Fidelity" : "Audit Fidelity"}
+              </button>
               <button type="button" onClick={tp("versions", showVersionHistory, setShowVersionHistory)} disabled={isLoading} className={actionBtn(showVersionHistory)}>
                 {showVersionHistory ? "Hide Versions" : "Versions"}
               </button>
@@ -239,7 +243,7 @@ export function ChatContainer() {
                 {showDocuments ? "Hide Docs" : "Documents"}
               </button>
               <button type="button" onClick={tp("docManager", showDocManager, setShowDocManager)} className={actionBtn(showDocManager)}>
-                {showDocManager ? "Hide Manager" : "Manager"}
+                {showDocManager ? "Hide Document Manager" : "Document Manager"}
               </button>
               <button
                 type="button"

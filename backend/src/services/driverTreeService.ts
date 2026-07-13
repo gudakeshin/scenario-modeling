@@ -13,6 +13,7 @@ import { DimensionalModel } from "./dimensionalModel.js";
 import type { WorkbookGraph, WorkbookDependency } from "./excelExtractor.js";
 import type { XlsxModelSchemaLike } from "./xlsxRuntime.js";
 import { XlsxModelRuntime } from "./xlsxRuntime.js";
+import { pickDefaultTargetMetric } from "./metricTypes.js";
 import {
   getEvaluableModelForScenario,
   loadScenarioOverrides,
@@ -35,6 +36,12 @@ export interface DriverTreeResult {
   model_kind: EvaluableModel["kind"];
   /** How to apply lever edits (documented apply path). */
   apply_path?: string;
+  rationale?: string;
+  grouping?: Array<{ category: string; member_ids: string[]; rationale?: string }>;
+  reconciliation?: {
+    ok: boolean;
+    failures: Array<{ node_id: string; expected: number; actual: number; message: string }>;
+  };
 }
 
 export interface ApplyLeverResult {
@@ -294,13 +301,13 @@ export function buildDriverTree(
   },
 ): DriverTreeResult {
   const values = model.evaluate(scenarioAbs);
-  if (!(targetMetric in values) && !model.outputIds.includes(targetMetric)) {
-    if (!(targetMetric in values)) {
-      throw new DriverTreeError(
-        `Unknown target metric '${targetMetric}'. Available: ${model.outputIds.join(", ")}`,
-      );
-    }
+  const resolvedTarget = pickDefaultTargetMetric(model.outputIds, targetMetric);
+  if (!(resolvedTarget in values) && !model.outputIds.includes(resolvedTarget)) {
+    throw new DriverTreeError(
+      `Unknown target metric '${targetMetric}'. Available: ${model.outputIds.join(", ") || "(none)"}`,
+    );
   }
+  targetMetric = resolvedTarget;
 
   const inputIds = new Set(model.inputs.map((i) => i.id));
   const applyPath =
@@ -361,6 +368,7 @@ export function buildDriverTree(
 export async function runDriverTree(
   scenarioId: string,
   targetMetric = "net_income",
+  opts?: { reason?: boolean },
 ): Promise<DriverTreeResult> {
   const resolved: ResolvedModel = await getEvaluableModelForScenario(scenarioId);
   const model = resolved.model;
@@ -376,10 +384,21 @@ export async function runDriverTree(
     workbookGraph = (g.rows[0]?.workbook_graph as WorkbookGraph) ?? null;
   }
 
-  return buildDriverTree(model, scenarioAbs, targetMetric, {
+  const tree = buildDriverTree(model, scenarioAbs, targetMetric, {
     workbookGraph,
     modelSchema: resolved.modelSchema,
   });
+
+  if (opts?.reason) {
+    const { reasonDriverTree } = await import("./driverReasoningAgent.js");
+    return reasonDriverTree(tree, {
+      scenarioAbs,
+      modelInputIds: model.inputs.map((i) => i.id),
+      modelOutputIds: model.outputIds,
+    });
+  }
+
+  return tree;
 }
 
 /**

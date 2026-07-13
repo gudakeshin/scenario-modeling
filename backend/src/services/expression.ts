@@ -29,7 +29,7 @@ export class ExpressionError extends Error {
 
 // ── Typed deltas ──
 
-export type DeltaType = "percent" | "absolute";
+export type DeltaType = "percent" | "absolute" | "additive";
 
 export interface TypedOverride {
   value: number;
@@ -41,6 +41,9 @@ export function resolveOverride(base: number, override: TypedOverride): number {
   if (!Number.isFinite(override.value)) return base;
   if (override.delta_type === "percent") {
     return base * (1 + override.value / 100);
+  }
+  if (override.delta_type === "additive") {
+    return base + override.value;
   }
   return override.value;
 }

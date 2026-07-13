@@ -15,6 +15,7 @@ import {
   getScenarioContext,
   validateAgainstConstraints,
 } from "./scenarioContextService.js";
+import { pickDefaultTargetMetric } from "./metricTypes.js";
 
 export interface GoalSeekRequest {
   target_metric?: string;
@@ -84,12 +85,12 @@ export function computeGoalSeek(
 ): GoalSeekResult {
   const {
     variableId,
-    targetMetric,
     targetValue,
     tolerance = 1e-4,
     maxIterations = config.GOAL_SEEK_MAX_ITERATIONS,
     constraints = [],
   } = opts;
+  const targetMetric = pickDefaultTargetMetric(model.outputIds, opts.targetMetric);
 
   const input = model.inputs.find((i) => i.id === variableId);
   if (!input) {

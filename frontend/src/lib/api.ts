@@ -172,11 +172,34 @@ export interface SearchContext {
   sources: string[];
 }
 
+export interface RecommendationEvidence {
+  kind: "model" | "document" | "context" | "web";
+  source: string;
+  snippet?: string;
+}
+
+export interface FollowUpRecommendation {
+  value: string;
+  label?: string;
+  rationale: string;
+  confidence: number;
+  evidence: RecommendationEvidence[];
+}
+
 export interface FollowUpQuestion {
   id: string;
   question: string;
   options: { label: string; value: string }[];
   allow_custom?: boolean;
+  question_type?: "choice" | "open";
+  recommendation?: FollowUpRecommendation;
+}
+
+export interface FollowUpAnswer {
+  question_id: string;
+  answer: string;
+  answer_kind?: "accepted_recommendation" | "overridden" | "custom" | "comment";
+  recommended_value?: string;
 }
 
 export interface ReflectionData {
@@ -255,7 +278,7 @@ export interface StoredParameter {
   mapped_variable_id: string;
   base_value: number | null;
   scenario_value: number;
-  delta_type?: "percent" | "absolute";
+  delta_type?: "percent" | "absolute" | "additive";
   member_scope?: Record<string, string> | null;
   member_catalog?: MemberCatalog;
   confidence_score: number;
@@ -299,7 +322,7 @@ export async function parseScenario(nlInput: string): Promise<ParseScenarioRespo
 
 export async function refineScenario(
   scenarioId: string,
-  answers: { question_id: string; answer: string }[]
+  answers: FollowUpAnswer[]
 ): Promise<ParseScenarioResponse> {
   const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/refine`, {
     method: "POST",
@@ -360,8 +383,15 @@ export async function resetScenarioUnlockedLevers(scenarioId: string): Promise<S
 
 export async function previewScenario(
   scenarioId: string,
-  parameters?: Array<{ variable_id: string; value: number; delta_type?: "percent" | "absolute" }>,
-): Promise<Record<string, unknown>> {
+  parameters?: Array<{ variable_id: string; value: number; delta_type?: "percent" | "absolute" | "additive" }>,
+): Promise<{
+  pl?: Record<string, number>;
+  aggregate?: Record<string, number>;
+  notices?: Array<string | { message?: string }>;
+  levers?: Array<{ id: string; name: string; base: number }>;
+  ignored_overrides?: string[];
+  [key: string]: unknown;
+}> {
   const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/preview`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
@@ -430,6 +460,19 @@ export interface SimulationResult {
   simulation_mode?: "formula_dag" | "xlsx_cell_graph" | "external_model";
   dimensional?: DimensionalResultBlock;
   notices?: Array<string | Notice>;
+  fidelity?: {
+    checked: true;
+    applied_repairs: string[];
+    violations: Array<{
+      code: string;
+      severity: string;
+      metric: string;
+      message: string;
+      expected?: number;
+      actual?: number;
+    }>;
+    normalized: boolean;
+  };
 }
 
 export type MemberCatalog = Record<
@@ -1075,6 +1118,7 @@ export interface AttributionBar {
   variable_name: string;
   contribution: number;
   residual?: boolean;
+  rationale?: string;
 }
 
 export interface AttributionResult {
@@ -1085,16 +1129,19 @@ export interface AttributionResult {
   method: string;
   bars: AttributionBar[];
   notices?: string[];
+  driver_groups?: Array<{ category: string; variable_ids: string[]; rationale?: string }>;
+  rationale?: string;
 }
 
 export async function runAttribution(
   scenarioId: string,
   targetMetric = "net_income",
+  opts?: { reason?: boolean },
 ): Promise<AttributionResult> {
   const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/attribution`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({ target_metric: targetMetric }),
+    body: JSON.stringify({ target_metric: targetMetric, reason: opts?.reason ?? false }),
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -1141,7 +1188,7 @@ export async function applyLeverValue(
   scenarioId: string,
   variableId: string,
   scenarioValue: number,
-  opts?: { delta_type?: "percent" | "absolute"; reason?: string; status?: string },
+  opts?: { delta_type?: "percent" | "absolute" | "additive"; reason?: string; status?: string },
 ): Promise<{
   parameter_id: string;
   mapped_variable_id: string;
@@ -1174,6 +1221,7 @@ export interface DriverTreeNode {
   value: number;
   editable?: boolean;
   children?: DriverTreeNode[];
+  rationale?: string;
 }
 
 export interface DriverTreeResult {
@@ -1181,18 +1229,70 @@ export interface DriverTreeResult {
   root: DriverTreeNode;
   model_kind: string;
   apply_path?: string;
+  rationale?: string;
+  grouping?: Array<{ category: string; member_ids: string[]; rationale?: string }>;
+  reconciliation?: {
+    ok: boolean;
+    failures: Array<{ node_id: string; expected: number; actual: number; message: string }>;
+  };
 }
 
 export async function fetchDriverTree(
   scenarioId: string,
   metric = "net_income",
+  opts?: { reason?: boolean },
 ): Promise<DriverTreeResult> {
+  const qs = new URLSearchParams({ metric });
+  if (opts?.reason) qs.set("reason", "true");
   const res = await apiFetch(
-    `${API_BASE}/api/v1/scenarios/${scenarioId}/driver-tree?metric=${encodeURIComponent(metric)}`,
+    `${API_BASE}/api/v1/scenarios/${scenarioId}/driver-tree?${qs.toString()}`,
   );
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
     throw new Error((err as { error?: string }).error || "Driver tree failed");
+  }
+  return res.json();
+}
+
+export interface FidelityAuditResult {
+  initial_violations: Array<{
+    code: string;
+    severity: string;
+    metric: string;
+    message: string;
+    expected?: number;
+    actual?: number;
+  }>;
+  deterministic: {
+    applied: string[];
+    residual: Array<{ code: string; severity: string; metric: string; message: string }>;
+    pl: Record<string, number>;
+  };
+  agent: {
+    findings: Array<{ code: string; severity: string; metric: string; message: string }>;
+    proposed_fixes: Array<{
+      kind: string;
+      metric: string;
+      proposed_value?: number | null;
+      rationale: string;
+    }>;
+    applied_fixes: Array<{ kind: string; metric: string; rationale: string }>;
+    residual_violations: Array<{ code: string; severity: string; metric: string; message: string }>;
+    notices: string[];
+    summary: string;
+    applied_pl?: Record<string, number>;
+  };
+}
+
+export async function runFidelityAudit(scenarioId: string): Promise<FidelityAuditResult> {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/fidelity-audit`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({}),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Fidelity audit failed");
   }
   return res.json();
 }
@@ -1589,8 +1689,8 @@ export interface OnboardingStatus {
   company_name: string | null;
   industry: string | null;
   model_name: string | null;
-  currency: string;
-  currency_unit: string;
+  currency: string | null;
+  currency_unit: string | null;
   ready: boolean;
 }
 

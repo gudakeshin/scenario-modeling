@@ -31,6 +31,7 @@ interface UiState {
   showAttribution: boolean;
   showDriverTree: boolean;
   showGoalSeek: boolean;
+  showFidelity: boolean;
   showTemplates: boolean;
   showInsights: boolean;
   showPeriods: boolean;
@@ -39,6 +40,8 @@ interface UiState {
   showRoles: boolean;
   showDocuments: boolean;
   showDocManager: boolean;
+  /** When opening Document Manager for validation, land on Context. */
+  docManagerInitialTab: "documents" | "context" | "model" | null;
   showVersionHistory: boolean;
   showActualsCompare: boolean;
   showLiveWhatIf: boolean;
@@ -63,6 +66,7 @@ interface UiState {
   setShowAttribution: (v: boolean) => void;
   setShowDriverTree: (v: boolean) => void;
   setShowGoalSeek: (v: boolean) => void;
+  setShowFidelity: (v: boolean) => void;
   setShowTemplates: (v: boolean) => void;
   setShowInsights: (v: boolean) => void;
   setShowPeriods: (v: boolean) => void;
@@ -71,6 +75,8 @@ interface UiState {
   setShowRoles: (v: boolean) => void;
   setShowDocuments: (v: boolean) => void;
   setShowDocManager: (v: boolean) => void;
+  setDocManagerInitialTab: (v: "documents" | "context" | "model" | null) => void;
+  openDocManagerForValidation: () => void;
   setShowVersionHistory: (v: boolean) => void;
   setShowActualsCompare: (v: boolean) => void;
   setShowLiveWhatIf: (v: boolean) => void;
@@ -117,6 +123,7 @@ export const useUiStore = create<UiState>((set) => ({
   showAttribution: false,
   showDriverTree: false,
   showGoalSeek: false,
+  showFidelity: false,
   showTemplates: false,
   showInsights: false,
   showPeriods: false,
@@ -125,6 +132,7 @@ export const useUiStore = create<UiState>((set) => ({
   showRoles: false,
   showDocuments: false,
   showDocManager: false,
+  docManagerInitialTab: null,
   showVersionHistory: false,
   showActualsCompare: false,
   showLiveWhatIf: false,
@@ -148,6 +156,7 @@ export const useUiStore = create<UiState>((set) => ({
   setShowAttribution: (v) => set({ showAttribution: v }),
   setShowDriverTree: (v) => set({ showDriverTree: v }),
   setShowGoalSeek: (v) => set({ showGoalSeek: v }),
+  setShowFidelity: (v) => set({ showFidelity: v }),
   setShowTemplates: (v) => set({ showTemplates: v }),
   setShowInsights: (v) => set({ showInsights: v }),
   setShowPeriods: (v) => set({ showPeriods: v }),
@@ -156,6 +165,13 @@ export const useUiStore = create<UiState>((set) => ({
   setShowRoles: (v) => set({ showRoles: v }),
   setShowDocuments: (v) => set({ showDocuments: v }),
   setShowDocManager: (v) => set({ showDocManager: v }),
+  setDocManagerInitialTab: (v) => set({ docManagerInitialTab: v }),
+  openDocManagerForValidation: () =>
+    set({
+      showDocManager: true,
+      docManagerInitialTab: "context",
+      expandedPanel: "docManager",
+    }),
   setShowVersionHistory: (v) => set({ showVersionHistory: v }),
   setShowActualsCompare: (v) => set({ showActualsCompare: v }),
   setShowLiveWhatIf: (v) => set({ showLiveWhatIf: v }),
@@ -201,6 +217,7 @@ export const useUiStore = create<UiState>((set) => ({
       showAttribution: false,
       showDriverTree: false,
       showGoalSeek: false,
+      showFidelity: false,
       showTemplates: false,
       showInsights: false,
       preloadedInsight: null,
@@ -211,6 +228,7 @@ export const useUiStore = create<UiState>((set) => ({
       showRoles: false,
       showDocuments: false,
       showDocManager: false,
+      docManagerInitialTab: null,
       showVersionHistory: false,
       showActualsCompare: false,
       showLiveWhatIf: false,

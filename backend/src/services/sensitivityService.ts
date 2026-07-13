@@ -11,6 +11,7 @@
 import { pool } from "../db/index.js";
 import type { EvaluableModel } from "./expression.js";
 import type { MetricType } from "./metricTypes.js";
+import { pickDefaultTargetMetric } from "./metricTypes.js";
 import type { DimensionalOverride } from "../models/dimensions.js";
 import { DimensionalModel } from "./dimensionalModel.js";
 import {
@@ -105,6 +106,7 @@ export function computeTornado(
   targetMetric: string,
   opts: ComputeTornadoOpts = {},
 ): { bars: TornadoBar[]; base_metric_value: number; swing_pct: number; percent_swing_pp: number } {
+  targetMetric = pickDefaultTargetMetric(model.outputIds, targetMetric);
   const swingPct = opts.swingPct ?? 20;
   const percentSwingPp = opts.percentSwingPp ?? swingPct / 4;
   const swing = swingPct / 100;
@@ -197,6 +199,7 @@ export function computeTornadoDimensional(
   targetMetric: string,
   opts: ComputeTornadoOpts = {},
 ): { bars: TornadoBar[]; base_metric_value: number; swing_pct: number; percent_swing_pp: number } {
+  targetMetric = pickDefaultTargetMetric(model.outputIds, targetMetric);
   const swingPct = opts.swingPct ?? 20;
   const percentSwingPp = opts.percentSwingPp ?? swingPct / 4;
   const swing = swingPct / 100;
@@ -377,6 +380,7 @@ export async function runSensitivity(
 ): Promise<SensitivityResult> {
   const resolved = await getEvaluableModelForScenario(scenarioId);
   const model = resolved.model;
+  targetMetric = pickDefaultTargetMetric(model.outputIds, targetMetric);
 
   const overrides = await loadScenarioOverrides(scenarioId);
   const { absolute: scenarioAbs, unresolved } = resolveOverridesToAbsolute(model, overrides);
@@ -495,6 +499,7 @@ export async function runTwoWaySensitivity(
 ): Promise<TwoWayGridResult> {
   const resolved = await getEvaluableModelForScenario(scenarioId);
   const model = resolved.model;
+  targetMetric = pickDefaultTargetMetric(model.outputIds, targetMetric);
   const overrides = await loadScenarioOverrides(scenarioId);
   const { absolute: scenarioAbs, unresolved } = resolveOverridesToAbsolute(model, overrides);
 

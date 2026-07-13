@@ -23,6 +23,11 @@ import { callClaudeStructured, getApiKey } from "./llmClient.js";
 import { logger } from "../logger.js";
 import { clearDimensionalRuntimeCache } from "./modelResolver.js";
 import { writeIntegrationEvent } from "./connectionService.js";
+import {
+  inferMetricTypeFromId,
+  isRatioLike,
+  type MetricType,
+} from "./metricTypes.js";
 
 export interface CrossFootWarning {
   measure_id: string;
@@ -33,10 +38,48 @@ export interface CrossFootWarning {
   message: string;
 }
 
-function mapAggregation(m: PlanningMeasure): AggregationKind {
+function inferMeasureMetricType(measure: PlanningMeasure): MetricType {
+  const unit = (measure.unit ?? "").toLowerCase();
+  if (unit.includes("%") || unit.includes("percent") || unit.includes("pct") || unit.includes("ratio")) {
+    return unit.includes("ratio") ? "ratio" : "percent";
+  }
+  if (unit.includes("unit") || unit.includes("volume") || unit.includes("qty")) return "volume";
+  if (unit.includes("count") || unit.includes("fte")) return "count";
+  return inferMetricTypeFromId(measure.id, measure.name);
+}
+
+function mapAggregation(
+  m: PlanningMeasure,
+  metricType: MetricType,
+  hasAccountDim: boolean,
+): AggregationKind {
+  if (isRatioLike(metricType)) return "avg";
   if (m.aggregation === "avg") return "avg";
   if (m.aggregation === "last") return "last";
+  if (hasAccountDim) return "signed_sum";
   return "sum";
+}
+
+/** Cost-like account members should reduce profit under signed_sum. */
+function normalizeAccountMemberSigns(dimensions: Dimension[]): string[] {
+  const notes: string[] = [];
+  const accountDim = dimensions.find((d) => d.type === "account");
+  if (!accountDim) return notes;
+
+  const costRe =
+    /\b(expense|expenses|cost|costs|cogs|opex|depreciation|amortization|tax|interest|wage|wages|salary|salaries|overhead)\b/i;
+  const incomeRe =
+    /\b(revenue|sales|income|ebitda|ebit|profit|margin|gain)\b/i;
+
+  for (const m of accountDim.members) {
+    if (!m.isLeaf) continue;
+    const text = `${m.id} ${m.name}`;
+    if (costRe.test(text) && !incomeRe.test(text) && m.sign !== -1) {
+      m.sign = -1;
+      notes.push(`Normalized account sign for cost member '${m.id}' to -1`);
+    }
+  }
+  return notes;
 }
 
 function inferTimeHorizon(meta: PlanningModelMetadata): {
@@ -153,10 +196,15 @@ export function mapMetadataToDefinition(
   // Preserve source dimension order for member_key alignment (including version).
   const measureDims = dimensions.map((d) => d.id);
 
+  const signNotes = normalizeAccountMemberSigns(dimensions);
+  warnings.push(...signNotes);
+
   const variables: DimensionalVariable[] = [];
 
   for (const measure of meta.measures) {
     const llm = opts?.llmFormulas?.get(measure.id);
+    const metricType = inferMeasureMetricType(measure);
+    const aggregation = mapAggregation(measure, metricType, !!accountDim);
     if (measure.formula) {
       // Source-exposed formula
       const deps = [...measure.formula.matchAll(/\b([a-z][a-z0-9_]*)\b/gi)]
@@ -168,9 +216,9 @@ export function mapMetadataToDefinition(
         dims: measureDims,
         formula: measure.formula,
         dependencies: deps,
-        aggregation: accountDim ? "signed_sum" : mapAggregation(measure),
+        aggregation,
         tags: ["pl_metric", "percent_delta"],
-        metric_type: measure.unit?.toLowerCase().includes("unit") ? "volume" : "currency",
+        metric_type: metricType,
         provenance: "extracted",
       });
     } else if (llm) {
@@ -180,9 +228,9 @@ export function mapMetadataToDefinition(
         dims: measureDims,
         formula: llm.formula,
         dependencies: llm.dependencies,
-        aggregation: accountDim ? "signed_sum" : mapAggregation(measure),
+        aggregation,
         tags: ["pl_metric", "percent_delta"],
-        metric_type: "currency",
+        metric_type: metricType,
         provenance: "derived",
       });
       warnings.push(
@@ -196,9 +244,9 @@ export function mapMetadataToDefinition(
         dims: measureDims,
         formula: "0",
         dependencies: [],
-        aggregation: accountDim ? "signed_sum" : mapAggregation(measure),
+        aggregation,
         tags: ["pl_metric", "percent_delta"],
-        metric_type: measure.unit?.toLowerCase().includes("unit") ? "volume" : "currency",
+        metric_type: metricType,
         provenance: "extracted",
       });
     }

@@ -37,6 +37,25 @@ import {
 } from "./scenarioContextService.js";
 import { runScenarioReasoning } from "./scenarioReasoningAgent.js";
 import type { AgentTraceStep } from "./scenarioReasoningAgent.js";
+import { searchDocumentChunksInDb } from "./documentService.js";
+import {
+  followUpQuestionSchema,
+  normalizeFollowUpQuestions,
+  describeDriverDependencies,
+  type FollowUpQuestion,
+} from "./followUpQuestions.js";
+
+export {
+  RECOMMENDATION_MIN_CONFIDENCE,
+  recommendationEvidenceSchema,
+  followUpRecommendationSchema,
+  followUpQuestionSchema,
+  normalizeFollowUpQuestions,
+  describeDriverDependencies,
+  type RecommendationEvidence,
+  type FollowUpRecommendation,
+  type FollowUpQuestion,
+} from "./followUpQuestions.js";
 
 const llmParseResponseSchema = z.object({
   parameters: z.array(z.object({
@@ -52,12 +71,7 @@ const llmParseResponseSchema = z.object({
     suggested_variable_id: z.string().optional(),
   })).default([]),
   clarification_needed: z.string().nullable().optional(),
-  follow_up_questions: z.array(z.object({
-    id: z.string(),
-    question: z.string(),
-    options: z.array(z.object({ label: z.string(), value: z.string() })).default([]),
-    allow_custom: z.boolean().default(true),
-  })).nullable().optional(),
+  follow_up_questions: z.array(followUpQuestionSchema).nullable().optional(),
 });
 
 export interface ParsedParameter {
@@ -72,41 +86,70 @@ export interface ParsedParameter {
   suggested_variable_id?: string;
 }
 
-export type DeltaType = "percent" | "absolute";
+export type DeltaType = "percent" | "absolute" | "additive";
 
 const DECREASE_DIRECTION_RE = /decreas|declin|drop|reduc|cut|lower|fall|shrink|delay|contract/i;
+const INCREASE_DIRECTION_RE = /increas|rais|grow|up|higher|expand|hike/i;
+const PERCENT_UNIT_RE = /^(percent|percentage|pct|pp|%|basis_points|bps)s?$/i;
+const ABSOLUTE_UNIT_RE = /^(absolute|currency|money|usd|inr|eur|gbp|amount|units?|count)$/i;
+
+/** True when the parsed unit denotes a relative percent (or basis-point) change. */
+export function isPercentUnit(unit: string | undefined | null): boolean {
+  const u = (unit || "").trim().toLowerCase();
+  if (!u) return false;
+  if (PERCENT_UNIT_RE.test(u)) return true;
+  if (u.startsWith("percent") || u.startsWith("pct")) return true;
+  return false;
+}
+
+function isBasisPoints(unit: string | undefined | null): boolean {
+  const u = (unit || "").trim().toLowerCase();
+  return u === "basis_points" || u === "bps" || u === "bp";
+}
 
 /**
  * Convert a parsed parameter into a signed, typed delta for storage.
- *  - direction "decrease"/"reduce"/... flips the sign (previously the sign
- *    was dropped, so "cut costs 10%" was simulated as a 10% INCREASE)
- *  - "set" always means an absolute value
- *  - unit "percent" (not "set") means a relative % change
+ *  - direction "decrease"/"reduce"/... flips the sign (direction wins over LLM sign)
+ *  - "set" always means an absolute SET of the leaf
+ *  - percent-like units (%, pct, bps, …) are relative changes
+ *  - currency/absolute increases & decreases are additive (base + delta), not SET
+ *  - ambiguous unit on increase/decrease defaults to percent (schema default)
  */
 export function toTypedDelta(p: ParsedParameter): { value: number; delta_type: DeltaType } {
   const magnitude = p.magnitude != null && !isNaN(Number(p.magnitude)) ? Number(p.magnitude) : 0;
   const direction = (p.direction || "").toLowerCase();
+  const unit = (p.unit || "").trim();
 
   if (direction === "set") {
     return { value: magnitude, delta_type: "absolute" };
   }
 
-  // Respect an explicit sign from the LLM; otherwise apply direction.
-  const value = magnitude < 0 || !DECREASE_DIRECTION_RE.test(direction)
-    ? magnitude
-    : -Math.abs(magnitude);
+  const absMag = Math.abs(magnitude);
+  let signed = absMag;
+  if (DECREASE_DIRECTION_RE.test(direction)) signed = -absMag;
+  else if (INCREASE_DIRECTION_RE.test(direction)) signed = absMag;
+  else if (magnitude < 0) signed = -absMag;
+  else signed = magnitude;
 
-  const delta_type: DeltaType = (p.unit || "").toLowerCase().startsWith("percent")
-    ? "percent"
-    : "absolute";
-  return { value, delta_type };
-}
+  if (isPercentUnit(unit) || (!unit && (DECREASE_DIRECTION_RE.test(direction) || INCREASE_DIRECTION_RE.test(direction)))) {
+    const value = isBasisPoints(unit) ? signed / 100 : signed;
+    return { value, delta_type: "percent" };
+  }
 
-export interface FollowUpQuestion {
-  id: string;
-  question: string;
-  options: { label: string; value: string }[];
-  allow_custom?: boolean;
+  if (ABSOLUTE_UNIT_RE.test(unit) && (DECREASE_DIRECTION_RE.test(direction) || INCREASE_DIRECTION_RE.test(direction))) {
+    return { value: signed, delta_type: "additive" };
+  }
+
+  // Bare absolute / currency without increase/decrease → SET target
+  if (ABSOLUTE_UNIT_RE.test(unit)) {
+    return { value: magnitude, delta_type: "absolute" };
+  }
+
+  // Fallback: treat as percent for relative language, else absolute SET
+  if (DECREASE_DIRECTION_RE.test(direction) || INCREASE_DIRECTION_RE.test(direction)) {
+    return { value: signed, delta_type: "percent" };
+  }
+  return { value: magnitude, delta_type: "absolute" };
 }
 
 export interface ParseResult {
@@ -192,14 +235,17 @@ FOLLOW-UP QUESTIONS:
     - "question": the question text
     - "options": array of {"label": display text, "value": a concise value string}
     - "allow_custom": true/false (whether user can type custom answer)
-11. ALWAYS generate follow_up_questions when:
+    - "question_type": "choice" (default) or "open" (free-form comment when you cannot recommend)
+    - "recommendation" (OPTIONAL): { "value", "label?", "rationale", "confidence" (0-1), "evidence": [{"kind":"model"|"document"|"context"|"web","source","snippet?"}] }
+11. For EACH follow-up question, first check whether the MODEL SCHEMA / DRIVER DEPENDENCIES or COMPANY CONTEXT above imply a most-likely answer. If so, include a recommendation where value matches one of your options and each evidence item cites its source. Recommend ONLY what the evidence supports — never invent quotes or model relationships. If dependencies are unclear, do NOT guess: either ask a probing question about the dependency itself, or set question_type to "open" with no recommendation.
+12. ALWAYS generate follow_up_questions when:
     - The scenario mentions a competitor action but not the expected impact magnitude
     - The scenario is qualitative and you're guessing at numbers
     - Multiple interpretations exist
     - Geography/product/timeline is unspecified for a scenario that would benefit from it
-12. Extract your BEST-GUESS parameters AND ask clarifying questions simultaneously.
-13. ALWAYS try to extract at least one parameter. Only return empty parameters if the input truly has no scenario content.
-14. Understand common business language and map to the ACTUAL model variables provided above.`;
+13. Extract your BEST-GUESS parameters AND ask clarifying questions simultaneously.
+14. ALWAYS try to extract at least one parameter. Only return empty parameters if the input truly has no scenario content.
+15. Understand common business language and map to the ACTUAL model variables provided above.`;
 
   return prompt;
 }
@@ -308,14 +354,10 @@ Do NOT use generic estimates — use the actual numbers from the research.`;
   const parsed: ParseResult = {
     parameters: Array.isArray(raw.parameters) ? raw.parameters : [],
     clarification_needed: raw.clarification_needed ?? undefined,
-    follow_up_questions: Array.isArray(raw.follow_up_questions) && raw.follow_up_questions.length > 0
-      ? raw.follow_up_questions.map((q) => ({
-          id: q.id || `q_${Math.random().toString(36).slice(2, 8)}`,
-          question: q.question,
-          options: Array.isArray(q.options) ? q.options : [],
-          allow_custom: q.allow_custom !== false,
-        }))
-      : undefined,
+    follow_up_questions: (() => {
+      const qs = normalizeFollowUpQuestions(raw.follow_up_questions ?? []);
+      return qs.length > 0 ? qs : undefined;
+    })(),
   };
 
   if (searchContext) {
@@ -358,7 +400,141 @@ Do NOT use generic estimates — use the actual numbers from the research.`;
       "I couldn't extract clear parameters. Could you be more specific? For example: 'raw materials increase 8%' or 'delay APAC launch by one quarter'.";
   }
 
+  // Guarantee structured probing questions for ambiguous prompts
+  const dependencyDesc = model
+    ? describeDriverDependencies(model)
+    : isDim
+      ? describeDriverDependencies(rawModel)
+      : undefined;
+  parsed.follow_up_questions = await ensureProbingQuestions(nlInput, parsed, {
+    scope,
+    modelDesc,
+    dependencyDesc,
+    contextDesc,
+  });
+
   return parsed;
+}
+
+const probingQuestionsSchema = z.object({
+  questions: z.array(followUpQuestionSchema).min(1).max(5),
+});
+
+export type ProbingGrounding = {
+  scope?: Scope;
+  modelDesc?: string;
+  dependencyDesc?: string;
+  contextDesc?: string | null;
+};
+
+const PROBING_SYSTEM_PROMPT = `Ask concise FP&A probing questions to turn an ambiguous scenario into
+measurable lever changes. Return 1–3 questions with optional multiple-choice options.
+Focus on magnitude, which P&L drivers, geography/segment scope, and timing.
+
+For EACH question, first check whether the MODEL DRIVERS, COMPANY CONTEXT, or DOCUMENT EVIDENCE
+below imply a most-likely answer. If so, include recommendation: {value, rationale, confidence, evidence[]}
+where value matches one of your options and each evidence item cites its source (kind: model|document|context|web).
+Recommend ONLY what the evidence supports — never invent quotes or model relationships.
+If the dependencies are unclear from the model and documents, do NOT guess: either ask a probing
+question about the dependency itself, or set question_type to "open" with no recommendation so the
+user can answer freely.`;
+
+function looksAmbiguous(nlInput: string, parsed: ParseResult): boolean {
+  if (isExplicitLeverChange(nlInput)) return false;
+  if (isOpenEndedQuestion(nlInput)) return true;
+  if (parsed.parameters.length === 0) return true;
+  if (parsed.parameters.every((p) => p.confidence < 0.75)) return true;
+  // Qualitative language without a clear magnitude
+  if (
+    /\b(tougher|softer|weaker|stronger|pressure|headwind|tailwind|uncertain|maybe|somewhat)\b/i.test(
+      nlInput,
+    ) &&
+    !/\d+(?:\.\d+)?\s*%/.test(nlInput)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function synthesizeFallbackQuestion(nlInput: string): FollowUpQuestion {
+  return {
+    id: `q_clarify_${Math.random().toString(36).slice(2, 8)}`,
+    question:
+      "Which drivers should we stress for this scenario (e.g. volume, price, raw materials, OpEx), and by roughly how much?",
+    options: [
+      { label: "Volume down 5%", value: "volume_down_5" },
+      { label: "Price down 3%", value: "price_down_3" },
+      { label: "Raw materials up 8%", value: "materials_up_8" },
+      { label: "OpEx up 5%", value: "opex_up_5" },
+    ],
+    allow_custom: true,
+    question_type: "choice",
+  };
+}
+
+/**
+ * Analysis-tier clarifying questions when the prompt is ambiguous and the
+ * Haiku parse returned none. Guarantees ≥1 structured question.
+ */
+async function ensureProbingQuestions(
+  nlInput: string,
+  parsed: ParseResult,
+  grounding?: ProbingGrounding,
+): Promise<FollowUpQuestion[] | undefined> {
+  if (parsed.follow_up_questions && parsed.follow_up_questions.length > 0) {
+    const normalized = normalizeFollowUpQuestions(parsed.follow_up_questions);
+    return normalized.length > 0 ? normalized : undefined;
+  }
+  if (!looksAmbiguous(nlInput, parsed)) {
+    return parsed.follow_up_questions;
+  }
+
+  if (getApiKey()) {
+    try {
+      let documentEvidence = "";
+      if (grounding?.scope?.workspaceId) {
+        try {
+          const chunks = await searchDocumentChunksInDb(nlInput, grounding.scope.workspaceId, 5);
+          if (chunks.length > 0) {
+            documentEvidence = chunks
+              .map((c) => `• [${c.document_name}] ${c.text.slice(0, 500)}`)
+              .join("\n");
+          }
+        } catch (e) {
+          logger.warn(`[Parser] Document RAG for probing failed: ${(e as Error).message}`);
+        }
+      }
+
+      const userParts: Record<string, unknown> = {
+        prompt: nlInput,
+        extracted_parameters: parsed.parameters,
+        clarification_needed: parsed.clarification_needed,
+      };
+      if (grounding?.dependencyDesc) userParts.MODEL_DRIVERS = grounding.dependencyDesc;
+      else if (grounding?.modelDesc) userParts.MODEL_SCHEMA = grounding.modelDesc;
+      if (grounding?.contextDesc) userParts.COMPANY_CONTEXT = grounding.contextDesc;
+      if (documentEvidence) userParts.DOCUMENT_EVIDENCE = documentEvidence;
+
+      const raw = await callClaudeStructured({
+        purpose: "business_analysis",
+        toolName: "submit_probing_questions",
+        toolDescription: "Submit clarifying questions for an ambiguous scenario prompt",
+        schema: probingQuestionsSchema,
+        maxTokens: 2000,
+        temperature: 0.3,
+        system: PROBING_SYSTEM_PROMPT,
+        userMessage: JSON.stringify(userParts),
+      });
+      if (raw.questions?.length) {
+        const normalized = normalizeFollowUpQuestions(raw.questions);
+        if (normalized.length > 0) return normalized;
+      }
+    } catch (e) {
+      logger.warn(`[Parser] Probing-question generation failed: ${(e as Error).message}`);
+    }
+  }
+
+  return [synthesizeFallbackQuestion(nlInput)];
 }
 
 // ── Minimal heuristic fallback (no hardcoded business scenarios) ──
@@ -476,6 +652,7 @@ export async function parseScenario(
     const result: ParseResult = {
       parameters: agentResult.parameters,
       clarification_needed: agentResult.clarification_needed,
+      follow_up_questions: agentResult.follow_up_questions,
       agent_trace: agentResult.agent_trace,
       causal_chain: agentResult.causal_chain,
       citations: agentResult.citations,
@@ -497,8 +674,24 @@ export async function parseScenario(
     }
     if (notices.length > 0) result.notices = notices;
 
+    let agentGrounding: ProbingGrounding | undefined;
+    if (scope) {
+      try {
+        const ctxDesc = await describeContextForLLM(scope);
+        agentGrounding = {
+          scope,
+          modelDesc: userModel ? describeModelForLLM(userModel) : undefined,
+          dependencyDesc: userModel ? describeDriverDependencies(userModel) : undefined,
+          contextDesc: ctxDesc,
+        };
+      } catch {
+        agentGrounding = { scope };
+      }
+    }
+    result.follow_up_questions = await ensureProbingQuestions(trimmed, result, agentGrounding);
+
     // If agent produced parameters (or a clear clarification), return; else fall through
-    if (result.parameters.length > 0 || result.clarification_needed) {
+    if (result.parameters.length > 0 || result.clarification_needed || result.follow_up_questions?.length) {
       return result;
     }
     notices.push({
@@ -582,7 +775,7 @@ export async function parseScenario(
 
       if (notices.length > 0) result.notices = notices;
 
-      if (result.parameters.length > 0 || result.clarification_needed) {
+      if (result.parameters.length > 0 || result.clarification_needed || result.follow_up_questions?.length) {
         return result;
       }
     } catch (e) {
@@ -630,5 +823,20 @@ export async function parseScenario(
   }
 
   if (notices.length > 0) heuristic.notices = notices;
+  let heuristicGrounding: ProbingGrounding | undefined;
+  if (scope) {
+    try {
+      const ctxDesc = await describeContextForLLM(scope);
+      heuristicGrounding = {
+        scope,
+        modelDesc: userModel ? describeModelForLLM(userModel) : undefined,
+        dependencyDesc: userModel ? describeDriverDependencies(userModel) : undefined,
+        contextDesc: ctxDesc,
+      };
+    } catch {
+      heuristicGrounding = { scope };
+    }
+  }
+  heuristic.follow_up_questions = await ensureProbingQuestions(trimmed, heuristic, heuristicGrounding);
   return heuristic;
 }

@@ -13,6 +13,12 @@ vi.mock("@/lib/api", async (importOriginal) => {
         model_definition: {
           variables: [
             { id: "revenue", name: "Revenue", dependencies: [], tags: ["input"] },
+            {
+              id: "net_income",
+              name: "Net Income",
+              dependencies: ["revenue"],
+              tags: ["output", "pl_metric"],
+            },
           ],
         },
       },
@@ -22,9 +28,13 @@ vi.mock("@/lib/api", async (importOriginal) => {
   };
 });
 
-vi.mock("@/lib/metrics", () => ({
-  fmtCurrency: (v: number) => `$${v}`,
-}));
+vi.mock("@/lib/metrics", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/metrics")>();
+  return {
+    ...actual,
+    fmtCurrency: (v: number) => `$${v}`,
+  };
+});
 
 import { runGoalSeek, applyLeverValue } from "@/lib/api";
 
@@ -55,6 +65,12 @@ describe("GoalSeekView", () => {
   it("solves and offers apply-to-parameters", async () => {
     const user = userEvent.setup();
     render(<GoalSeekView scenarioId="sc-1" onClose={() => {}} />);
+
+    // loadLevers() runs on lever-select focus and sets the default target metric
+    await user.click(screen.getByRole("combobox"));
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: "Net Income", selected: true })).toBeInTheDocument();
+    });
 
     const targetInput = screen.getByRole("spinbutton");
     await user.clear(targetInput);

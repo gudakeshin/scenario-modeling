@@ -326,3 +326,95 @@ test("dependency cycles are rejected", () => {
   };
   assert.throws(() => new DimensionalModel(cyclic), /circular/i);
 });
+
+test("dimensional accounting: revenue ≥ ebitda; ratios not summed", () => {
+  const def: DimensionalModelDefinition = {
+    model_kind: "dimensional",
+    model_version: "acct-1",
+    dimensions: [
+      {
+        id: "region",
+        name: "Region",
+        type: "generic",
+        members: [
+          { id: "total", name: "Total", parentId: null, isLeaf: false, sign: 1, ordinal: 0 },
+          { id: "a", name: "A", parentId: "total", isLeaf: true, sign: 1, ordinal: 1 },
+          { id: "b", name: "B", parentId: "total", isLeaf: true, sign: 1, ordinal: 2 },
+        ],
+      },
+    ],
+    variables: [
+      {
+        id: "revenue",
+        name: "Revenue",
+        dims: ["region"],
+        formula: "0",
+        dependencies: [],
+        aggregation: "sum",
+        tags: ["pl_metric"],
+        metric_type: "currency",
+      },
+      {
+        id: "gross_profit",
+        name: "Gross Profit",
+        dims: ["region"],
+        formula: "0",
+        dependencies: [],
+        aggregation: "sum",
+        tags: ["pl_metric"],
+        metric_type: "currency",
+      },
+      {
+        id: "operating_expenses",
+        name: "OpEx",
+        dims: ["region"],
+        formula: "0",
+        dependencies: [],
+        aggregation: "sum",
+        tags: ["pl_metric"],
+        metric_type: "currency",
+      },
+      {
+        id: "ebitda",
+        name: "EBITDA",
+        dims: ["region"],
+        formula: "gross_profit - operating_expenses",
+        dependencies: ["gross_profit", "operating_expenses"],
+        aggregation: "sum",
+        tags: ["pl_metric"],
+        metric_type: "currency",
+      },
+      {
+        id: "ebitda_margin",
+        name: "EBITDA Margin",
+        dims: ["region"],
+        formula: "(ebitda / revenue) * 100",
+        dependencies: ["ebitda", "revenue"],
+        aggregation: "sum", // intentionally wrong agg — engine must not sum percents
+        tags: ["pl_metric"],
+        metric_type: "percent",
+      },
+    ],
+    time_horizon: { start: "2024-01", end: "2024-01", granularity: "monthly" },
+  };
+
+  const facts = factsToLeafMap([
+    { measure_id: "revenue", member_key: "a", value: 600 },
+    { measure_id: "revenue", member_key: "b", value: 400 },
+    { measure_id: "gross_profit", member_key: "a", value: 300 },
+    { measure_id: "gross_profit", member_key: "b", value: 200 },
+    { measure_id: "operating_expenses", member_key: "a", value: 100 },
+    { measure_id: "operating_expenses", member_key: "b", value: 80 },
+  ]);
+
+  const model = new DimensionalModel(def, facts);
+  const totals = model.evaluate({});
+
+  assert.equal(totals.revenue, 1000);
+  assert.equal(totals.gross_profit, 500);
+  assert.equal(totals.operating_expenses, 180);
+  assert.equal(totals.ebitda, 320);
+  assert.ok(totals.revenue >= totals.ebitda, "revenue must be ≥ ebitda");
+  // Margin recomputed from totals: 320/1000*100 = 32 — not sum of leaf margins
+  assert.ok(Math.abs(totals.ebitda_margin - 32) < 0.01, `expected ~32, got ${totals.ebitda_margin}`);
+});

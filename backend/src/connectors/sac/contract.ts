@@ -1,6 +1,7 @@
 /**
  * SAC Data Export Service URL contract and shared constants.
  */
+export { slugId } from "../slug.js";
 
 export const DEFAULT_DES_BASE_PATH = "/api/v1/dataexport";
 export const DEFAULT_NAMESPACE = "sac";
@@ -13,17 +14,6 @@ export const ACCOUNT_SIGN: Record<string, 1 | -1> = {
   EXP: 1,
   AST: 1,
 };
-
-export function slugId(raw: string): string {
-  return (
-    raw
-      .trim()
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "_")
-      .replace(/^_+|_+$/g, "")
-      .slice(0, 120) || "id"
-  );
-}
 
 export function normalizeTenantRoot(baseUrl: string): string {
   return baseUrl.replace(/\/+$/, "").replace(/\/api\/v1\/dataexport.*$/i, "");

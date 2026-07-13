@@ -21,8 +21,16 @@ import {
   goalSeekSchema,
   driverTreeSchema,
   applyLeverSchema,
+  fidelityAuditSchema,
 } from "../schemas/auth.js";
 import { logger } from "../logger.js";
+import { pool } from "../db/index.js";
+import {
+  attemptDeterministicNormalization,
+  checkInvariants,
+} from "../services/financialInvariants.js";
+import { reviewModelFidelity } from "../services/accountingFidelityAgent.js";
+import { getEvaluableModelForScenario } from "../services/modelResolver.js";
 
 export const analysisRouter = Router();
 
@@ -122,8 +130,10 @@ analysisRouter.post("/:id/attribution", requireRole("analyst"), validateBody(att
     const scenarioId = req.params.id;
     await assertCanWriteScenario(req.user!.userId, req.user!.role, scenarioId);
     const target_metric = req.body.target_metric || "net_income";
-    const result = await runAttribution(scenarioId, target_metric);
-    await logAudit(scenarioId, "attribution_run", { target_metric }, req.user!.userId);
+    const result = await runAttribution(scenarioId, target_metric, {
+      reason: !!req.body.reason,
+    });
+    await logAudit(scenarioId, "attribution_run", { target_metric, reason: !!req.body.reason }, req.user!.userId);
     return res.json(result);
   } catch (e) {
     return handleAnalysisError(e, res, "Attribution analysis failed");
@@ -161,7 +171,8 @@ analysisRouter.get("/:id/driver-tree", requireRole("analyst"), async (req, res) 
     const scenarioId = req.params.id;
     await assertCanReadScenario(req.user!.userId, req.user!.role, scenarioId);
     const metric = (req.query.metric as string) || "net_income";
-    const result = await runDriverTree(scenarioId, metric);
+    const reason = req.query.reason === "1" || req.query.reason === "true";
+    const result = await runDriverTree(scenarioId, metric, { reason });
     return res.json(result);
   } catch (e) {
     return handleAnalysisError(e, res, "Driver tree failed");
@@ -185,13 +196,98 @@ analysisRouter.post("/:id/driver-tree", requireRole("analyst"), validateBody(dri
       }
     }
 
-    const result = await runDriverTree(scenarioId, metric);
-    await logAudit(scenarioId, "driver_tree", { metric, applied_count: applied.length }, req.user!.userId);
+    const result = await runDriverTree(scenarioId, metric, { reason: !!req.body.reason });
+    await logAudit(scenarioId, "driver_tree", { metric, applied_count: applied.length, reason: !!req.body.reason }, req.user!.userId);
     return res.json({ ...result, ...(applied.length > 0 ? { applied } : {}) });
   } catch (e) {
     return handleAnalysisError(e, res, "Driver tree failed");
   }
 });
+
+// ── On-demand accounting fidelity audit ──
+analysisRouter.post(
+  "/:id/fidelity-audit",
+  requireRole("analyst"),
+  validateBody(fidelityAuditSchema),
+  async (req, res) => {
+    try {
+      const scenarioId = req.params.id;
+      await assertCanWriteScenario(req.user!.userId, req.user!.role, scenarioId);
+
+      let pl: Record<string, number> = req.body.pl ?? {};
+      let basePl: Record<string, number> = {};
+      if (!pl || Object.keys(pl).length === 0) {
+        const out = await pool.query(
+          `SELECT output_data FROM scenario_outputs
+           WHERE scenario_id = $1 AND output_type = 'simulation'
+           ORDER BY created_at DESC LIMIT 1`,
+          [scenarioId],
+        );
+        const data = out.rows[0]?.output_data as {
+          aggregate?: Record<string, number>;
+          base_pl?: Record<string, number>;
+        } | undefined;
+        pl = data?.aggregate ?? {};
+        basePl = data?.base_pl ?? {};
+      }
+
+      if (Object.keys(pl).length === 0) {
+        // Fall back to model base evaluation
+        try {
+          const resolved = await getEvaluableModelForScenario(scenarioId);
+          pl = resolved.model.evaluate({});
+          basePl = { ...pl };
+        } catch {
+          return res.status(422).json({ error: "No P&L available to audit — run a simulation first" });
+        }
+      }
+
+      const initial = checkInvariants(pl);
+      const normalized = attemptDeterministicNormalization(pl);
+      const agent = await reviewModelFidelity(
+        {
+          pl: normalized.pl,
+          basePl,
+          residualViolations: normalized.residualViolations,
+          modelSummary: `fidelity-audit scenario=${scenarioId}`,
+        },
+        { applyGatedFixes: true },
+      );
+
+      const payload = {
+        initial_violations: initial,
+        deterministic: {
+          applied: normalized.applied,
+          residual: normalized.residualViolations,
+          pl: normalized.pl,
+        },
+        agent: {
+          findings: agent.findings,
+          proposed_fixes: agent.proposedFixes,
+          applied_fixes: agent.appliedFixes,
+          residual_violations: agent.residualViolations,
+          notices: agent.notices,
+          summary: agent.summary,
+          applied_pl: agent.appliedPl,
+        },
+      };
+
+      await pool.query(
+        `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'fidelity_audit', $2)`,
+        [scenarioId, JSON.stringify(payload)],
+      );
+      await logAudit(scenarioId, "fidelity_audit", {
+        initial_count: initial.length,
+        residual_count: agent.residualViolations.length,
+        applied_fixes: agent.appliedFixes.length,
+      }, req.user!.userId);
+
+      return res.json(payload);
+    } catch (e) {
+      return handleAnalysisError(e, res, "Fidelity audit failed");
+    }
+  },
+);
 
 // ── Apply lever value (goal-seek / driver-tree) ──
 analysisRouter.post(

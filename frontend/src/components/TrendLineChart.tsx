@@ -14,17 +14,13 @@ import {
   AreaChart,
 } from "recharts";
 import type { PeriodResult } from "@/lib/api";
-import { METRIC_LABELS, METRIC_COLORS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import { METRIC_LABELS, METRIC_COLORS, fmtMetric, getCurrencySymbol } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 import { ChartDataTable } from "./ChartDataTable";
 
 interface TrendLineChartProps {
   periods: PeriodResult[];
   granularity: "monthly" | "quarterly";
-}
-
-function fmt(n: number) {
-  return fmtCurrency(n);
 }
 
 type ChartMode = "line" | "area";
@@ -70,7 +66,7 @@ export function TrendLineChart({ periods, granularity: _granularity }: TrendLine
               <div className="w-2 h-2 rounded-full" style={{ backgroundColor: entry.color }} />
               <span className="text-[var(--text-secondary)]">{METRIC_LABELS[entry.dataKey] || entry.dataKey}</span>
             </div>
-            <span className="font-medium text-[var(--text-primary)]">{fmt(entry.value)}</span>
+            <span className="font-medium text-[var(--text-primary)]">{fmtMetric(entry.dataKey, entry.value)}</span>
           </div>
         ))}
       </div>

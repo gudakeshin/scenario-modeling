@@ -19,6 +19,7 @@ import {
   type FidelityReport,
 } from "@/lib/api";
 import { getCurrencySymbol } from "@/lib/metrics";
+import { useUiStore } from "@/stores/uiStore";
 
 type Tab = "documents" | "context" | "model";
 
@@ -44,7 +45,9 @@ function ingestionSummary(doc: DocumentRecord): string | null {
 }
 
 export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) {
-  const [tab, setTab] = useState<Tab>("documents");
+  const docManagerInitialTab = useUiStore((s) => s.docManagerInitialTab);
+  const setDocManagerInitialTab = useUiStore((s) => s.setDocManagerInitialTab);
+  const [tab, setTab] = useState<Tab>(docManagerInitialTab || "documents");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [uploading, setUploading] = useState(false);
   const [uploadProgress, setUploadProgress] = useState<string | null>(null);
@@ -56,9 +59,16 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   const [model, setModel] = useState<UserModel | null>(null);
   const [building, setBuilding] = useState(false);
   const [buildError, setBuildError] = useState<string | null>(null);
+  const [validating, setValidating] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [editingVar, setEditingVar] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (!docManagerInitialTab) return;
+    setTab(docManagerInitialTab);
+    setDocManagerInitialTab(null);
+  }, [docManagerInitialTab, setDocManagerInitialTab]);
 
   const loadDocuments = useCallback(async () => {
     try { setDocuments(await listDocuments()); } catch { /* ignore */ }
@@ -168,16 +178,21 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
 
   const handleValidateModel = async () => {
     try {
+      setValidating(true);
       setBuildError(null);
       const result = await validateModelSchema();
       if (result.fidelity) setFidelityReport(result.fidelity);
       await loadContext();
       await loadDocuments();
+      setTab("context");
     } catch (e) {
       const err = e as Error & { fidelity?: FidelityReport };
       if (err.fidelity) setFidelityReport(err.fidelity);
       setBuildError(err.message);
       await loadContext();
+      setTab("context");
+    } finally {
+      setValidating(false);
     }
   };
 
@@ -256,6 +271,19 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
     return { leverSeeded, leverTotal, metricSeeded, metricTotal };
   };
 
+  const spreadsheetNeedsValidation = documents.some(
+    (doc) =>
+      doc.document_kind === "spreadsheet_model" &&
+      doc.validation_status !== "ready",
+  );
+  const contextNeedsValidation =
+    modelValidationStatus === "needs_validation" ||
+    context?.context_data?.validation_status === "needs_validation" ||
+    (modelValidationStatus != null && modelValidationStatus !== "ready") ||
+    (context?.context_data?.validation_status != null &&
+      context.context_data.validation_status !== "ready");
+  const needsValidation = spreadsheetNeedsValidation || contextNeedsValidation;
+
   return (
     <div className="p-5 max-h-[80vh] overflow-y-auto">
       <PanelHeader
@@ -265,6 +293,32 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
         onMinimize={onMinimize || onClose}
         isMinimized={false}
       />
+
+      {needsValidation && (
+        <div className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 space-y-2">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-[var(--text-primary)]">
+                Spreadsheet model needs analyst validation
+              </p>
+              <p className="text-xs text-[var(--text-secondary)] mt-0.5">
+                Simulation is blocked until this model is marked ready. Validate against the Excel baseline, then re-run your scenario.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleValidateModel}
+              disabled={validating}
+              className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-accent text-white font-medium hover:bg-accent/90 transition-colors disabled:opacity-50"
+            >
+              {validating ? "Validating…" : "Mark Model Validated"}
+            </button>
+          </div>
+          {buildError && (
+            <p className="text-[11px] text-[var(--danger)]">{buildError}</p>
+          )}
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 border-b border-[var(--border)] mb-4">

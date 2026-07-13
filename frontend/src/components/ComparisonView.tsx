@@ -3,7 +3,7 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { compareScenarios as compareApi, listScenarios, type ComparisonResult } from "@/lib/api";
-import { METRIC_LABELS, fmtCurrency, fmtCurrencySigned } from "@/lib/metrics";
+import { METRIC_LABELS, fmtMetric, fmtMetricSigned } from "@/lib/metrics";
 
 interface ComparisonViewProps {
   currentScenarioId: string;
@@ -216,9 +216,9 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
             {comparison.key_callouts.map((c) => (
               <div key={c.label} className="rounded-xl border border-[var(--card-border)] bg-[var(--panel-bg)] p-3 text-center shadow-card hover:shadow-card-hover transition-shadow">
                 <p className="text-[10px] text-[var(--text-faint)] uppercase font-medium tracking-wider">{METRIC_LABELS[c.label] || c.label}</p>
-                <p className="text-lg font-semibold text-[var(--text-primary)] mt-1">{fmtCurrency(c.scenario)}</p>
+                <p className="text-lg font-semibold text-[var(--text-primary)] mt-1">{fmtMetric(c.label, c.scenario)}</p>
                 <p className={`text-xs font-medium mt-0.5 ${c.delta >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
-                  {fmtCurrencySigned(c.delta)} {c.delta_pct != null && `(${c.delta >= 0 ? "+" : ""}${c.delta_pct}%)`}
+                  {fmtMetricSigned(c.label, c.delta)} {c.delta_pct != null && `(${c.delta >= 0 ? "+" : ""}${c.delta_pct}%)`}
                 </p>
               </div>
             ))}
@@ -287,11 +287,11 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
                 {sortedMetrics.map((row) => (
                   <tr key={row.metric} className="border-b border-[var(--border-light)] hover:bg-[var(--panel-bg)] transition-colors">
                     <td className="py-2 px-3 font-medium text-[var(--text-primary)]">{METRIC_LABELS[row.metric] || row.metric}</td>
-                    <td className="text-right py-2 px-2 text-[var(--text-secondary)]">{fmtCurrency(row.base)}</td>
+                    <td className="text-right py-2 px-2 text-[var(--text-secondary)]">{fmtMetric(row.metric, row.base)}</td>
                     {row.scenarios.map((s) => [
-                      <td key={s.scenario_id + "-v"} className="text-right py-2 px-2 text-[var(--text-primary)]">{fmtCurrency(s.value)}</td>,
+                      <td key={s.scenario_id + "-v"} className="text-right py-2 px-2 text-[var(--text-primary)]">{fmtMetric(row.metric, s.value)}</td>,
                       <td key={s.scenario_id + "-d"} className={`text-right py-2 px-2 font-medium ${s.delta >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
-                        {fmtCurrencySigned(s.delta)}
+                        {fmtMetricSigned(row.metric, s.delta)}
                         {s.delta_pct != null && (
                           <span className="text-[10px] ml-0.5 opacity-60">({s.delta >= 0 ? "+" : ""}{s.delta_pct}%)</span>
                         )}

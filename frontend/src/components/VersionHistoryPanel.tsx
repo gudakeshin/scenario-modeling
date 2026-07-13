@@ -10,16 +10,12 @@ import {
   type ScenarioVersion,
   type ScenarioVersionDiff,
 } from "@/lib/api";
-import { fmtCurrency, fmtCurrencySigned } from "@/lib/metrics";
+import { fmtMetric, fmtMetricSigned, metricLabel } from "@/lib/metrics";
 
 interface VersionHistoryPanelProps {
   scenarioId: string;
   onClose: () => void;
   onMinimize?: () => void;
-}
-
-function metricLabel(id: string): string {
-  return id.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
 }
 
 export function VersionHistoryPanel({ scenarioId, onClose, onMinimize }: VersionHistoryPanelProps) {
@@ -224,17 +220,17 @@ export function VersionHistoryPanel({ scenarioId, onClose, onMinimize }: Version
                     <tr key={key} className="border-t border-[var(--border)]">
                       <td className="px-3 py-1.5 text-[var(--text-primary)]">{metricLabel(key)}</td>
                       <td className="px-3 py-1.5 text-right text-[var(--text-muted)]">
-                        {row.from != null ? fmtCurrency(row.from) : "—"}
+                        {row.from != null ? fmtMetric(key, row.from) : "—"}
                       </td>
                       <td className="px-3 py-1.5 text-right text-[var(--text-primary)]">
-                        {row.to != null ? fmtCurrency(row.to) : "—"}
+                        {row.to != null ? fmtMetric(key, row.to) : "—"}
                       </td>
                       <td
                         className={`px-3 py-1.5 text-right font-medium ${
                           (row.delta ?? 0) >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"
                         }`}
                       >
-                        {row.delta != null ? fmtCurrencySigned(row.delta) : "—"}
+                        {row.delta != null ? fmtMetricSigned(key, row.delta) : "—"}
                       </td>
                     </tr>
                   ))}

@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert";
-import { inferMetricTypeFromId, resolveMetricType } from "./metricTypes.js";
+import { inferMetricTypeFromId, resolveMetricType, pickDefaultTargetMetric } from "./metricTypes.js";
 import { CompiledModel } from "./expression.js";
 
 test("inferMetricTypeFromId: percent/ratio/count/volume/currency", () => {
@@ -14,6 +14,24 @@ test("inferMetricTypeFromId: percent/ratio/count/volume/currency", () => {
   assert.strictEqual(inferMetricTypeFromId("units_sold"), "volume");
   assert.strictEqual(inferMetricTypeFromId("revenue"), "currency");
   assert.strictEqual(inferMetricTypeFromId("net_income"), "currency");
+});
+
+test("pickDefaultTargetMetric: prefers ebitda when net_income missing", () => {
+  const available = [
+    "gross_revenue",
+    "net_revenue",
+    "material_vehicle_cost",
+    "gross_profit",
+    "ebitda",
+    "ebitda_margin",
+  ];
+  assert.strictEqual(pickDefaultTargetMetric(available, "net_income"), "ebitda");
+  assert.strictEqual(pickDefaultTargetMetric(available), "ebitda");
+  assert.strictEqual(pickDefaultTargetMetric(available, "gross_profit"), "gross_profit");
+});
+
+test("pickDefaultTargetMetric: skips margins when falling back", () => {
+  assert.strictEqual(pickDefaultTargetMetric(["ebitda_margin", "total_opex"]), "total_opex");
 });
 
 test("CompiledModel exposes metricType on inputs", () => {

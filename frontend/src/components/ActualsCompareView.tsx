@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { compareActuals, type ActualsCompareRow } from "@/lib/api";
-import { fmtCurrency, fmtCurrencySigned } from "@/lib/metrics";
+import { fmtMetric, fmtMetricSigned, metricLabel } from "@/lib/metrics";
 
 interface ActualsCompareViewProps {
   scenarioId: string;
@@ -11,19 +11,15 @@ interface ActualsCompareViewProps {
   onMinimize?: () => void;
 }
 
-function metricLabel(id: string): string {
-  return id.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+function cell(metricId: string, n: number | null): string {
+  return n != null && Number.isFinite(n) ? fmtMetric(metricId, n) : "—";
 }
 
-function cell(n: number | null): string {
-  return n != null && Number.isFinite(n) ? fmtCurrency(n) : "—";
-}
-
-function deltaCell(n: number | null) {
+function deltaCell(metricId: string, n: number | null) {
   if (n == null || !Number.isFinite(n)) return <span className="text-[var(--text-faint)]">—</span>;
   return (
     <span className={n >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}>
-      {fmtCurrencySigned(n)}
+      {fmtMetricSigned(metricId, n)}
     </span>
   );
 }
@@ -110,13 +106,13 @@ export function ActualsCompareView({ scenarioId, onClose, onMinimize }: ActualsC
                   <td className="px-3 py-1.5 font-medium text-[var(--text-primary)]">
                     {metricLabel(r.measure_id)}
                   </td>
-                  <td className="px-3 py-1.5 text-right text-[var(--text-muted)]">{cell(r.actual)}</td>
-                  <td className="px-3 py-1.5 text-right text-[var(--text-muted)]">{cell(r.budget)}</td>
-                  <td className="px-3 py-1.5 text-right text-[var(--text-muted)]">{cell(r.forecast)}</td>
-                  <td className="px-3 py-1.5 text-right text-[var(--text-primary)]">{cell(r.scenario)}</td>
-                  <td className="px-3 py-1.5 text-right">{deltaCell(r.vs_actual)}</td>
-                  <td className="px-3 py-1.5 text-right">{deltaCell(r.vs_budget)}</td>
-                  <td className="px-3 py-1.5 text-right">{deltaCell(r.vs_forecast)}</td>
+                  <td className="px-3 py-1.5 text-right text-[var(--text-muted)]">{cell(r.measure_id, r.actual)}</td>
+                  <td className="px-3 py-1.5 text-right text-[var(--text-muted)]">{cell(r.measure_id, r.budget)}</td>
+                  <td className="px-3 py-1.5 text-right text-[var(--text-muted)]">{cell(r.measure_id, r.forecast)}</td>
+                  <td className="px-3 py-1.5 text-right text-[var(--text-primary)]">{cell(r.measure_id, r.scenario)}</td>
+                  <td className="px-3 py-1.5 text-right">{deltaCell(r.measure_id, r.vs_actual)}</td>
+                  <td className="px-3 py-1.5 text-right">{deltaCell(r.measure_id, r.vs_budget)}</td>
+                  <td className="px-3 py-1.5 text-right">{deltaCell(r.measure_id, r.vs_forecast)}</td>
                 </tr>
               ))}
             </tbody>

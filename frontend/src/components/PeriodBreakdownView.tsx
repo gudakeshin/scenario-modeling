@@ -4,7 +4,7 @@ import { useState, useMemo } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from "recharts";
 import type { PeriodResult } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
-import { METRIC_LABELS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import { METRIC_LABELS, fmtMetric, getCurrencySymbol } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface PeriodBreakdownViewProps {
@@ -15,8 +15,9 @@ interface PeriodBreakdownViewProps {
   onMinimize?: () => void;
 }
 
-function fmt(n: number) {
-  return n < 0 ? `-${fmtCurrency(n)}` : fmtCurrency(n);
+function fmt(metricId: string, n: number) {
+  const s = fmtMetric(metricId, Math.abs(n));
+  return n < 0 ? `-${s.replace(/^-/, "")}` : s;
 }
 
 type ViewMode = "table" | "chart";
@@ -92,7 +93,7 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
             }`}
           >
             <p className="text-[9px] text-[var(--text-faint)] uppercase font-medium tracking-wider">{METRIC_LABELS[key] || key}</p>
-            <p className="text-sm font-semibold text-[var(--text-primary)] mt-0.5">{fmt(totalPl[key] || 0)}</p>
+            <p className="text-sm font-semibold text-[var(--text-primary)] mt-0.5">{fmt(key, totalPl[key] || 0)}</p>
           </button>
         ))}
       </div>
@@ -123,7 +124,7 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
                   tickLine={false}
                 />
                 <Tooltip
-                  formatter={(v) => fmt(Number(v))}
+                  formatter={(v) => fmt(selectedMetric, Number(v))}
                   contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--card-border)", borderRadius: 8, fontSize: 12 }}
                 />
                 <Bar dataKey="value" radius={[0, 3, 3, 0]}>
@@ -161,12 +162,12 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
                       total += val;
                       return (
                         <td key={p.period} className="text-right py-2 px-2 text-[var(--text-secondary)] tabular-nums">
-                          {fmt(val)}
+                          {fmt(key, val)}
                         </td>
                       );
                     })}
                     <td className="text-right py-2 px-3 font-semibold text-[var(--text-primary)] tabular-nums">
-                      {fmt(Math.round(total * 100) / 100)}
+                      {fmt(key, Math.round(total * 100) / 100)}
                     </td>
                   </tr>
                 );
@@ -196,7 +197,7 @@ export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, on
                   formatter={(v, _name, item) => {
                     const changePct = (item?.payload as { changePct: number | null } | undefined)?.changePct;
                     const val = Number(v);
-                    return [`${fmt(val)}${changePct != null ? ` (${changePct >= 0 ? "+" : ""}${changePct.toFixed(1)}%)` : ""}`, METRIC_LABELS[selectedMetric] || selectedMetric];
+                    return [`${fmt(selectedMetric, val)}${changePct != null ? ` (${changePct >= 0 ? "+" : ""}${changePct.toFixed(1)}%)` : ""}`, METRIC_LABELS[selectedMetric] || selectedMetric];
                   }}
                   contentStyle={{ background: "var(--card-bg)", border: "1px solid var(--card-border)", borderRadius: 8, fontSize: 12 }}
                 />

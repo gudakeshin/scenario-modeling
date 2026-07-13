@@ -10,7 +10,7 @@ import {
   type EvaluableModel,
   type ModelInput,
 } from "./expression.js";
-import { inferMetricTypeFromId } from "./metricTypes.js";
+import { inferMetricTypeFromId, isRatioLike, resolveMetricType } from "./metricTypes.js";
 import {
   makeCellKey,
   splitCellKey,
@@ -23,6 +23,7 @@ import {
   type Member,
   type AggregationKind,
 } from "../models/dimensions.js";
+import type { MetricType } from "./metricTypes.js";
 
 type CompiledFn = (ctx: Record<string, number>, fns: typeof SAFE_FNS) => number;
 
@@ -344,10 +345,36 @@ export class DimensionalModel implements EvaluableModel {
       }
     }
 
+    // Totals in topo order so ratio metrics can recompute from rolled-up deps
     const totals: Record<string, number> = {};
-    for (const v of this.def.variables) {
+    for (const id of this.order) {
+      const v = this.varsById.get(id)!;
+      const mt = resolveMetricType(v.metric_type, v.id, v.name);
+      const fn = this.compiled.get(id);
+      if (isRatioLike(mt) && fn && v.dependencies.length > 0) {
+        const ctx: Record<string, number> = {};
+        let ok = true;
+        for (const depId of v.dependencies) {
+          if (totals[depId] === undefined || !Number.isFinite(totals[depId])) {
+            ok = false;
+            break;
+          }
+          ctx[depId] = totals[depId];
+        }
+        if (ok) {
+          try {
+            const recomputed = fn(ctx, SAFE_FNS);
+            if (typeof recomputed === "number" && Number.isFinite(recomputed)) {
+              totals[id] = recomputed;
+              continue;
+            }
+          } catch {
+            /* fall through to leaf rollup */
+          }
+        }
+      }
       const t = this.aggregateAll(v, getLeafMap(v.id), rollupMemo);
-      if (t !== undefined) totals[v.id] = t;
+      if (t !== undefined) totals[id] = t;
     }
 
     return {
@@ -533,6 +560,7 @@ export class DimensionalModel implements EvaluableModel {
       // Aggregate all root children / all leaves via hierarchy roots
       const roots = idx.dim.members.filter((m) => !m.parentId);
       const targets = roots.length > 0 ? roots : idx.leaves;
+      const mt = resolveMetricType(v.metric_type, v.id, v.name);
       return this.combine(
         v.aggregation,
         targets.map((m) => {
@@ -541,6 +569,7 @@ export class DimensionalModel implements EvaluableModel {
           return this.aggregateRecursive(v, next, depth, prefix, leafMap, rollupMemo, varId);
         }),
         targets,
+        mt,
       );
     }
 
@@ -563,6 +592,7 @@ export class DimensionalModel implements EvaluableModel {
 
     // Non-leaf: aggregate children
     const kids = idx.children.get(member.id) ?? [];
+    const mt = resolveMetricType(v.metric_type, v.id, v.name);
     return this.combine(
       v.aggregation,
       kids.map((child) => {
@@ -571,6 +601,7 @@ export class DimensionalModel implements EvaluableModel {
         return this.aggregateRecursive(v, next, depth, prefix, leafMap, rollupMemo, varId);
       }),
       kids,
+      mt,
     );
   }
 
@@ -578,6 +609,7 @@ export class DimensionalModel implements EvaluableModel {
     agg: AggregationKind,
     values: Array<number | undefined>,
     members: Member[],
+    metricType: MetricType = "unknown",
   ): number | undefined {
     const present: Array<{ v: number; sign: 1 | -1 }> = [];
     for (let i = 0; i < values.length; i++) {
@@ -586,6 +618,11 @@ export class DimensionalModel implements EvaluableModel {
       present.push({ v, sign: members[i]?.sign ?? 1 });
     }
     if (present.length === 0) return undefined;
+
+    // Never sum/signed_sum percent or ratio metrics (avoids 160% margin artifacts)
+    if (isRatioLike(metricType)) {
+      return present.reduce((s, p) => s + p.v, 0) / present.length;
+    }
 
     switch (agg) {
       case "signed_sum":
@@ -665,6 +702,23 @@ export class DimensionalModel implements EvaluableModel {
       for (const key of matching) {
         const cur = leafMap.get(key) ?? 0;
         leafMap.set(key, cur * (1 + ov.value / 100));
+      }
+      return;
+    }
+
+    if (ov.delta_type === "additive") {
+      if (matching.length === 0) return;
+      const currentAggregate = this.readPov(v, scope, leafMap, new Map()) ?? 0;
+      if (Math.abs(currentAggregate) < 1e-12) {
+        const each = ov.value / matching.length;
+        for (const key of matching) {
+          leafMap.set(key, (leafMap.get(key) ?? 0) + each);
+        }
+      } else {
+        for (const key of matching) {
+          const cur = leafMap.get(key) ?? 0;
+          leafMap.set(key, cur + ov.value * (cur / currentAggregate));
+        }
       }
       return;
     }

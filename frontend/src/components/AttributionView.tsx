@@ -1,6 +1,6 @@
 "use client";
 
-import { useState, useCallback, useMemo } from "react";
+import { useState, useCallback, useMemo, useEffect } from "react";
 import {
   BarChart,
   Bar,
@@ -14,8 +14,8 @@ import {
 } from "recharts";
 import { PanelHeader } from "./PanelHeader";
 import { ChartDataTable } from "./ChartDataTable";
-import { runAttribution, type AttributionResult } from "@/lib/api";
-import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol } from "@/lib/metrics";
+import { runAttribution, getActiveModel, type AttributionResult } from "@/lib/api";
+import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol, pickDefaultTargetMetric, metricLabel } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface AttributionViewProps {
@@ -28,18 +28,33 @@ export function AttributionView({ scenarioId, onClose, onMinimize }: Attribution
   const [result, setResult] = useState<AttributionResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [targetMetric, setTargetMetric] = useState("net_income");
+  const [targetMetric, setTargetMetric] = useState("");
+  const [metricOptions, setMetricOptions] = useState<string[]>([]);
+  const [reason, setReason] = useState(false);
+
+  useEffect(() => {
+    getActiveModel()
+      .then(({ model }) => {
+        const ids = (model?.model_definition?.variables ?? [])
+          .filter((v) => v.tags?.includes("pl_metric") || v.tags?.includes("output") || (v.dependencies?.length ?? 0) > 0)
+          .map((v) => v.id);
+        setMetricOptions(ids);
+        setTargetMetric(pickDefaultTargetMetric(ids, "net_income"));
+      })
+      .catch(() => setTargetMetric("ebitda"));
+  }, []);
 
   const run = useCallback(async () => {
+    if (!targetMetric) return;
     setLoading(true);
     setError(null);
     try {
-      setResult(await runAttribution(scenarioId, targetMetric));
+      setResult(await runAttribution(scenarioId, targetMetric, { reason }));
     } catch (e) {
       setError((e as Error).message);
     }
     setLoading(false);
-  }, [scenarioId, targetMetric]);
+  }, [scenarioId, targetMetric, reason]);
 
   const chartData = useMemo(() => {
     if (!result) return [];
@@ -81,11 +96,23 @@ export function AttributionView({ scenarioId, onClose, onMinimize }: Attribution
       <div className="flex items-center gap-3 mb-4 bg-[var(--panel-bg)] rounded-xl border border-[var(--panel-border)] p-3">
         <label className="text-xs text-[var(--text-muted)]">
           Metric:
-          <input
-            value={targetMetric}
-            onChange={(e) => setTargetMetric(e.target.value)}
-            className="ml-1.5 w-32 rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)] px-2 py-1 text-xs"
-          />
+          {metricOptions.length > 0 ? (
+            <select
+              value={targetMetric}
+              onChange={(e) => setTargetMetric(e.target.value)}
+              className="ml-1.5 w-40 rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)] px-2 py-1 text-xs"
+            >
+              {metricOptions.map((id) => (
+                <option key={id} value={id}>{metricLabel(id)}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              value={targetMetric}
+              onChange={(e) => setTargetMetric(e.target.value)}
+              className="ml-1.5 w-32 rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)] px-2 py-1 text-xs"
+            />
+          )}
         </label>
         <button
           type="button"
@@ -95,6 +122,14 @@ export function AttributionView({ scenarioId, onClose, onMinimize }: Attribution
         >
           {loading ? "Running..." : "Run Attribution"}
         </button>
+        <label className="text-xs text-[var(--text-muted)] flex items-center gap-1.5 ml-auto">
+          <input
+            type="checkbox"
+            checked={reason}
+            onChange={(e) => setReason(e.target.checked)}
+          />
+          Add rationale
+        </label>
       </div>
 
       {error && <p className="text-xs text-[var(--danger)] mb-2 bg-[var(--danger-bg)] px-3 py-1.5 rounded-lg">{error}</p>}
@@ -105,6 +140,20 @@ export function AttributionView({ scenarioId, onClose, onMinimize }: Attribution
             Δ {fmtCurrencySigned(result.total_delta)} · {result.method.replace("_", " ")} · base{" "}
             {fmtCurrency(result.base_value)} → scenario {fmtCurrency(result.scenario_value)}
           </p>
+          {result.rationale && (
+            <p className="text-xs text-[var(--text-secondary)] mb-2 italic">{result.rationale}</p>
+          )}
+          {result.driver_groups && result.driver_groups.length > 0 && (
+            <div className="mb-2 space-y-1">
+              {result.driver_groups.map((g) => (
+                <p key={g.category} className="text-[11px] text-[var(--text-muted)]">
+                  <span className="font-medium text-[var(--text-secondary)]">{g.category}:</span>{" "}
+                  {g.variable_ids.join(", ")}
+                  {g.rationale ? ` — ${g.rationale}` : ""}
+                </p>
+              ))}
+            </div>
+          )}
           {result.notices?.map((n, i) => (
             <p key={i} className="text-[11px] text-[var(--warning)] bg-[var(--warning-bg)] px-2.5 py-1 rounded-lg mb-1">
               {n}

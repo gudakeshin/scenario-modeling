@@ -227,6 +227,7 @@ scenariosRouter.post("/agent/stream", requireRole("analyst"), async (req, res) =
         citations: result.citations,
         confidence: result.confidence,
         clarification_needed: result.clarification_needed,
+        follow_up_questions: result.follow_up_questions,
         agent_trace: result.agent_trace,
         stopped_reason: result.stopped_reason,
         preview_pl: result.preview_pl ?? result.final_preview_pl,
@@ -439,8 +440,31 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
 
     // Build an enriched input that combines the original query with the user's answers
     const originalInput = sRes.rows[0].nl_input;
-    const answerContext = answers
-      .map((a: { question_id: string; answer: string }) => `- ${a.question_id}: ${a.answer}`)
+    type RefineAnswer = {
+      question_id: string;
+      answer: string;
+      answer_kind?: "accepted_recommendation" | "overridden" | "custom" | "comment";
+      recommended_value?: string;
+    };
+    const typedAnswers = answers as RefineAnswer[];
+    const answerContext = typedAnswers
+      .map((a) => {
+        const kind = a.answer_kind;
+        if (kind === "accepted_recommendation") {
+          return `- ${a.question_id}: ${a.answer} (user confirmed the system recommendation)`;
+        }
+        if (kind === "overridden") {
+          const prev = a.recommended_value ? ` of "${a.recommended_value}"` : "";
+          return `- ${a.question_id}: ${a.answer} (user overrode the recommendation${prev})`;
+        }
+        if (kind === "comment") {
+          return `- ${a.question_id} (open comment): ${a.answer}`;
+        }
+        if (kind === "custom") {
+          return `- ${a.question_id}: ${a.answer} (custom answer)`;
+        }
+        return `- ${a.question_id}: ${a.answer}`;
+      })
       .join("\n");
     const enrichedInput = `${originalInput}\n\nAdditional context from user:\n${answerContext}`;
 
@@ -495,11 +519,32 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
         source: "parser_extract" as const,
       })),
     );
-    for (const answer of answers) {
-      addQuestionHistory(sid, answer.question_id, String(answer.answer || ""), paramsWithMapping.map((p) => p.mapped_variable_id));
+    for (const answer of typedAnswers) {
+      addQuestionHistory(
+        sid,
+        answer.question_id,
+        String(answer.answer || ""),
+        paramsWithMapping.map((p) => p.mapped_variable_id),
+        {
+          answerKind: answer.answer_kind,
+          recommendedValue: answer.recommended_value,
+        },
+      );
     }
 
-    await logAudit(sid, "refined", { answer_count: answers.length, new_param_count: parseResult.parameters.length }, userId);
+    const acceptedCount = typedAnswers.filter((a) => a.answer_kind === "accepted_recommendation").length;
+    const overriddenCount = typedAnswers.filter((a) => a.answer_kind === "overridden").length;
+    await logAudit(
+      sid,
+      "refined",
+      {
+        answer_count: typedAnswers.length,
+        new_param_count: parseResult.parameters.length,
+        accepted_recommendations: acceptedCount,
+        overridden_recommendations: overriddenCount,
+      },
+      userId,
+    );
 
     return res.json({
       scenario_id: sid,
@@ -647,7 +692,14 @@ scenariosRouter.get("/:id/parameters", async (req, res) => {
        FROM scenario_parameters WHERE scenario_id = $1 ORDER BY created_at`,
       [req.params.id]
     );
-    return res.json({ parameters: r.rows });
+    // node-pg returns NUMERIC as string; coerce so clients always get numbers.
+    const parameters = r.rows.map((row) => ({
+      ...row,
+      base_value: row.base_value == null ? null : Number(row.base_value),
+      scenario_value: row.scenario_value == null ? null : Number(row.scenario_value),
+      confidence_score: row.confidence_score == null ? null : Number(row.confidence_score),
+    }));
+    return res.json({ parameters });
   } catch (e) {
     const status = authzError(e);
     if (status) return res.status(status).json({ error: (e as Error).message });
@@ -1137,8 +1189,8 @@ const previewBodySchema = z.object({
     .array(
       z.object({
         variable_id: z.string().min(1),
-        value: z.number().finite(),
-        delta_type: z.enum(["percent", "absolute"]).optional(),
+        value: z.coerce.number().finite(),
+        delta_type: z.enum(["percent", "absolute", "additive"]).optional(),
       }),
     )
     .optional(),
@@ -1155,7 +1207,7 @@ scenariosRouter.post("/:id/preview", requireRole("analyst"), async (req, res) =>
     const overrides = parsed.data.parameters?.map((p) => ({
       variableId: p.variable_id,
       value: p.value,
-      delta_type: (p.delta_type ?? "percent") as "percent" | "absolute",
+      delta_type: (p.delta_type ?? "percent") as "percent" | "absolute" | "additive",
     }));
     const result = await previewSimulationForScenario(req.params.id, overrides);
     return res.json(result);

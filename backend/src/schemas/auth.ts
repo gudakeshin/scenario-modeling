@@ -40,6 +40,8 @@ export const refineScenarioSchema = z.object({
       z.object({
         question_id: z.string().min(1),
         answer: z.string().min(1).max(2000),
+        answer_kind: z.enum(["accepted_recommendation", "overridden", "custom", "comment"]).optional(),
+        recommended_value: z.string().max(500).optional(),
       })
     )
     .min(1)
@@ -94,7 +96,7 @@ export const monteCarloSchema = z.object({
         min: z.number().finite().optional(),
         max: z.number().finite().optional(),
         mode: z.number().finite().optional(),
-        delta_type: z.enum(["percent", "absolute"]).optional(),
+        delta_type: z.enum(["percent", "absolute", "additive"]).optional(),
         truncate_at_zero: z.boolean().optional(),
       })
     )
@@ -146,6 +148,8 @@ export const twoWaySensitivitySchema = z.object({
 
 export const attributionSchema = z.object({
   target_metric: z.string().min(1).max(255).optional(),
+  /** When true, LLM adds business rationale / groupings (Shapley math unchanged). */
+  reason: z.boolean().optional(),
 });
 
 export const goalSeekSchema = z.object({
@@ -160,23 +164,30 @@ export const goalSeekSchema = z.object({
 export const driverTreeSchema = z.object({
   metric: z.string().min(1).max(255).optional(),
   target_metric: z.string().min(1).max(255).optional(),
+  /** When true, LLM restructures the tree (reconciliation-gated). */
+  reason: z.boolean().optional(),
   /** Optional lever edits applied before returning the tree. */
   apply_levers: z
     .array(
       z.object({
         variable_id: z.string().min(1).max(255),
-        scenario_value: z.number().finite(),
-        delta_type: z.enum(["percent", "absolute"]).optional(),
+        scenario_value: z.coerce.number().finite(),
+        delta_type: z.enum(["percent", "absolute", "additive"]).optional(),
       }),
     )
     .max(50)
     .optional(),
 });
 
+export const fidelityAuditSchema = z.object({
+  /** Optional P&L override; otherwise uses latest simulation aggregate. */
+  pl: z.record(z.number()).optional(),
+});
+
 export const applyLeverSchema = z.object({
   variable_id: z.string().min(1).max(255),
-  scenario_value: z.number().finite(),
-  delta_type: z.enum(["percent", "absolute"]).optional(),
+  scenario_value: z.coerce.number().finite(),
+  delta_type: z.enum(["percent", "absolute", "additive"]).optional(),
   reason: z.string().max(1000).optional(),
   status: z.enum(["pending", "accepted", "modified"]).optional(),
 });

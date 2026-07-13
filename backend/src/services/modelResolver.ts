@@ -254,7 +254,11 @@ export async function loadScenarioOverrides(scenarioId: string): Promise<Scenari
     }) => ({
       variableId: row.mapped_variable_id,
       value: Number(row.scenario_value),
-      delta_type: (row.delta_type === "percent" ? "percent" : "absolute") as DeltaType,
+      delta_type: (row.delta_type === "percent"
+        ? "percent"
+        : row.delta_type === "additive"
+          ? "additive"
+          : "absolute") as DeltaType,
       memberScope: row.member_scope ?? undefined,
     }),
   );
@@ -283,6 +287,12 @@ export function resolveOverridesToAbsolute(
         continue;
       }
       absolute[o.variableId] = base * (1 + o.value / 100);
+    } else if (o.delta_type === "additive") {
+      if (base == null) {
+        unresolved.push(o.variableId);
+        continue;
+      }
+      absolute[o.variableId] = base + o.value;
     } else {
       absolute[o.variableId] = o.value;
     }

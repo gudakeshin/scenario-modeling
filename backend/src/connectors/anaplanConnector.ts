@@ -12,6 +12,17 @@ import type {
   PlanningModelMetadata,
   PlanningModelSummary,
 } from "./types.js";
+import { config } from "../config.js";
+import { AnaplanClient, type FetchLike } from "./anaplan/client.js";
+import { streamFactPages } from "./anaplan/cellData.js";
+import {
+  encodeCompositeModelId,
+  modelApiRoot,
+  normalizeAnaplanBaseUrl,
+  parseCompositeModelId,
+  type AnaplanColumnMaps,
+} from "./anaplan/contract.js";
+import { buildModuleMetadata } from "./anaplan/metadata.js";
 
 const MOCK_MODELS: PlanningModelSummary[] = [
   { id: "mock-anaplan-pl", name: "P&L Planning (mock)", description: "Demo Anaplan model" },
@@ -135,11 +146,27 @@ function mockMetadata(modelId: string): PlanningModelMetadata {
 
 export class AnaplanConnector implements PlanningConnector {
   readonly provider = "anaplan" as const;
+  private readonly client: AnaplanClient;
+  private readonly metadataCache = new Map<
+    string,
+    { meta: PlanningModelMetadata; columnMaps: AnaplanColumnMaps }
+  >();
+  private readonly summaryCache = new Map<string, PlanningModelSummary>();
 
-  constructor(private readonly creds: ConnectionCredentials) {}
+  constructor(
+    private readonly creds: ConnectionCredentials,
+    fetchImpl?: FetchLike,
+  ) {
+    this.client = new AnaplanClient({
+      auth: creds.auth,
+      fetchImpl,
+      maxRetries: config.ANAPLAN_HTTP_MAX_RETRIES,
+    });
+  }
 
   /** True when auth secrets are absent — use documented mock responses. */
   isMockMode(): boolean {
+    if (this.creds.baseUrl.trim().toLowerCase() === "mock://local") return true;
     const auth = this.creds.auth;
     if (!auth) return true;
     if (auth.kind === "api_key") return !auth.apiKey;
@@ -154,12 +181,15 @@ export class AnaplanConnector implements PlanningConnector {
       return { ok: true, message: "Anaplan mock mode (no credentials)" };
     }
     try {
-      const token = await this.getAuthHeader();
-      const res = await fetch(`${this.creds.baseUrl.replace(/\/$/, "")}/users/me`, {
-        headers: { Authorization: token, Accept: "application/json" },
-      });
-      if (!res.ok) {
-        return { ok: false, message: `Anaplan auth failed (${res.status})` };
+      const base = normalizeAnaplanBaseUrl(this.creds.baseUrl);
+      await this.client.fetchJson(`${base}/users/me`);
+      const workspaceId = this.workspaceId(false);
+      if (workspaceId) {
+        const body = await this.client.fetchJson(
+          `${base}/workspaces/${encodeURIComponent(workspaceId)}`,
+        ) as { name?: string; workspace?: { name?: string } };
+        const name = body.workspace?.name ?? body.name ?? workspaceId;
+        return { ok: true, message: `Connected to Anaplan workspace ${name}` };
       }
       return { ok: true, message: "Anaplan connection OK" };
     } catch (e) {
@@ -170,106 +200,65 @@ export class AnaplanConnector implements PlanningConnector {
   async listModels(): Promise<PlanningModelSummary[]> {
     if (this.isMockMode()) return MOCK_MODELS;
 
-    const token = await this.getAuthHeader();
-    const workspaceId = String(
-      this.creds.authPublic?.workspace_id || this.creds.authPublic?.workspaceId || "",
-    );
-    if (!workspaceId) {
-      throw new Error("Anaplan requires auth_public.workspace_id");
-    }
-    const url = `${this.creds.baseUrl.replace(/\/$/, "")}/workspaces/${workspaceId}/models`;
-    const res = await fetch(url, {
-      headers: { Authorization: token, Accept: "application/json" },
-    });
-    if (!res.ok) {
-      throw new Error(`Anaplan listModels failed (${res.status})`);
-    }
-    const body = (await res.json()) as {
+    const workspaceId = this.workspaceId();
+    const base = normalizeAnaplanBaseUrl(this.creds.baseUrl);
+    const body = await this.client.fetchJson(
+      `${base}/workspaces/${encodeURIComponent(workspaceId)}/models`,
+    ) as {
       models?: Array<{ id: string; name: string; activeState?: string }>;
     };
-    return (body.models || []).map((m) => ({
-      id: m.id,
-      name: m.name,
-      description: m.activeState,
-    }));
+    const models = body.models ?? [];
+    const summaries: PlanningModelSummary[] = [];
+    const concurrency = 4;
+    for (let offset = 0; offset < models.length; offset += concurrency) {
+      const batch = await Promise.all(models.slice(offset, offset + concurrency).map(async (model) => {
+        const root = `${base}/workspaces/${encodeURIComponent(workspaceId)}/models/${encodeURIComponent(model.id)}`;
+        const moduleBody = await this.client.fetchJson(`${root}/modules`) as {
+          modules?: Array<{ id: string; name: string }>;
+          items?: Array<{ id: string; name: string }>;
+        };
+        const modules = (moduleBody.modules ?? moduleBody.items ?? [])
+          .slice(0, config.ANAPLAN_MAX_MODULES_PER_MODEL);
+        return modules.map((module) => ({
+          id: encodeCompositeModelId(model.id, module.id),
+          name: `${model.name} · ${module.name}`,
+          description: model.activeState,
+        }));
+      }));
+      for (const modelSummaries of batch) {
+        for (const summary of modelSummaries) {
+          summaries.push(summary);
+          this.summaryCache.set(summary.id, summary);
+        }
+      }
+    }
+    return summaries;
   }
 
   async getModelMetadata(modelId: string): Promise<PlanningModelMetadata> {
     if (this.isMockMode()) return mockMetadata(modelId);
+    const cached = this.metadataCache.get(modelId);
+    if (cached) return cached.meta;
 
-    // Live: list modules as a lightweight dimension/measure stub from Anaplan shapes
-    try {
-      const token = await this.getAuthHeader();
-      const workspaceId = String(
-        this.creds.authPublic?.workspace_id || this.creds.authPublic?.workspaceId || "",
-      );
-      const base = this.creds.baseUrl.replace(/\/$/, "");
-      const url = `${base}/workspaces/${workspaceId}/models/${modelId}/modules`;
-      const res = await fetch(url, {
-        headers: { Authorization: token, Accept: "application/json" },
-      });
-      if (res.ok) {
-        const body = (await res.json()) as {
-          modules?: Array<{ id: string; name: string }>;
-        };
-        const modules = body.modules || [];
-        return {
-          modelId,
-          modelName: modelId,
-          dimensions: [
-            {
-              id: "time",
-              source_id: "time",
-              name: "Time",
-              type: "time",
-              members: [],
-              hierarchies: [],
-            },
-            {
-              id: "version",
-              source_id: "version",
-              name: "Version",
-              type: "version",
-              members: [],
-              hierarchies: [],
-            },
-          ],
-          measures: modules.slice(0, 20).map((m) => ({
-            id: m.id,
-            source_id: m.id,
-            name: m.name,
-            aggregation: "sum" as const,
-          })),
-          providerRaw: { provider: "anaplan", modules },
-        };
-      }
-    } catch {
-      /* fall through to stubs */
+    const { modelId: sourceModelId, moduleId } = parseCompositeModelId(modelId);
+    let summary = this.summaryCache.get(modelId);
+    if (!summary) {
+      await this.listModels();
+      summary = this.summaryCache.get(modelId);
     }
-    return {
-      modelId,
-      modelName: modelId,
-      dimensions: [
-        {
-          id: "time",
-          source_id: "time",
-          name: "Time",
-          type: "time",
-          members: [],
-          hierarchies: [],
-        },
-        {
-          id: "version",
-          source_id: "version",
-          name: "Version",
-          type: "version",
-          members: [],
-          hierarchies: [],
-        },
-      ],
-      measures: [],
-      providerRaw: { provider: "anaplan", note: "Configure module/view mapping at import" },
-    };
+    const [modelName, moduleName] = summary?.name.split(" · ") ?? [sourceModelId, moduleId];
+    const built = await buildModuleMetadata(
+      this.client,
+      modelApiRoot(this.creds.baseUrl, sourceModelId),
+      {
+        modelId: sourceModelId,
+        moduleId,
+        modelName,
+        moduleName,
+      },
+    );
+    this.metadataCache.set(modelId, built);
+    return built.meta;
   }
 
   async *getModelData(modelId: string, query: FactQuery): AsyncIterable<FactPage> {
@@ -279,48 +268,53 @@ export class AnaplanConnector implements PlanningConnector {
         rows: [
           {
             measureId: "amount",
-            memberKey: "revenue|q1|budget",
+            memberKey: "q1|budget|revenue",
             value: 1_250_000,
           },
           {
             measureId: "amount",
-            memberKey: "revenue|q2|budget",
+            memberKey: "q2|budget|revenue",
             value: 1_310_000,
           },
           {
             measureId: "amount",
-            memberKey: "cogs|q1|budget",
+            memberKey: "q1|budget|cogs",
             value: 480_000,
           },
         ].slice(0, pageSize),
       };
       return;
     }
-    // Live export-action streaming is configured per connection; empty page until mapped.
-    yield { rows: [] };
+    let cached = this.metadataCache.get(modelId);
+    if (!cached) {
+      await this.getModelMetadata(modelId);
+      cached = this.metadataCache.get(modelId)!;
+    }
+    const { modelId: sourceModelId, moduleId } = parseCompositeModelId(modelId);
+    const aggregates: NonNullable<PlanningModelMetadata["source_aggregates"]> = [];
+    for await (const page of streamFactPages(
+      this.client,
+      modelApiRoot(this.creds.baseUrl, sourceModelId),
+      moduleId,
+      query,
+      cached.meta,
+      cached.columnMaps,
+      {
+        pollIntervalMs: config.ANAPLAN_READ_POLL_INTERVAL_MS,
+        pollTimeoutMs: config.ANAPLAN_READ_POLL_TIMEOUT_MS,
+      },
+      (aggregate) => aggregates.push(aggregate),
+    )) {
+      yield page;
+    }
+    cached.meta.source_aggregates = aggregates;
   }
 
-  private async getAuthHeader(): Promise<string> {
-    const auth = this.creds.auth;
-    if (auth.kind === "api_key") {
-      return `AnaplanAuthToken ${auth.apiKey}`;
-    }
-    const tokenUrl = auth.tokenUrl || "https://auth.anaplan.com/token/authenticate";
-    const basic = Buffer.from(`${auth.clientId}:${auth.clientSecret}`).toString("base64");
-    const res = await fetch(tokenUrl, {
-      method: "POST",
-      headers: {
-        Authorization: `Basic ${basic}`,
-        "Content-Type": "application/json",
-      },
-    });
-    if (!res.ok) throw new Error(`Anaplan token exchange failed (${res.status})`);
-    const body = (await res.json()) as {
-      tokenInfo?: { tokenValue?: string };
-      access_token?: string;
-    };
-    const token = body.tokenInfo?.tokenValue || body.access_token;
-    if (!token) throw new Error("Anaplan token response missing tokenValue");
-    return `AnaplanAuthToken ${token}`;
+  private workspaceId(required = true): string {
+    const value = String(
+      this.creds.authPublic?.workspace_id ?? this.creds.authPublic?.workspaceId ?? "",
+    ).trim();
+    if (required && !value) throw new Error("Anaplan requires auth_public.workspace_id");
+    return value;
   }
 }

@@ -8,16 +8,35 @@ vi.mock("@/lib/api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("@/lib/api")>();
   return {
     ...actual,
-    getActiveModel: vi.fn().mockResolvedValue({ model: null }),
+    getActiveModel: vi.fn().mockResolvedValue({
+      model: {
+        model_definition: {
+          variables: [
+            { id: "revenue_growth", name: "Revenue Growth", dependencies: [], tags: ["input"] },
+            { id: "cogs_pct", name: "COGS %", dependencies: [], tags: ["input"] },
+            {
+              id: "net_income",
+              name: "Net Income",
+              dependencies: ["revenue_growth"],
+              tags: ["output", "pl_metric"],
+            },
+          ],
+        },
+      },
+    }),
     runSensitivity: vi.fn(),
   };
 });
 
-vi.mock("@/lib/metrics", () => ({
-  fmtCurrency: (v: number) => `$${v}`,
-  fmtCurrencySigned: (v: number) => (v < 0 ? `-$${Math.abs(v)}` : `+$${v}`),
-  getCurrencySymbol: () => "$",
-}));
+vi.mock("@/lib/metrics", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/metrics")>();
+  return {
+    ...actual,
+    fmtCurrency: (v: number) => `$${v}`,
+    fmtCurrencySigned: (v: number) => (v < 0 ? `-$${Math.abs(v)}` : `+$${v}`),
+    getCurrencySymbol: () => "$",
+  };
+});
 
 vi.mock("recharts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("recharts")>();
@@ -68,6 +87,11 @@ describe("TornadoChart", () => {
     const user = userEvent.setup();
     render(<TornadoChart scenarioId="sc-1" onClose={() => {}} />);
 
+    // Await async default target-metric selection from getActiveModel
+    await waitFor(() => {
+      expect(screen.getByRole("option", { name: "Net Income", selected: true })).toBeInTheDocument();
+    });
+
     await user.click(screen.getByRole("button", { name: /run analysis/i }));
 
     await waitFor(() => {
@@ -77,5 +101,6 @@ describe("TornadoChart", () => {
 
     expect(screen.getByText(/Variable Impact Ranking/i)).toBeInTheDocument();
     expect(screen.getByRole("table")).toBeInTheDocument();
+    expect(runSensitivity).toHaveBeenCalledWith("sc-1", "net_income", 20);
   });
 });

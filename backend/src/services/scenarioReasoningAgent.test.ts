@@ -245,3 +245,42 @@ test("describeCostRevenueComposition includes revenue and cost lines", async () 
   assert.match(text!, /COGS|cost/i);
   assert.match(text!, /40\.0%/);
 });
+
+test("follow_up_questions recommendations respect server gate when present", async () => {
+  const { normalizeFollowUpQuestions, RECOMMENDATION_MIN_CONFIDENCE } = await import("./parser.js");
+  const qs = normalizeFollowUpQuestions([
+    {
+      id: "impact",
+      question: "Expected COGS impact?",
+      options: [
+        { label: "+5%", value: "cogs_5" },
+        { label: "+10%", value: "cogs_10" },
+      ],
+      recommendation: {
+        value: "cogs_10",
+        rationale: "cost_of_revenue feeds gross_profit",
+        confidence: 0.8,
+        evidence: [{ kind: "model", source: "gross_profit = f(revenue, cost_of_revenue)" }],
+      },
+    },
+    {
+      id: "weak",
+      question: "Guess?",
+      options: [{ label: "x", value: "x" }],
+      recommendation: {
+        value: "x",
+        rationale: "no evidence",
+        confidence: 0.9,
+        evidence: [],
+      },
+    },
+  ]);
+  for (const q of qs) {
+    if (q.recommendation) {
+      assert.ok(q.recommendation.confidence >= RECOMMENDATION_MIN_CONFIDENCE);
+      assert.ok(q.recommendation.evidence.length >= 1);
+    }
+  }
+  assert.ok(qs.find((q) => q.id === "impact")?.recommendation);
+  assert.strictEqual(qs.find((q) => q.id === "weak")?.recommendation, undefined);
+});

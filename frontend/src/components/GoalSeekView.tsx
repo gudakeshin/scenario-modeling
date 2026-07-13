@@ -3,7 +3,7 @@
 import { useState, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { runGoalSeek, getActiveModel, applyLeverValue, type GoalSeekResult } from "@/lib/api";
-import { fmtCurrency } from "@/lib/metrics";
+import { fmtCurrency, pickDefaultTargetMetric } from "@/lib/metrics";
 
 interface GoalSeekViewProps {
   scenarioId: string;
@@ -18,9 +18,10 @@ export function GoalSeekView({ scenarioId, onClose, onMinimize }: GoalSeekViewPr
   const [error, setError] = useState<string | null>(null);
   const [applyMsg, setApplyMsg] = useState<string | null>(null);
   const [variableId, setVariableId] = useState("");
-  const [targetMetric, setTargetMetric] = useState("net_income");
+  const [targetMetric, setTargetMetric] = useState("");
   const [targetValue, setTargetValue] = useState("");
   const [leverOptions, setLeverOptions] = useState<Array<{ id: string; name: string }>>([]);
+  const [metricOptions, setMetricOptions] = useState<Array<{ id: string; name: string }>>([]);
 
   const loadLevers = useCallback(async () => {
     try {
@@ -30,10 +31,18 @@ export function GoalSeekView({ scenarioId, onClose, onMinimize }: GoalSeekViewPr
         .map((v) => ({ id: v.id, name: v.name || v.id }));
       setLeverOptions(vars);
       if (!variableId && vars[0]) setVariableId(vars[0].id);
+      const outputs = (model?.model_definition?.variables ?? [])
+        .filter((v) => v.tags?.includes("pl_metric") || v.tags?.includes("output") || (v.dependencies?.length ?? 0) > 0)
+        .map((v) => ({ id: v.id, name: v.name || v.id }));
+      setMetricOptions(outputs);
+      if (!targetMetric) {
+        setTargetMetric(pickDefaultTargetMetric(outputs.map((o) => o.id), "net_income"));
+      }
     } catch {
       /* model may be xlsx schema — leave blank for manual entry */
+      if (!targetMetric) setTargetMetric("ebitda");
     }
-  }, [variableId]);
+  }, [variableId, targetMetric]);
 
   const run = useCallback(async () => {
     const tv = Number(targetValue);
@@ -139,11 +148,24 @@ export function GoalSeekView({ scenarioId, onClose, onMinimize }: GoalSeekViewPr
         </label>
         <label className="text-xs text-[var(--text-secondary)]">
           Target metric
-          <input
-            className="mt-1 w-full text-sm bg-[var(--card-bg)] border border-[var(--border)] rounded px-2 py-1.5"
-            value={targetMetric}
-            onChange={(e) => setTargetMetric(e.target.value)}
-          />
+          {metricOptions.length > 0 ? (
+            <select
+              className="mt-1 w-full text-sm bg-[var(--card-bg)] border border-[var(--border)] rounded px-2 py-1.5"
+              value={targetMetric}
+              onChange={(e) => setTargetMetric(e.target.value)}
+            >
+              {metricOptions.map((v) => (
+                <option key={v.id} value={v.id}>{v.name}</option>
+              ))}
+            </select>
+          ) : (
+            <input
+              className="mt-1 w-full text-sm bg-[var(--card-bg)] border border-[var(--border)] rounded px-2 py-1.5"
+              value={targetMetric}
+              onChange={(e) => setTargetMetric(e.target.value)}
+              placeholder="ebitda"
+            />
+          )}
         </label>
         <label className="text-xs text-[var(--text-secondary)]">
           Target value

@@ -14,7 +14,7 @@ import {
 import { runSensitivity, runTwoWaySensitivity, getActiveModel, type SensitivityResult, type TornadoBar, type TwoWayGridResult } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
 import { ChartDataTable } from "./ChartDataTable";
-import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol } from "@/lib/metrics";
+import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol, pickDefaultTargetMetric, metricLabel } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface TornadoChartProps {
@@ -24,7 +24,7 @@ interface TornadoChartProps {
 }
 
 function labelFromId(id: string): string {
-  return id.split("_").map((w) => w.charAt(0).toUpperCase() + w.slice(1)).join(" ");
+  return metricLabel(id);
 }
 
 interface TornadoDatum {
@@ -62,12 +62,13 @@ export function TornadoChart({ scenarioId, onClose, onMinimize }: TornadoChartPr
   const [mode, setMode] = useState<"tornado" | "two-way">("tornado");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [targetMetric, setTargetMetric] = useState("net_income");
+  const [targetMetric, setTargetMetric] = useState("");
   const [swingPct, setSwingPct] = useState(20);
   const [metricOptions, setMetricOptions] = useState<{ value: string; label: string }[]>([]);
   const [varOptions, setVarOptions] = useState<{ value: string; label: string }[]>([]);
   const [varA, setVarA] = useState("");
   const [varB, setVarB] = useState("");
+  const [metricsReady, setMetricsReady] = useState(false);
 
   useEffect(() => {
     getActiveModel().then(({ model }) => {
@@ -75,11 +76,14 @@ export function TornadoChart({ scenarioId, onClose, onMinimize }: TornadoChartPr
         const opts = model.model_definition.variables
           .filter((v) => v.tags?.includes("pl_metric") || v.tags?.includes("output"))
           .map((v) => ({ value: v.id, label: v.name || labelFromId(v.id) }));
+        const ids = opts.map((o) => o.value);
+        const picked = pickDefaultTargetMetric(ids, "net_income");
         if (opts.length > 0) {
           setMetricOptions(opts);
-          if (!opts.find((o) => o.value === targetMetric) && opts[0]) {
-            setTargetMetric(opts[0].value);
-          }
+          setTargetMetric(picked);
+        } else {
+          setMetricOptions([{ value: picked, label: labelFromId(picked) }]);
+          setTargetMetric(picked);
         }
         const inputs = model.model_definition.variables
           .filter((v) => !v.dependencies?.length)
@@ -89,12 +93,15 @@ export function TornadoChart({ scenarioId, onClose, onMinimize }: TornadoChartPr
           setVarA(inputs[0].value);
           setVarB(inputs[1].value);
         }
+      } else {
+        setTargetMetric("ebitda");
+        setMetricOptions([{ value: "ebitda", label: "EBITDA" }]);
       }
-      if (metricOptions.length === 0) {
-        setMetricOptions([{ value: "net_income", label: "Net Income" }]);
-      }
+      setMetricsReady(true);
     }).catch(() => {
-      setMetricOptions([{ value: "net_income", label: "Net Income" }]);
+      setTargetMetric("ebitda");
+      setMetricOptions([{ value: "ebitda", label: "EBITDA" }]);
+      setMetricsReady(true);
     });
   }, []);
 

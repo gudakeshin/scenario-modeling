@@ -21,8 +21,9 @@ import { RoleManagement } from "./RoleManagement";
 import { FollowUpQuestions } from "./FollowUpQuestions";
 import { DocumentPanel } from "./DocumentPanel";
 import { DocumentManager } from "./DocumentManager";
+import { FidelityReport } from "./FidelityReport";
 import { AnalysisModal } from "./AnalysisModal";
-import { getOnboardingStatus } from "@/lib/api";
+import { getOnboardingStatus, type FollowUpAnswer } from "@/lib/api";
 import { setCurrency } from "@/lib/metrics";
 import { useUiStore } from "@/stores/uiStore";
 
@@ -30,6 +31,7 @@ const CARD_COLORS: Record<string, string> = {
   review: "bg-accent", comparison: "bg-[var(--info)]", monteCarlo: "bg-accent",
   tornado: "bg-[var(--warning)]", attribution: "bg-[var(--success)]", driverTree: "bg-accent",
   goalSeek: "bg-[var(--info)]",
+  fidelity: "bg-[var(--warning)]",
   versions: "bg-accent",
   actuals: "bg-[var(--success)]",
   whatIf: "bg-[var(--warning)]",
@@ -45,7 +47,7 @@ interface AnalysisPanelStripProps {
   scenarioId?: string | null;
   isLoading: boolean;
   onApproved: () => void | Promise<void>;
-  onFollowUpAnswers: (answers: { question_id: string; answer: string }[]) => void | Promise<void>;
+  onFollowUpAnswers: (answers: FollowUpAnswer[]) => void | Promise<void>;
   onTemplateCloned: (newScenarioId: string) => void;
 }
 
@@ -58,7 +60,7 @@ export function AnalysisPanelStrip({
 }: AnalysisPanelStripProps) {
   const {
     showReview, showComparison, showAudit, showMonteCarlo, showTornado,
-    showAttribution, showDriverTree, showGoalSeek,
+    showAttribution, showDriverTree, showGoalSeek, showFidelity,
     showVersionHistory, showActualsCompare, showLiveWhatIf,
     showTemplates, showInsights, showPeriods, showCharts, showSharing,
     showRoles, showDocuments, showDocManager,
@@ -66,6 +68,7 @@ export function AnalysisPanelStrip({
     refineKey, expandedPanel,
     setShowReview, setShowComparison, setShowAudit, setShowMonteCarlo,
     setShowTornado, setShowAttribution, setShowDriverTree, setShowGoalSeek,
+    setShowFidelity,
     setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
     setShowTemplates, setShowInsights, setShowPeriods,
     setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
@@ -89,6 +92,7 @@ export function AnalysisPanelStrip({
     if (showAttribution && scenarioId) cards.push({ id: "attribution", title: "Attribution", close: () => setShowAttribution(false) });
     if (showDriverTree && scenarioId) cards.push({ id: "driverTree", title: "Driver Tree", close: () => setShowDriverTree(false) });
     if (showGoalSeek && scenarioId) cards.push({ id: "goalSeek", title: "Goal Seek", close: () => setShowGoalSeek(false) });
+    if (showFidelity && scenarioId) cards.push({ id: "fidelity", title: "Fidelity", close: () => setShowFidelity(false) });
     if (showVersionHistory && scenarioId) cards.push({ id: "versions", title: "Versions", close: () => setShowVersionHistory(false) });
     if (showActualsCompare && scenarioId) cards.push({ id: "actuals", title: "Actuals", close: () => setShowActualsCompare(false) });
     if (showLiveWhatIf && scenarioId) cards.push({ id: "whatIf", title: "What-If", close: () => setShowLiveWhatIf(false) });
@@ -99,18 +103,21 @@ export function AnalysisPanelStrip({
     if (showTemplates) cards.push({ id: "templates", title: "Templates", close: () => setShowTemplates(false) });
     if (showRoles) cards.push({ id: "roles", title: "Roles", close: () => setShowRoles(false) });
     if (showInsights && scenarioId) cards.push({ id: "insights", title: "Business Insights", close: () => { setShowInsights(false); setPreloadedInsight(null); } });
-    if (pendingQuestions && pendingQuestions.length > 0 && scenarioId) cards.push({ id: "followUp", title: "Refine Scenario", close: () => setPendingQuestions(null) });
+    // Follow-up card first among interactive panels when present (visual priority)
+    if (pendingQuestions && pendingQuestions.length > 0 && scenarioId) {
+      cards.unshift({ id: "followUp", title: "Refine Scenario", close: () => setPendingQuestions(null) });
+    }
     if (showDocuments) cards.push({ id: "documents", title: "Documents", close: () => setShowDocuments(false) });
     if (showDocManager) cards.push({ id: "docManager", title: "Document Manager", close: () => setShowDocManager(false) });
     return cards;
   }, [
-    showReview, showComparison, showMonteCarlo, showTornado, showAttribution, showDriverTree, showGoalSeek,
+    showReview, showComparison, showMonteCarlo, showTornado, showAttribution, showDriverTree, showGoalSeek, showFidelity,
     showVersionHistory, showActualsCompare, showLiveWhatIf,
     showPeriods, showCharts,
     showSharing, showAudit, showTemplates, showRoles, showInsights, pendingQuestions,
     showDocuments, showDocManager, scenarioId, periodData, chartData,
     setShowReview, setShowComparison, setShowMonteCarlo, setShowTornado, setShowAttribution,
-    setShowDriverTree, setShowGoalSeek, setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
+    setShowDriverTree, setShowGoalSeek, setShowFidelity, setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
     setShowPeriods,
     setShowCharts, setShowSharing, setShowAudit, setShowTemplates, setShowRoles,
     setShowInsights, setPreloadedInsight, setPendingQuestions, setShowDocuments, setShowDocManager,
@@ -140,6 +147,8 @@ export function AnalysisPanelStrip({
         return sid ? <DriverTreeView scenarioId={sid} onClose={() => closePanel("driverTree", () => setShowDriverTree(false))} onMinimize={collapseModal} /> : null;
       case "goalSeek":
         return sid ? <GoalSeekView scenarioId={sid} onClose={() => closePanel("goalSeek", () => setShowGoalSeek(false))} onMinimize={collapseModal} /> : null;
+      case "fidelity":
+        return sid ? <FidelityReport scenarioId={sid} onClose={() => closePanel("fidelity", () => setShowFidelity(false))} onMinimize={collapseModal} /> : null;
       case "versions":
         return sid ? <VersionHistoryPanel scenarioId={sid} onClose={() => closePanel("versions", () => setShowVersionHistory(false))} onMinimize={collapseModal} /> : null;
       case "actuals":
@@ -165,7 +174,7 @@ export function AnalysisPanelStrip({
       case "documents":
         return <DocumentPanel onClose={() => closePanel("documents", () => setShowDocuments(false))} onMinimize={collapseModal} />;
       case "docManager":
-        return <DocumentManager onClose={() => closePanel("docManager", () => setShowDocManager(false))} onMinimize={collapseModal} onContextBuilt={() => { getOnboardingStatus().then((s) => { setOnboardingStatus(s); if (s.currency) setCurrency(s.currency, s.currency_unit); }).catch(() => {}); }} />;
+        return <DocumentManager onClose={() => closePanel("docManager", () => setShowDocManager(false))} onMinimize={collapseModal} onContextBuilt={() => { getOnboardingStatus().then((s) => { setOnboardingStatus(s); if (s.currency) setCurrency(s.currency, s.currency_unit ?? undefined); }).catch(() => {}); }} />;
       default:
         return null;
     }

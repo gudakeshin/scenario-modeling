@@ -23,6 +23,12 @@ import {
 import { describeContextForLLM as describeCompanyContext } from "./contextEngine.js";
 import { getInputVariables, type ModelDefinition } from "../models/registry.js";
 import { logger } from "../logger.js";
+import { toTypedDelta } from "./parser.js";
+import {
+  followUpQuestionSchema,
+  normalizeFollowUpQuestions,
+  type FollowUpQuestion,
+} from "./followUpQuestions.js";
 
 export interface AgentParameterProvenance {
   citation_index?: number;
@@ -100,6 +106,7 @@ const proposeParametersSchema = z.object({
     .default([]),
   confidence: z.number().min(0).max(1).default(0.5),
   clarification_needed: z.string().nullable().optional(),
+  follow_up_questions: z.array(followUpQuestionSchema).nullable().optional(),
 });
 
 export type ProposeParametersResult = z.infer<typeof proposeParametersSchema>;
@@ -133,6 +140,7 @@ export interface ScenarioReasoningResult {
   citations: ProposeParametersResult["citations"];
   confidence: number;
   clarification_needed?: string;
+  follow_up_questions?: FollowUpQuestion[];
   agent_trace: AgentTraceStep[];
   stopped_reason: string;
   error?: string;
@@ -300,7 +308,7 @@ export function filterParametersToInputLevers<
  */
 async function resolveLeverAbsolutesForConstraints(
   scenarioId: string | undefined,
-  params: Array<{ variableId: string; value: number; delta_type: "percent" | "absolute" }>,
+  params: Array<{ variableId: string; value: number; delta_type: "percent" | "absolute" | "additive" }>,
 ): Promise<Record<string, number>> {
   if (!scenarioId || params.length === 0) return {};
   try {
@@ -438,7 +446,7 @@ function buildTools(opts: {
             z.object({
               variable_id: z.string(),
               value: z.number(),
-              delta_type: z.enum(["percent", "absolute"]).default("percent"),
+              delta_type: z.enum(["percent", "absolute", "additive"]).default("percent"),
             }),
           )
           .min(1),
@@ -467,7 +475,11 @@ function buildTools(opts: {
       const overrideParams = params.map((p) => ({
         variableId: p.variable_id,
         value: p.value,
-        delta_type: (p.delta_type === "absolute" ? "absolute" : "percent") as "percent" | "absolute",
+        delta_type: (p.delta_type === "absolute"
+          ? "absolute"
+          : p.delta_type === "additive"
+            ? "additive"
+            : "percent") as "percent" | "absolute" | "additive",
       }));
 
       const absoluteProbe = await resolveLeverAbsolutesForConstraints(scenarioId, overrideParams);
@@ -588,6 +600,7 @@ Rules:
 - Never override calculated/output metrics — only input levers from: ${leverList}
 - Prefer percent or absolute deltas grounded in research; attach provenance on every lever.
 - If constraints block a lever, adjust or explain in clarification_needed.
+- When the question remains ambiguous, include follow_up_questions (1–3 structured clarifying questions with options). Attach recommendation {value, rationale, confidence, evidence[]} ONLY when get_model_schema dependencies, search_documents evidence, or business context support a most-likely answer — each evidence item must cite its source. If evidence is insufficient, set question_type to "open" with no recommendation so the user can answer freely. Never invent model relationships or document quotes.
 - Be concise in causal_chain steps; use kinds: decomposition, research, levers, preview.
 - Ground assumptions in the company's industry and cost-revenue composition from get_business_context.
 - Call run_what_if with the final lever set before propose_parameters so preview and proposal stay aligned.`;
@@ -644,13 +657,14 @@ Investigate and call propose_parameters when ready.`;
     // absolute-value floor/ceiling bounds, not raw magnitude comparisons).
     const overrideParams = kept
       .filter((p) => p.suggested_variable_id)
-      .map((p) => ({
-        variableId: p.suggested_variable_id!,
-        value: p.magnitude,
-        delta_type: (p.unit === "absolute" || p.direction === "set"
-          ? "absolute"
-          : "percent") as "percent" | "absolute",
-      }));
+      .map((p) => {
+        const typed = toTypedDelta(p);
+        return {
+          variableId: p.suggested_variable_id!,
+          value: typed.value,
+          delta_type: typed.delta_type,
+        };
+      });
 
     const absoluteProbe = await resolveLeverAbsolutesForConstraints(scenarioId, overrideParams);
     const validation = validateAgainstConstraints(absoluteProbe, constraints);
@@ -799,6 +813,10 @@ Investigate and call propose_parameters when ready.`;
       citations: proposed.citations,
       confidence: proposed.confidence,
       clarification_needed: clarification,
+      follow_up_questions: (() => {
+        const qs = normalizeFollowUpQuestions(proposed.follow_up_questions ?? []);
+        return qs.length > 0 ? qs : undefined;
+      })(),
       agent_trace: loop.steps,
       stopped_reason: loop.stopped_reason,
       readiness,

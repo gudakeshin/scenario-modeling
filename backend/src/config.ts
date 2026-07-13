@@ -83,6 +83,10 @@ const envSchema = z.object({
   SAC_DEFAULT_PAGE_SIZE: z.coerce.number().int().positive().default(1000),
   SAC_MAX_FACT_PAGES: z.coerce.number().int().positive().default(10_000),
   SAC_HTTP_MAX_RETRIES: z.coerce.number().int().nonnegative().default(4),
+  ANAPLAN_HTTP_MAX_RETRIES: z.coerce.number().int().nonnegative().default(4),
+  ANAPLAN_MAX_MODULES_PER_MODEL: z.coerce.number().int().positive().default(100),
+  ANAPLAN_READ_POLL_INTERVAL_MS: z.coerce.number().int().positive().default(1500),
+  ANAPLAN_READ_POLL_TIMEOUT_MS: z.coerce.number().int().positive().default(600_000),
   /** Absolute / relative absurdity threshold (%) for simulation notices. */
   ABSURDITY_THRESHOLD_PCT: z.coerce.number().positive().default(200),
   /** Cross-foot / identity-repair relative tolerance (fraction, e.g. 0.01 = 1%). */
@@ -98,6 +102,11 @@ const envSchema = z.object({
   AGENT_MAX_STEPS: z.coerce.number().int().positive().default(8),
   AGENT_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
   GOAL_SEEK_MAX_ITERATIONS: z.coerce.number().int().positive().default(40),
+  /** When true, residual invariant violations invoke the LLM accounting-fidelity agent. */
+  FIDELITY_AGENT_ENABLED: z
+    .string()
+    .optional()
+    .transform((v) => v === "1" || v?.toLowerCase() === "true"),
   SHOWCASE_AGENT_ENABLED: z
     .string()
     .optional()

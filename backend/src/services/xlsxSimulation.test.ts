@@ -65,15 +65,43 @@ test("typed deltas: decrease flips the sign (old code applied cuts as increases)
   assert.deepStrictEqual(toTypedDelta(param({ direction: "increase" })), { value: 10, delta_type: "percent" });
 });
 
-test("typed deltas: 'set' and non-percent units are absolute", () => {
-  assert.deepStrictEqual(toTypedDelta(param({ direction: "set", magnitude: 500 })), { value: 500, delta_type: "absolute" });
-  assert.deepStrictEqual(toTypedDelta(param({ unit: "currency", magnitude: 250 })), { value: 250, delta_type: "absolute" });
+test("typed deltas: '%' / pct / bps count as percent (not absolute SET)", () => {
+  assert.deepStrictEqual(toTypedDelta(param({ unit: "%" })), { value: 10, delta_type: "percent" });
+  assert.deepStrictEqual(toTypedDelta(param({ unit: "pct" })), { value: 10, delta_type: "percent" });
+  assert.deepStrictEqual(toTypedDelta(param({ unit: "basis_points", magnitude: 50 })), { value: 0.5, delta_type: "percent" });
 });
 
-test("typed deltas: >100% and negative percents resolve correctly", () => {
+test("typed deltas: direction wins over a contradictory magnitude sign", () => {
+  assert.deepStrictEqual(
+    toTypedDelta(param({ direction: "increase", magnitude: -8 })),
+    { value: 8, delta_type: "percent" },
+  );
+  assert.deepStrictEqual(
+    toTypedDelta(param({ direction: "decrease", magnitude: -8 })),
+    { value: -8, delta_type: "percent" },
+  );
+});
+
+test("typed deltas: 'set' is absolute; currency increase/decrease is additive", () => {
+  assert.deepStrictEqual(toTypedDelta(param({ direction: "set", magnitude: 500 })), { value: 500, delta_type: "absolute" });
+  assert.deepStrictEqual(
+    toTypedDelta(param({ unit: "currency", direction: "increase", magnitude: 250 })),
+    { value: 250, delta_type: "additive" },
+  );
+  assert.deepStrictEqual(
+    toTypedDelta(param({ unit: "currency", direction: "decrease", magnitude: 250 })),
+    { value: -250, delta_type: "additive" },
+  );
+  // Bare currency without direction remains absolute SET (legacy)
+  assert.deepStrictEqual(toTypedDelta(param({ unit: "currency", magnitude: 250, direction: "" })), { value: 250, delta_type: "absolute" });
+});
+
+test("typed deltas: percent and additive resolve correctly", () => {
   assert.strictEqual(resolveOverride(200, { value: 150, delta_type: "percent" }), 500);
   assert.strictEqual(resolveOverride(200, { value: -10, delta_type: "percent" }), 180);
   assert.strictEqual(resolveOverride(200, { value: 42, delta_type: "absolute" }), 42);
+  assert.strictEqual(resolveOverride(200, { value: 50, delta_type: "additive" }), 250);
+  assert.strictEqual(resolveOverride(200, { value: -30, delta_type: "additive" }), 170);
 });
 
 // ── XLSX pipeline ──

@@ -70,7 +70,7 @@ export interface DimensionalOverride {
   /** dimId → memberId; missing dims broadcast; non-leaf applies to leaf subtree. */
   memberScope?: Record<string, string>;
   value: number;
-  delta_type: "percent" | "absolute";
+  delta_type: "percent" | "absolute" | "additive";
 }
 
 export interface DimensionalEvalResult {

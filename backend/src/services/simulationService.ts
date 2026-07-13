@@ -24,6 +24,14 @@ import {
   getScenarioContext,
   validateAgainstConstraints,
 } from "./scenarioContextService.js";
+import {
+  attemptDeterministicNormalization,
+  buildFidelityBlock,
+  fidelityNotices,
+  type FidelityBlock,
+  type InvariantViolation,
+} from "./financialInvariants.js";
+import { reviewModelFidelity } from "./accountingFidelityAgent.js";
 
 export interface ScenarioParameterRow {
   mapped_variable_id: string;
@@ -56,6 +64,10 @@ export interface SimulationOutput {
   formula_error_metrics?: FormulaErrorMetric[];
   status?: "completed" | "failed";
   failure_reason?: string;
+  fidelity?: FidelityBlock;
+  /** Bound input levers available for what-if (preview only). */
+  levers?: Array<{ id: string; name: string; base: number }>;
+  ignored_overrides?: string[];
   dimensional?: {
     dimensions: Array<{ id: string; name: string; type: string }>;
     member_catalog: Record<string, Record<string, string>>;
@@ -167,6 +179,7 @@ function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise
 function absurdityWarnings(
   basePl: Record<string, number>,
   scenarioPl: Record<string, number>,
+  overrides: Array<{ variableId: string; value: number; delta_type: string }> = [],
 ): string[] {
   const threshold = config.ABSURDITY_THRESHOLD_PCT ?? 200;
   const warnings: string[] = [];
@@ -181,6 +194,124 @@ function absurdityWarnings(
       );
     }
   }
+  warnings.push(...economicConsistencyWarnings(basePl, scenarioPl, overrides));
+  return warnings;
+}
+
+/**
+ * Deterministic fidelity guard — always runs. Optionally invokes the LLM
+ * accounting agent when residual violations remain and FIDELITY_AGENT_ENABLED.
+ */
+async function applyFidelityGuard(
+  pl: Record<string, number>,
+  basePl: Record<string, number>,
+  notices: string[],
+  context?: { scenarioId?: string; modelSummary?: string },
+): Promise<{ pl: Record<string, number>; fidelity: FidelityBlock; agentFindings?: InvariantViolation[] }> {
+  const { pl: normalized, applied, residualViolations } = attemptDeterministicNormalization(pl);
+  Object.assign(pl, normalized);
+  notices.push(...fidelityNotices(applied, residualViolations));
+
+  let residual = residualViolations;
+  if (residual.length > 0 && config.FIDELITY_AGENT_ENABLED) {
+    try {
+      const agentResult = await reviewModelFidelity(
+        { pl: normalized, basePl, residualViolations: residual, modelSummary: context?.modelSummary },
+        { applyGatedFixes: true },
+      );
+      if (agentResult.appliedPl) {
+        Object.assign(pl, agentResult.appliedPl);
+        residual = agentResult.residualViolations;
+        notices.push(...agentResult.notices);
+      } else if (agentResult.notices.length) {
+        notices.push(...agentResult.notices);
+      }
+    } catch (e) {
+      logger.warn(
+        `[Simulation] Fidelity agent skipped: ${(e as Error).message}`,
+      );
+    }
+  }
+
+  return {
+    pl,
+    fidelity: buildFidelityBlock(applied, residual),
+    agentFindings: residual,
+  };
+}
+
+const COST_LEVER_RE = /cost|cogs|raw_material|materials|opex|expense|overhead|labour|labor/i;
+const MARGIN_OR_PROFIT_RE = /margin|gross_profit|ebitda$|^ebit$|operating_income|operating_profit|net_income|net_profit|profit_before_tax/i;
+
+/**
+ * Soft accounting check: cost levers moving up should not lift margins/profits
+ * (and cost cuts should not compress them). Catches wrong-sign / absolute-SET bugs.
+ */
+export function economicConsistencyWarnings(
+  basePl: Record<string, number>,
+  scenarioPl: Record<string, number>,
+  overrides: Array<{ variableId: string; value: number; delta_type: string }>,
+): string[] {
+  const costUp = overrides.filter(
+    (o) => COST_LEVER_RE.test(o.variableId) && o.delta_type !== "absolute" && o.value > 0,
+  );
+  const costDown = overrides.filter(
+    (o) => COST_LEVER_RE.test(o.variableId) && o.delta_type !== "absolute" && o.value < 0,
+  );
+  // Absolute SET above typical "small mistaken percent" is harder; still flag when
+  // a cost-like absolute SET is tiny vs a large base margin move later via heuristics below.
+  if (costUp.length === 0 && costDown.length === 0) {
+    // Absolute SET of a cost leaf to a small number often inverts economics — detect via
+    // cost-like ids with absolute delta_type when profits/margins rise sharply.
+    const absCostSets = overrides.filter(
+      (o) => COST_LEVER_RE.test(o.variableId) && o.delta_type === "absolute",
+    );
+    if (absCostSets.length === 0) return [];
+  }
+
+  const warnings: string[] = [];
+  const eps = 1e-6;
+
+  const risingOutcomes = Object.keys(scenarioPl).filter((id) => {
+    if (!MARGIN_OR_PROFIT_RE.test(id)) return false;
+    const base = basePl[id];
+    const scen = scenarioPl[id];
+    if (base == null || scen == null) return false;
+    return scen > base + Math.max(eps, Math.abs(base) * 0.001);
+  });
+  const fallingOutcomes = Object.keys(scenarioPl).filter((id) => {
+    if (!MARGIN_OR_PROFIT_RE.test(id)) return false;
+    const base = basePl[id];
+    const scen = scenarioPl[id];
+    if (base == null || scen == null) return false;
+    return scen < base - Math.max(eps, Math.abs(base) * 0.001);
+  });
+
+  if (costUp.length > 0 && risingOutcomes.length > 0) {
+    warnings.push(
+      `Accounting check: cost lever(s) ${costUp.map((o) => o.variableId).join(", ")} increased, ` +
+        `but ${risingOutcomes.join(", ")} rose vs base — expected margins/profits to fall. ` +
+        `Verify the lever mapping and whether the change was applied as percent vs absolute SET.`,
+    );
+  }
+  if (costDown.length > 0 && fallingOutcomes.length > 0) {
+    warnings.push(
+      `Accounting check: cost lever(s) ${costDown.map((o) => o.variableId).join(", ")} decreased, ` +
+        `but ${fallingOutcomes.join(", ")} fell vs base — expected margins/profits to rise.`,
+    );
+  }
+
+  // Absolute SET on a cost line that collapses the leaf (common %→absolute bug)
+  for (const o of overrides) {
+    if (!COST_LEVER_RE.test(o.variableId) || o.delta_type !== "absolute") continue;
+    if (!(o.value >= 0 && o.value <= 100) || risingOutcomes.length === 0) continue;
+    warnings.push(
+      `Accounting check: ${o.variableId} was applied as an absolute SET to ${o.value} ` +
+        `(not a percent change). If you meant +${o.value}%, remapping as percent; ` +
+        `a small absolute SET typically collapses costs and inflates margins.`,
+    );
+  }
+
   return warnings;
 }
 
@@ -229,8 +360,31 @@ export async function previewSimulationForScenario(
 ): Promise<SimulationOutput> {
   const resolved = await getEvaluableModelForScenario(scenarioId);
   const overrides = overrideParams ?? (await loadScenarioOverrides(scenarioId));
-  const { absolute } = resolveOverridesToAbsolute(resolved.model, overrides);
+  const { absolute, unresolved } = resolveOverridesToAbsolute(resolved.model, overrides);
   await enforceConstraints(scenarioId, absolute);
+
+  const leverList = (() => {
+    const seen = new Set<string>();
+    const out: Array<{ id: string; name: string; base: number }> = [];
+    for (const i of resolved.model.inputs) {
+      if (seen.has(i.id)) continue;
+      seen.add(i.id);
+      out.push({ id: i.id, name: i.name, base: i.base });
+    }
+    return out;
+  })();
+  const inputIds = new Set(leverList.map((l) => l.id));
+  const notices: string[] = [...unresolvedNotices(unresolved)];
+
+  const unknownOverrides = overrides
+    .map((o) => o.variableId)
+    .filter((id) => id && !inputIds.has(id));
+  if (unknownOverrides.length > 0) {
+    notices.push(
+      `These overrides are not model input levers and will not affect the preview: ${[...new Set(unknownOverrides)].join(", ")}. ` +
+        `Map parameters to input levers (e.g. material_cost_of_nsp), not calculated outputs.`,
+    );
+  }
 
   if (resolved.source === "external_model") {
     const model = resolved.model as DimensionalModel;
@@ -249,6 +403,8 @@ export async function previewSimulationForScenario(
       period_count: 1,
       granularity: "quarterly",
       simulation_mode: "external_model",
+      levers: leverList,
+      ...(notices.length ? { notices } : {}),
       ...(errors.length ? { formula_error_metrics: errors } : {}),
       status: "completed",
     };
@@ -258,6 +414,23 @@ export async function previewSimulationForScenario(
     const runtime = resolved.model;
     const baseOut = runtime.evaluate({});
     const scenarioOut = runtime.evaluate(absolute);
+    const ignored =
+      "lastIgnoredOverrides" in runtime &&
+      Array.isArray((runtime as { lastIgnoredOverrides: string[] }).lastIgnoredOverrides)
+        ? (runtime as { lastIgnoredOverrides: string[] }).lastIgnoredOverrides
+        : unknownOverrides;
+    if (ignored.length > 0) {
+      notices.push(
+        `Ignored non-lever overrides (XLSX only applies bound input cells): ${[...new Set(ignored)].join(", ")}`,
+      );
+    }
+    const runtimeErrors =
+      "lastEvaluationErrors" in runtime &&
+      Array.isArray((runtime as { lastEvaluationErrors: string[] }).lastEvaluationErrors)
+        ? (runtime as { lastEvaluationErrors: string[] }).lastEvaluationErrors
+        : [];
+    if (runtimeErrors.length > 0) notices.push(...runtimeErrors);
+
     const pl: Record<string, number> = {};
     const errors: FormulaErrorMetric[] = [];
     const { coreFailed } = collectFiniteMetrics(
@@ -268,6 +441,7 @@ export async function previewSimulationForScenario(
     if (coreFailed) {
       throw new SimulationFiniteError("Preview failed: core metrics non-finite", errors);
     }
+    void baseOut;
     return {
       pl,
       variables: { ...pl },
@@ -275,6 +449,9 @@ export async function previewSimulationForScenario(
       period_count: 1,
       granularity: "quarterly",
       simulation_mode: "xlsx_cell_graph",
+      levers: leverList,
+      ignored_overrides: [...new Set(ignored)],
+      ...(notices.length ? { notices } : {}),
       ...(errors.length ? { formula_error_metrics: errors } : {}),
       status: "completed",
     };
@@ -295,6 +472,8 @@ export async function previewSimulationForScenario(
     period_count: 1,
     granularity: "quarterly",
     simulation_mode: "formula_dag",
+    levers: leverList,
+    ...(notices.length ? { notices } : {}),
     ...(errors.length ? { formula_error_metrics: errors } : {}),
     status: "completed",
   };
@@ -406,9 +585,14 @@ async function _runDimensionalSimulation(
     breakdowns,
   };
 
-  const warnings = absurdityWarnings(basePl, pl);
+  const warnings = absurdityWarnings(basePl, pl, overrides);
   const notices: string[] = [];
   if (def.build_warnings?.length) notices.push(...def.build_warnings);
+
+  const fidelityResult = await applyFidelityGuard(pl, basePl, notices, {
+    scenarioId,
+    modelSummary: `external_model ${def.model_version}`,
+  });
 
   if (scenarioCollect.coreFailed) {
     const outputData = {
@@ -419,6 +603,7 @@ async function _runDimensionalSimulation(
       formula_error_metrics: formulaErrors,
       status: "failed",
       failure_reason: "core_metrics_non_finite",
+      fidelity: fidelityResult.fidelity,
     };
     await storeFailed(scenarioId, outputData);
     throw new SimulationFiniteError("Simulation failed: core P&L metrics are non-finite", formulaErrors);
@@ -432,6 +617,7 @@ async function _runDimensionalSimulation(
     period_count: periods.length,
     simulation_mode: "external_model",
     dimensional,
+    fidelity: fidelityResult.fidelity,
     ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
     ...(notices.length > 0 ? { notices } : {}),
     ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
@@ -446,6 +632,7 @@ async function _runDimensionalSimulation(
     granularity: def.time_horizon.granularity,
     simulation_mode: "external_model",
     dimensional,
+    fidelity: fidelityResult.fidelity,
     status: "completed",
     ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
     ...(notices.length > 0 ? { notices } : {}),
@@ -501,7 +688,7 @@ async function _runXlsxSimulation(
     }
   }
 
-  const warnings = absurdityWarnings(basePl, pl);
+  const warnings = absurdityWarnings(basePl, pl, overrides);
   const notices = unresolvedNotices(unresolved);
   const runtimeErrors =
     "lastEvaluationErrors" in runtime &&
@@ -557,6 +744,11 @@ async function _runXlsxSimulation(
     throw new SimulationFiniteError("Simulation failed: core P&L metrics are non-finite", formulaErrors);
   }
 
+  const fidelityResult = await applyFidelityGuard(pl, basePl, notices, {
+    scenarioId,
+    modelSummary: "xlsx_cell_graph",
+  });
+
   const outputData: Record<string, unknown> = {
     aggregate: pl,
     base_pl: basePl,
@@ -564,6 +756,7 @@ async function _runXlsxSimulation(
     granularity: "quarterly",
     period_count: periods.length,
     simulation_mode: "xlsx_cell_graph",
+    fidelity: fidelityResult.fidelity,
     ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
     ...(notices.length > 0 ? { notices } : {}),
     ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
@@ -577,6 +770,7 @@ async function _runXlsxSimulation(
     period_count: periods.length,
     granularity: "quarterly",
     simulation_mode: "xlsx_cell_graph",
+    fidelity: fidelityResult.fidelity,
     status: "completed",
     ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
     ...(notices.length > 0 ? { notices } : {}),
@@ -637,7 +831,7 @@ async function _runFormulaSimulation(
     if (isFiniteNumber(v)) basePl[id] = round2(v);
   }
   const singlePeriodPl: Record<string, number> = periods[0]?.pl ?? {};
-  const warnings = absurdityWarnings(basePl, singlePeriodPl);
+  const warnings = absurdityWarnings(basePl, singlePeriodPl, overrides);
   const notices = unresolvedNotices(unresolved);
   notices.push(...aggWarnings);
 
@@ -667,6 +861,11 @@ async function _runFormulaSimulation(
     throw new SimulationFiniteError("Simulation failed: core P&L metrics are non-finite", formulaErrors);
   }
 
+  const fidelityResult = await applyFidelityGuard(aggregatePl, basePl, notices, {
+    scenarioId,
+    modelSummary: `formula_dag ${modelVersion}`,
+  });
+
   const outputData: Record<string, unknown> = {
     aggregate: aggregatePl,
     base_pl: basePl,
@@ -674,6 +873,7 @@ async function _runFormulaSimulation(
     granularity: modelDef.time_horizon.granularity,
     period_count: periods.length,
     simulation_mode: "formula_dag",
+    fidelity: fidelityResult.fidelity,
     ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
     ...(notices.length > 0 ? { notices } : {}),
     ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
@@ -690,6 +890,7 @@ async function _runFormulaSimulation(
     period_count: periods.length,
     granularity: modelDef.time_horizon.granularity,
     simulation_mode: "formula_dag",
+    fidelity: fidelityResult.fidelity,
     status: "completed",
     ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
     ...(notices.length > 0 ? { notices } : {}),

@@ -19,7 +19,7 @@ AI-assisted FP&A tool: plain-English scenarios → mapped model levers → simul
 - **Auth providers:** `AUTH_PROVIDER=local` (default) or `oidc` with issuer/JWKS env vars; SSO login link appears when OIDC is enabled.
 - **Object storage:** optional S3-compatible store (`OBJECT_STORAGE_*`); workbook bytes dual-write with Postgres BYTEA fallback / backfill script.
 - **Portfolio UX:** `/dashboard` portfolio KPIs; scenario version history, actuals/budget/forecast lanes, live what-if preview (apply still requires approval).
-- **Connectors:** SAP SAC (incl. audited write-back) and Anaplan (mock/read) behind `ENABLE_PLANNING_CONNECTORS`.
+- **Connectors:** SAP SAC (incl. audited write-back) and Anaplan (live read-only Cell Data API) behind `ENABLE_PLANNING_CONNECTORS`.
 - **Errors:** pino + optional Sentry (`SENTRY_DSN` / `NEXT_PUBLIC_SENTRY_DSN`) with PII scrubbing on backend and Next instrumentation.
 Schema source of truth is `backend/migrations/` (node-pg-migrate). `backend/src/db/schema.sql` is a legacy snapshot kept for reference; prefer migrations.
 

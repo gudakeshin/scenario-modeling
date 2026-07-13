@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { fmtCurrency, getCurrencyLabel } from "@/lib/metrics";
+import { fmtMetric, getCurrencyLabel } from "@/lib/metrics";
 
 export interface CausalChainStep {
   step: string;
@@ -158,7 +158,7 @@ export function AgentTracePanel({
                     <div key={k} className="flex justify-between gap-2 text-[11px]">
                       <dt className="truncate text-[var(--text-faint)]">{k}</dt>
                       <dd className="shrink-0 font-medium tabular-nums text-[var(--text-primary)]">
-                        {fmtCurrency(v)}
+                        {fmtMetric(k, v)}
                       </dd>
                     </div>
                   ))}

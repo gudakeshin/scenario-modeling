@@ -14,9 +14,10 @@ import {
   listScenarios,
   getOnboardingStatus,
   queryAllDocuments,
+  type FollowUpAnswer,
 } from "@/lib/api";
 import { probePlanningConnectors } from "@/lib/features";
-import { setCurrency, getCurrencySymbol, getCurrencyLabel } from "@/lib/metrics";
+import { setCurrency, getCurrencyLabel, fmtMetric, metricLabel, formatFidelityViolations } from "@/lib/metrics";
 import type { Message, ThinkingData, CausalChainStep, AgentTraceStep } from "@/types/chat";
 import { useChatStore } from "@/stores/chatStore";
 import { useUiStore } from "@/stores/uiStore";
@@ -53,6 +54,7 @@ export function useScenarioWorkflow() {
     setChartData, setPendingQuestions, setOnboardingStatus, bumpRefineKey,
     setIsLoading, setExpandedPanel, closeAllPanels, setShowInsights,
     setShowPeriods, setShowTemplates, setDimensionalPov, setDimensionalMetric,
+    openDocManagerForValidation,
   } = useUiStore();
 
   const sessionId = useSessionStore((s) => s.sessionId);
@@ -76,7 +78,7 @@ export function useScenarioWorkflow() {
     probePlanningConnectors().catch(() => {});
     getOnboardingStatus().then((s) => {
       setOnboardingStatus(s);
-      if (s.currency) setCurrency(s.currency, s.currency_unit);
+      if (s.currency) setCurrency(s.currency, s.currency_unit ?? undefined);
     }).catch(() => {});
   }, [setOnboardingStatus, activeWorkspaceId]);
 
@@ -289,6 +291,7 @@ export function useScenarioWorkflow() {
       let previewPl: Record<string, number> | undefined;
       let previewReconciliation: Message["previewReconciliation"];
       let constraintViolations: Message["constraintViolations"];
+      let hasFollowUps = false;
       try {
         const data = await parseScenario(text);
         scenarioIdFromApi = data.scenario_id ?? undefined;
@@ -372,6 +375,7 @@ export function useScenarioWorkflow() {
         // If the parser generated follow-up questions, show them
         if (data.follow_up_questions && data.follow_up_questions.length > 0) {
           setPendingQuestions(data.follow_up_questions);
+          hasFollowUps = true;
           if (data.parameters.length > 0) {
             parts.push("\nI've extracted initial parameters but need a few more details to be more precise. Please answer the questions below.");
           } else {
@@ -433,7 +437,8 @@ export function useScenarioWorkflow() {
       setIsLoading(false);
       if (scenarioIdFromApi) {
         setShowReview(true);
-        setExpandedPanel("review");
+        // Prefer follow-up panel over Review when probing questions are pending
+        setExpandedPanel(hasFollowUps ? "followUp" : "review");
       }
     },
     [
@@ -457,11 +462,12 @@ export function useScenarioWorkflow() {
     try {
       const result = await runScenario(scenarioId);
 
-      // Aggregate P&L
+      // Aggregate P&L (currency, percent, etc. — format by metric id)
+      const plEntries = Object.entries(result.pl || {});
       const plText =
         `**P&L in ${getCurrencyLabel()} (scenario total${result.period_count ? ` \u2014 ${result.period_count} ${result.granularity || "periods"}` : ""}):**\n` +
-        Object.entries(result.pl || {})
-          .map(([k, v]) => `- **${k}**: ${getCurrencySymbol()}${v.toLocaleString()}`)
+        plEntries
+          .map(([k, v]) => `- **${metricLabel(k)}**: ${fmtMetric(k, v)}`)
           .join("\n");
       addAssistantMessage(convId, plText);
 
@@ -472,6 +478,11 @@ export function useScenarioWorkflow() {
           result.absurdity_warnings.map((w: string) => `- ${w}`).join("\n") +
           "\n\n_The model detected potentially disproportionate results. Please review the parameters above._";
         addAssistantMessage(convId, warningText);
+      }
+
+      const fidelityText = formatFidelityViolations(result.fidelity);
+      if (fidelityText) {
+        addAssistantMessage(convId, fidelityText);
       }
 
       // Surface non-finite / formula-error metrics (Wave 0 finite-output contract)
@@ -552,17 +563,31 @@ export function useScenarioWorkflow() {
         addAssistantMessage(convId, "Business analysis could not be generated. Click **So What?** in the toolbar to retry.");
       }
     } catch (e) {
-      addAssistantMessage(convId, "Simulation failed: " + (e as Error).message);
+      const errorMsg = (e as Error).message || "";
+      if (/not validated|analyst validation/i.test(errorMsg)) {
+        addAssistantMessage(
+          convId,
+          "**Simulation blocked — spreadsheet model is not validated yet.**\n\n" +
+            "1. Open **Document Manager** (opened for you)\n" +
+            "2. Click **Mark Model Validated** in the amber banner\n" +
+            "3. If validation succeeds, return here and click **Review Parameters** → approve again\n\n" +
+            `_Details: ${errorMsg}_`,
+        );
+        openDocManagerForValidation();
+      } else {
+        addAssistantMessage(convId, "Simulation failed: " + errorMsg);
+      }
     }
     setIsLoading(false);
   }, [
     active?.scenarioId, activeId, addAssistantMessage,
     setShowReview, setExpandedPanel, setIsLoading, setPeriodData, setShowPeriods,
     setChartData, setPreloadedInsight, setShowInsights, setDimensionalPov, setDimensionalMetric,
+    openDocManagerForValidation,
   ]);
 
   const handleFollowUpAnswers = useCallback(
-    async (answers: { question_id: string; answer: string }[]) => {
+    async (answers: FollowUpAnswer[]) => {
       const scenarioId = active?.scenarioId;
       const convId = activeId;
       if (!scenarioId || !convId) return;
@@ -570,8 +595,25 @@ export function useScenarioWorkflow() {
       setPendingQuestions(null);
       setIsLoading(true);
 
-      // Show user's answers in chat
-      const answerSummary = answers.map((a) => `- **${a.question_id}**: ${a.answer}`).join("\n");
+      // Show user's answers in chat with acceptance/override provenance
+      const answerSummary = answers
+        .map((a) => {
+          if (a.answer_kind === "accepted_recommendation") {
+            return `- **${a.question_id}**: ${a.answer} _(accepted recommendation)_`;
+          }
+          if (a.answer_kind === "overridden") {
+            const prev = a.recommended_value ? ` _(overrode “${a.recommended_value}”)_` : " _(overrode recommendation)_";
+            return `- **${a.question_id}**: ${a.answer}${prev}`;
+          }
+          if (a.answer_kind === "comment") {
+            return `- **${a.question_id}** _(comment)_: ${a.answer}`;
+          }
+          if (a.answer_kind === "custom") {
+            return `- **${a.question_id}**: ${a.answer} _(custom)_`;
+          }
+          return `- **${a.question_id}**: ${a.answer}`;
+        })
+        .join("\n");
       addAssistantMessage(convId, `**Your answers:**\n${answerSummary}\n\nRefining scenario parameters...`);
 
       try {
@@ -636,10 +678,11 @@ export function useScenarioWorkflow() {
         if (data.clarification_needed) parts.push(data.clarification_needed);
 
         addAssistantMessage(convId, parts.join("\n\n") || "Parameters refined. Review them below.", refineThinking);
-        // Force ParameterReview to re-mount + re-fetch updated parameters
         bumpRefineKey();
         setShowReview(true);
-        setExpandedPanel("review");
+        setExpandedPanel(
+          data.follow_up_questions && data.follow_up_questions.length > 0 ? "followUp" : "review",
+        );
       } catch (e) {
         addAssistantMessage(convId, "Refinement failed: " + (e as Error).message);
       }

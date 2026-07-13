@@ -5,10 +5,11 @@ import { PanelHeader } from "./PanelHeader";
 import {
   applyLeverValue,
   fetchDriverTree,
+  getActiveModel,
   type DriverTreeNode,
   type DriverTreeResult,
 } from "@/lib/api";
-import { fmtCurrency } from "@/lib/metrics";
+import { fmtMetric, pickDefaultTargetMetric } from "@/lib/metrics";
 
 interface DriverTreeViewProps {
   scenarioId: string;
@@ -95,7 +96,7 @@ function TreeNode({
           </div>
         ) : (
           <span className="text-xs font-medium text-[var(--text-secondary)] tabular-nums">
-            {fmtCurrency(node.value)}
+            {fmtMetric(node.id, node.value, node.name)}
           </span>
         )}
       </div>
@@ -123,23 +124,54 @@ export function DriverTreeView({ scenarioId, onClose, onMinimize }: DriverTreeVi
   const [result, setResult] = useState<DriverTreeResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [metric, setMetric] = useState("net_income");
+  const [metric, setMetric] = useState("");
+  const [metricReady, setMetricReady] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  const [reason, setReason] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    getActiveModel()
+      .then(({ model }) => {
+        if (cancelled) return;
+        const ids = (model?.model_definition?.variables ?? [])
+          .filter((v) => v.tags?.includes("pl_metric") || v.tags?.includes("output") || (v.dependencies?.length ?? 0) > 0)
+          .map((v) => v.id);
+        setMetric(pickDefaultTargetMetric(ids, "net_income"));
+        setMetricReady(true);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setMetric(pickDefaultTargetMetric([], "ebitda"));
+        setMetricReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const load = useCallback(async () => {
+    if (!metric) return;
     setLoading(true);
     setError(null);
     try {
-      setResult(await fetchDriverTree(scenarioId, metric));
+      const tree = await fetchDriverTree(scenarioId, metric, { reason });
+      setResult(tree);
+      setNotice(
+        tree.target_metric && tree.target_metric !== metric
+          ? `Model has no “${metric}”; showing ${tree.target_metric}.`
+          : null,
+      );
     } catch (e) {
       setError((e as Error).message);
     }
     setLoading(false);
-  }, [scenarioId, metric]);
+  }, [scenarioId, metric, reason]);
 
   useEffect(() => {
+    if (!metricReady || !metric) return;
     void load();
-  }, [load]);
+  }, [metricReady, load]);
 
   return (
     <div className="border-t border-[var(--border)] bg-background p-4 max-h-[60vh] overflow-auto">
@@ -166,6 +198,14 @@ export function DriverTreeView({ scenarioId, onClose, onMinimize }: DriverTreeVi
             className="ml-1.5 w-32 rounded-lg border border-[var(--input-border)] bg-[var(--card-bg)] px-2 py-1 text-xs"
           />
         </label>
+        <label className="text-xs text-[var(--text-muted)] flex items-center gap-1.5">
+          <input
+            type="checkbox"
+            checked={reason}
+            onChange={(e) => setReason(e.target.checked)}
+          />
+          LLM restructure
+        </label>
         <button
           type="button"
           onClick={load}
@@ -178,6 +218,14 @@ export function DriverTreeView({ scenarioId, onClose, onMinimize }: DriverTreeVi
 
       {error && <p className="text-xs text-[var(--danger)] mb-2 bg-[var(--danger-bg)] px-3 py-1.5 rounded-lg">{error}</p>}
       {notice && <p className="text-xs text-accent mb-2 px-1">{notice}</p>}
+      {result?.rationale && (
+        <p className="text-xs text-[var(--text-secondary)] mb-2 px-1 italic">{result.rationale}</p>
+      )}
+      {result?.reconciliation && !result.reconciliation.ok && (
+        <p className="text-xs text-[var(--warning)] mb-2 px-1">
+          LLM tree failed reconciliation — showing deterministic tree.
+        </p>
+      )}
 
       {result && (
         <div className="rounded-xl border border-[var(--panel-border)] bg-[var(--card-bg)] p-2">

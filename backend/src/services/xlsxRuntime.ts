@@ -149,6 +149,8 @@ export class XlsxModelRuntime implements EvaluableModel {
   readonly outputIds: string[];
   readonly supportsPeriods: boolean;
   readonly lastEvaluationErrors: string[] = [];
+  /** Override ids that did not match a bound lever on the last evaluate(). */
+  readonly lastIgnoredOverrides: string[] = [];
 
   private hf: HyperFormula;
   private levers: Map<string, LeverBinding>;
@@ -169,7 +171,14 @@ export class XlsxModelRuntime implements EvaluableModel {
     this.timeAxis = timeAxis;
     this.periodColumns = periodColumns;
     this.supportsPeriods = periodColumns.length > 1;
-    this.inputs = levers.map((l) => ({ id: l.id, name: l.label, base: l.base }));
+    // Deduplicate lever ids (schema can list the same id more than once)
+    const seen = new Set<string>();
+    this.inputs = [];
+    for (const l of levers) {
+      if (seen.has(l.id)) continue;
+      seen.add(l.id);
+      this.inputs.push({ id: l.id, name: l.label, base: l.base });
+    }
     this.outputIds = outputs.map((o) => o.id);
   }
 
@@ -371,12 +380,16 @@ export class XlsxModelRuntime implements EvaluableModel {
 
   evaluate(absoluteOverrides: Record<string, number>): Record<string, number> {
     this.lastEvaluationErrors.length = 0;
+    this.lastIgnoredOverrides.length = 0;
     const touched: Array<{ binding: LeverBinding; previous: unknown }> = [];
 
     try {
       for (const [id, value] of Object.entries(absoluteOverrides)) {
         const binding = this.levers.get(toId(id));
-        if (!binding || !Number.isFinite(value)) continue;
+        if (!binding || !Number.isFinite(value)) {
+          if (Number.isFinite(value)) this.lastIgnoredOverrides.push(id);
+          continue;
+        }
         const previous = this.hf.getCellValue({
           sheet: binding.sheetId,
           row: binding.row,
