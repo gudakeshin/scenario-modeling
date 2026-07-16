@@ -63,7 +63,7 @@ export function ChatContainer() {
     setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
     setShowTemplates, setShowInsights, setShowPeriods,
     setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
-    setShowDocManager, setPreloadedInsight, setExpandedPanel,
+    setShowDocManager, setExpandedPanel,
   } = useUiStore();
 
   const assistantMode = useChatStore((s) => s.assistantMode);
@@ -249,7 +249,7 @@ export function ChatContainer() {
                 type="button"
                 onClick={() => {
                   if (showInsights) {
-                    setShowInsights(false); setPreloadedInsight(null);
+                    setShowInsights(false);
                     if (expandedPanel === "insights") setExpandedPanel(null);
                   } else {
                     setShowInsights(true);

@@ -9,7 +9,7 @@ import {
   extractSinglePeriodPl,
   resolveScenarioCurrencySymbol,
 } from "../services/narrativeService.js";
-import { generateBusinessAnalysis, regenerateWithFeedback } from "../services/businessAnalysisAgent.js";
+import { generateBusinessAnalysis, regenerateWithFeedback, regenerateForGrounding, verifyEvidence } from "../services/businessAnalysisAgent.js";
 import {
   evaluateAnalysis, buildScenarioContext, storeQAReport,
   QA_THRESHOLD, MAX_QA_ITERATIONS,
@@ -1230,6 +1230,49 @@ scenariosRouter.post("/:id/preview", requireRole("analyst"), async (req, res) =>
   }
 });
 
+// ── Business Analysis (read persisted) ──
+scenariosRouter.get("/:id/business-analysis", async (req, res) => {
+  try {
+    const sid = req.params.id;
+    await assertCanReadScenario(req.user!.userId, req.user!.role, sid);
+
+    const r = await pool.query(
+      `SELECT output_data, created_at FROM scenario_outputs
+       WHERE scenario_id = $1 AND output_type = 'business_analysis'
+       ORDER BY created_at DESC LIMIT 1`,
+      [sid],
+    );
+    if (r.rows.length === 0) {
+      return res.status(404).json({ error: "No business analysis stored for this scenario" });
+    }
+
+    const stored = r.rows[0].output_data as Record<string, unknown>;
+    // Older rows stored analysis only — attach latest QA report if missing
+    if (stored && stored.qa_report == null) {
+      const qa = await pool.query(
+        `SELECT output_data FROM scenario_outputs
+         WHERE scenario_id = $1 AND output_type = 'qa_report'
+         ORDER BY created_at DESC LIMIT 1`,
+        [sid],
+      );
+      if (qa.rows.length > 0) {
+        stored.qa_report = qa.rows[0].output_data;
+      }
+    }
+
+    res.setHeader("Cache-Control", "no-store");
+    return res.json({
+      ...stored,
+      created_at: r.rows[0].created_at,
+    });
+  } catch (e) {
+    const status = authzError(e);
+    if (status) return res.status(status).json({ error: (e as Error).message });
+    logger.error({ err: e }, "Request failed");
+    return res.status(500).json({ error: "Failed to load business analysis" });
+  }
+});
+
 // ── Business Analysis Agent + QA Reflection Loop ──
 scenariosRouter.post("/:id/business-analysis", requireRole("analyst"), async (req, res) => {
   try {
@@ -1260,6 +1303,62 @@ scenariosRouter.post("/:id/business-analysis", requireRole("analyst"), async (re
 
       while (iteration < MAX_QA_ITERATIONS) {
         iteration++;
+
+        // ── Grounding first: refine on numeric mismatches before full LLM QA ──
+        const groundStart = Date.now();
+        let grounding: Awaited<ReturnType<typeof verifyEvidence>>;
+        try {
+          grounding = await verifyEvidence(currentAnalysis, sid);
+        } catch (e) {
+          logger.error({ err: e }, "[QA Agent] Pre-QA grounding check failed");
+          grounding = {
+            ok: false,
+            mismatches: [{
+              implication_title: "grounding_error",
+              metric_id: "verify_evidence",
+              claimed_value: 0,
+              actual_value: undefined,
+            }],
+          };
+        }
+
+        if (!grounding.ok) {
+          reflectionLog.push({
+            agent: "Quality Assurance",
+            action: `Grounding check #${iteration} — FAILED`,
+            detail: `Numeric mismatches: ${grounding.mismatches.map((m) => `${m.metric_id} claimed ${m.claimed_value} vs ${m.actual_value ?? "N/A"}`).join("; ").slice(0, 300)}`,
+            passed: false,
+            duration_ms: Date.now() - groundStart,
+          });
+
+          if (iteration >= MAX_QA_ITERATIONS) {
+            // Final iteration still runs LLM QA so the report captures the failure
+            const qaStart = Date.now();
+            const report = await evaluateAnalysis(currentAnalysis, scenarioContext, sid);
+            report.iterations = iteration;
+            qaReport = report;
+            reflectionLog.push({
+              agent: "Quality Assurance",
+              action: `Evaluation #${iteration} — Score: ${report.overall_score}/10`,
+              detail: `FAILED after grounding retries. ${report.summary}`,
+              score: report.overall_score,
+              passed: false,
+              duration_ms: Date.now() - qaStart,
+            });
+            break;
+          }
+
+          const refineStart = Date.now();
+          logger.info(`[BA Agent] Grounding refine (iteration ${iteration})...`);
+          currentAnalysis = await regenerateForGrounding(sid, grounding.mismatches, iteration);
+          reflectionLog.push({
+            agent: "Business Analysis",
+            action: `Refinement #${iteration} — fixing grounding mismatches`,
+            detail: `Rewrote analysis to correct ${grounding.mismatches.length} numeric claim(s). New headline: "${currentAnalysis.headline.slice(0, 100)}".`,
+            duration_ms: Date.now() - refineStart,
+          });
+          continue;
+        }
 
         // ── QA Agent evaluates ──
         const qaStart = Date.now();
@@ -1300,7 +1399,12 @@ scenariosRouter.post("/:id/business-analysis", requireRole("analyst"), async (re
           .map((d) => `${d.name} (${d.score}/10): ${d.feedback}`)
           .join("; ");
 
-        currentAnalysis = await regenerateWithFeedback(sid, report, iteration);
+        currentAnalysis = await regenerateWithFeedback(
+          sid,
+          report,
+          iteration,
+          report.grounding_mismatches,
+        );
         reflectionLog.push({
           agent: "Business Analysis",
           action: `Refinement #${iteration} — addressing QA feedback`,
@@ -1335,16 +1439,18 @@ scenariosRouter.post("/:id/business-analysis", requireRole("analyst"), async (re
       qa_passed: qaReport?.passed,
     }, req.user!.userId);
 
-    await pool.query(
-      `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'business_analysis', $2)`,
-      [sid, JSON.stringify(currentAnalysis)]
-    );
-
-    return res.json({
+    const persisted = {
       ...currentAnalysis,
       qa_report: qaReport,
       reflection_log: reflectionLog,
-    });
+    };
+
+    await pool.query(
+      `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'business_analysis', $2)`,
+      [sid, JSON.stringify(persisted)]
+    );
+
+    return res.json(persisted);
   } catch (e) {
     const status = authzError(e);
     if (status) return res.status(status).json({ error: (e as Error).message });

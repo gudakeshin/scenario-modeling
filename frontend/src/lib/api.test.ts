@@ -43,6 +43,25 @@ describe("apiFetch", () => {
     );
   });
 
+  it("honors timeoutMs on the init object (LLM callers)", async () => {
+    vi.mocked(fetch).mockImplementation((_input, init) => {
+      return new Promise((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => {
+          const err = new Error("Aborted");
+          err.name = "AbortError";
+          reject(err);
+        });
+      });
+    });
+
+    await expect(
+      apiFetch("http://localhost:4000/api/v1/scenarios/x/business-analysis", {
+        method: "POST",
+        timeoutMs: 75,
+      })
+    ).rejects.toThrow(/timed out after 0\.075s/i);
+  });
+
   it("refreshes tokens and retries once on 401", async () => {
     setTokens("expired-access", "valid-refresh");
 

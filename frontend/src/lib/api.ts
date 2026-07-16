@@ -93,6 +93,8 @@ export class ApiTimeoutError extends Error {
 }
 
 const DEFAULT_TIMEOUT_MS = 30_000;
+/** LLM / analysis calls (BA+QA loop, context build, parse) routinely exceed 30s. */
+export const LLM_TIMEOUT_MS = 300_000;
 
 /** fetch with a timeout, distinguishing "server took too long" from other network errors. */
 async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: number): Promise<Response> {
@@ -126,13 +128,18 @@ function buildAuthHeaders(init: RequestInit): Headers {
   return headers;
 }
 
+export type ApiFetchInit = RequestInit & { timeoutMs?: number };
+
 /** Authenticated fetch: Bearer token + workspace header, timeout, 401 → refresh → retry → login redirect. */
-export async function apiFetch(input: string, init: RequestInit = {}, timeoutMs = DEFAULT_TIMEOUT_MS): Promise<Response> {
-  let res = await fetchWithTimeout(input, { ...init, headers: buildAuthHeaders(init) }, timeoutMs);
+export async function apiFetch(input: string, init: ApiFetchInit = {}, timeoutMs?: number): Promise<Response> {
+  // Prefer explicit 3rd arg, then init.timeoutMs, then default — so LLM callers can't silently get 30s.
+  const ms = timeoutMs ?? init.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const { timeoutMs: _ignored, ...fetchInit } = init;
+  let res = await fetchWithTimeout(input, { ...fetchInit, headers: buildAuthHeaders(fetchInit) }, ms);
   if (res.status === 401 && !input.includes("/api/v1/auth/")) {
     const ok = await tryRefresh();
     if (ok) {
-      res = await fetchWithTimeout(input, { ...init, headers: buildAuthHeaders(init) }, timeoutMs);
+      res = await fetchWithTimeout(input, { ...fetchInit, headers: buildAuthHeaders(fetchInit) }, ms);
     }
     if (res.status === 401) {
       clearTokens();
@@ -145,7 +152,7 @@ export async function apiFetch(input: string, init: RequestInit = {}, timeoutMs 
       const body = await res.clone().json();
       if (body?.code === "WORKSPACE_NOT_FOUND") {
         setActiveWorkspaceId(null);
-        res = await fetchWithTimeout(input, { ...init, headers: buildAuthHeaders(init) }, timeoutMs);
+        res = await fetchWithTimeout(input, { ...fetchInit, headers: buildAuthHeaders(fetchInit) }, ms);
       }
     } catch {
       // Non-JSON 403 — leave as-is.
@@ -312,6 +319,7 @@ export async function parseScenario(nlInput: string): Promise<ParseScenarioRespo
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ nl_input: nlInput }),
+    timeoutMs: LLM_TIMEOUT_MS,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -328,6 +336,7 @@ export async function refineScenario(
     method: "POST",
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ answers }),
+    timeoutMs: LLM_TIMEOUT_MS,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -1365,6 +1374,8 @@ export interface BusinessRecommendation {
   priority: "immediate" | "short-term" | "monitor";
   rationale: string;
   owner?: string;
+  /** In-app remediation deep-link */
+  cta?: "open_doc_manager_model" | "open_review" | "refresh_analysis" | "open_doc_manager";
 }
 
 export interface QADimension {
@@ -1400,14 +1411,31 @@ export interface BusinessInsight {
   recommendations: BusinessRecommendation[];
   decision_context: string;
   confidence_note: string;
+  analysis_mode?: "standard" | "integrity";
+  mode_reasons?: string[];
   qa_report?: QAReport | null;
   reflection_log?: ReflectionStep[];
 }
 
+/** Load the latest persisted business analysis (404 if none yet). */
+export async function getBusinessAnalysis(scenarioId: string): Promise<BusinessInsight | null> {
+  const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/business-analysis`, {
+    cache: "no-store",
+  });
+  if (res.status === 404 || res.status === 304) return null;
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to load business analysis");
+  }
+  return res.json();
+}
+
 export async function generateBusinessAnalysis(scenarioId: string): Promise<BusinessInsight> {
+  // BA + up to 3 QA/refine LLM rounds routinely exceeds the default 30s client timeout.
   const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/business-analysis`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    timeoutMs: LLM_TIMEOUT_MS,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));
@@ -1704,6 +1732,7 @@ export async function buildContext(): Promise<CompanyContext> {
   const res = await apiFetch(`${API_BASE}/api/v1/context/build`, {
     method: "POST",
     headers: authHeaders({ "Content-Type": "application/json" }),
+    timeoutMs: LLM_TIMEOUT_MS,
   });
   if (!res.ok) {
     const err = await res.json().catch(() => ({}));

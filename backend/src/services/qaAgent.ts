@@ -12,8 +12,13 @@
 import { z } from "zod";
 import { getApiKey, callClaudeStructured } from "./llmClient.js";
 import { pool } from "../db/index.js";
-import type { BusinessInsight } from "./businessAnalysisAgent.js";
-import { verifyEvidence } from "./businessAnalysisAgent.js";
+import type { BusinessInsight, AnalysisModeResult, EvidenceMismatch } from "./businessAnalysisAgent.js";
+import {
+  verifyEvidence,
+  detectAnalysisMode,
+  analysisMentionsIntegrity,
+  getAnalysisModeForScenario,
+} from "./businessAnalysisAgent.js";
 import { logger } from "../logger.js";
 
 const qaResponseSchema = z.object({
@@ -46,6 +51,9 @@ export interface QAReport {
   improvement_guidance: string;
   summary: string;
   iterations: number;
+  /** Present when numeric grounding failed (for orchestration refine path). */
+  grounding_mismatches?: EvidenceMismatch[];
+  analysis_mode?: "standard" | "integrity";
 }
 
 /** One step in the QA-BA reflection loop, visible to the user */
@@ -67,16 +75,48 @@ export interface QAResult {
 export const QA_THRESHOLD = 6;
 export const MAX_QA_ITERATIONS = 3;
 
-const QA_SYSTEM_PROMPT = `You are a QA analyst reviewing business scenario analysis. Score each dimension 1-10.
+const QA_SYSTEM_PROMPT_STANDARD = `You are a QA analyst reviewing business scenario analysis. Score each dimension 1-10.
 
-ABSURDITY CHECK (CRITICAL — do this FIRST):
-- If any P&L change exceeds ±200% and there's no clear justification, flag it as absurd and score consistency 1/10.
-- If EBITDA, revenue, or net income changes are wildly disproportionate to the stated scenario (e.g. a 10% cost increase causing >50% EBITDA change), flag as inconsistent.
+ABSURDITY CHECK (CRITICAL — do this FIRST) — STANDARD MODE:
+- If any P&L change exceeds ±200% and the analysis treats it as a real business outcome without justification, flag it and score consistency ≤2/10.
+- If EBITDA, revenue, or net income changes are wildly disproportionate to the stated scenario (e.g. a 10% cost increase causing >50% EBITDA change) and the write-up treats that as real impact, flag as inconsistent.
 - If the analysis describes huge impacts but the scenario is minor, call it out.
 
 Dimensions: completeness, specificity, actionability, consistency, business_relevance, risk_coverage.
 
-Keep feedback strings SHORT (under 100 chars each). Submit scores and guidance via the structured tool.`
+Keep feedback strings SHORT (under 100 chars each). Submit scores and guidance via the structured tool.`;
+
+const QA_SYSTEM_PROMPT_INTEGRITY = `You are a QA analyst reviewing business scenario analysis in INTEGRITY MODE (zero/missing baseline or uninterpretable % deltas).
+
+Score each dimension 1-10. CONSISTENCY RULES FOR INTEGRITY MODE (do these FIRST):
+- Score consistency HIGH (7–10) when the analysis (1) leads with baseline/setup/model-integrity failure, (2) treats ±200% / n/a% swings as math artifacts not business outcomes, (3) cites only canonical scenario levels with correct figures, (4) does NOT claim proven net impact or unverifiable "resilience".
+- Do NOT auto-penalize consistency merely because underlying P&L % swings look absurd — that is expected when baseline is broken. Penalize only if the write-up treats those swings as real business results.
+- Fail consistency (≤2) if the analysis claims healthy margins/revenue intact as proven vs base, or if it omits the model-integrity diagnosis.
+- Actionability should reward: fix baseline + re-run first, then qualitative preparedness tied to assumption levers.
+
+Dimensions: completeness, specificity, actionability, consistency, business_relevance, risk_coverage.
+
+Keep feedback strings SHORT (under 100 chars each). Submit scores and guidance via the structured tool.`;
+
+function qaSystemPrompt(mode: AnalysisModeResult["mode"]): string {
+  return mode === "integrity" ? QA_SYSTEM_PROMPT_INTEGRITY : QA_SYSTEM_PROMPT_STANDARD;
+}
+
+/**
+ * Deterministic integrity gate: analyses in integrity mode must diagnose the setup failure.
+ */
+export function integrityDiagnosisCheck(
+  analysis: BusinessInsight,
+  mode: AnalysisModeResult,
+): { ok: boolean; guidance: string } {
+  if (mode.mode !== "integrity") return { ok: true, guidance: "" };
+  if (analysisMentionsIntegrity(analysis)) return { ok: true, guidance: "" };
+  return {
+    ok: false,
+    guidance:
+      "Lead with model-integrity / zero-baseline diagnosis in the headline and implications. Do not treat scenario levels as proven net impact until a valid base P&L is loaded.",
+  };
+}
 
 /**
  * Build scenario context string for QA evaluation.
@@ -97,6 +137,7 @@ export async function buildScenarioContext(scenarioId: string): Promise<string> 
   const pl: Record<string, number> = periods.length > 0
     ? periods[0].pl
     : (rawPl.aggregate ?? rawPl);
+  const absurdity_warnings: string[] = rawPl.absurdity_warnings ?? [];
 
   const modelRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
   const modelHash = modelRef.rows[0]?.model_version_hash;
@@ -104,9 +145,12 @@ export async function buildScenarioContext(scenarioId: string): Promise<string> 
   const { resolveBasePl } = await import("./basePl.js");
   const model = await getModelDefinition(modelHash);
   const base_pl = await resolveBasePl(rawPl, model);
+  const mode = detectAnalysisMode({ pl, base_pl, absurdity_warnings });
 
   const lines = [
     `Scenario: "${sRes.rows[0]?.nl_input || ""}"`,
+    `ANALYSIS_MODE: ${mode.mode}`,
+    ...(mode.reasons.length > 0 ? mode.reasons.map((r) => `MODE_REASON: ${r}`) : []),
     "",
     "Parameters:",
     ...pRes.rows.map((r: { extracted_name: string; scenario_value: number }) =>
@@ -115,10 +159,11 @@ export async function buildScenarioContext(scenarioId: string): Promise<string> 
     "P&L Changes (Base → Scenario, per period):",
   ];
   for (const [k, v] of Object.entries(pl)) {
+    if (typeof v !== "number" || !Number.isFinite(v)) continue;
     const base = base_pl[k] ?? 0;
     const delta = v - base;
-    if (Math.abs(delta) > 0.01) {
-      const pct = base !== 0 ? ((delta / base) * 100).toFixed(1) : "n/a";
+    if (Math.abs(delta) > 0.01 || Math.abs(v) > 0.01) {
+      const pct = Math.abs(base) > 0.01 ? ((delta / base) * 100).toFixed(1) : "n/a";
       lines.push(`  - ${k}: ${base.toLocaleString()} → ${v.toLocaleString()} (${delta >= 0 ? "+" : ""}${delta.toLocaleString()}, ${pct}%)`);
     }
   }
@@ -137,7 +182,31 @@ export async function evaluateAnalysis(
   scenarioContext: string,
   scenarioId: string,
 ): Promise<QAReport> {
-  const grounding = await verifyEvidence(analysis, scenarioId).catch(() => ({ ok: true, mismatches: [] }));
+  let grounding: { ok: boolean; mismatches: EvidenceMismatch[] };
+  try {
+    grounding = await verifyEvidence(analysis, scenarioId);
+  } catch (e) {
+    logger.error({ err: e }, "[QA Agent] Grounding verification failed");
+    grounding = {
+      ok: false,
+      mismatches: [{
+        implication_title: "grounding_error",
+        metric_id: "verify_evidence",
+        claimed_value: 0,
+        actual_value: undefined,
+      }],
+    };
+  }
+
+  let mode: AnalysisModeResult;
+  try {
+    mode = await getAnalysisModeForScenario(scenarioId);
+  } catch (e) {
+    logger.warn({ err: e }, "[QA Agent] Could not load analysis mode; defaulting to standard");
+    mode = { mode: "standard", reasons: [] };
+  }
+
+  const integrityCheck = integrityDiagnosisCheck(analysis, mode);
 
   if (!getApiKey()) {
     // Previously this returned passed:true with a fabricated 7/10 — an
@@ -150,6 +219,8 @@ export async function evaluateAnalysis(
       improvement_guidance: "",
       summary: "QA was not run — the LLM is unavailable (API key not configured). This analysis has not been quality-checked.",
       iterations: 0,
+      grounding_mismatches: grounding.ok ? undefined : grounding.mismatches,
+      analysis_mode: mode.mode,
     };
   }
 
@@ -159,11 +230,15 @@ export async function evaluateAnalysis(
         .map((m) => `- "${m.implication_title}" cites ${m.metric_id}=${m.claimed_value}, but the computed value is ${m.actual_value ?? "not present in the model"}`)
         .join("\n")}\nScore "consistency" no higher than 2/10 and require the analysis to correct these figures.`;
 
-  const userMessage = `## Scenario Context\n${scenarioContext}\n\n## Analysis Being Reviewed\n${JSON.stringify(analysis, null, 2)}${groundingNote}\n\nEvaluate this analysis rigorously. Score each dimension 1-10 and provide specific improvement guidance.`;
+  const integrityNote = integrityCheck.ok
+    ? ""
+    : `\n\n## INTEGRITY DIAGNOSIS CHECK FAILED\n${integrityCheck.guidance}\nScore consistency no higher than 2/10 until the analysis leads with model-integrity diagnosis.`;
+
+  const userMessage = `## Scenario Context\n${scenarioContext}\n\n## Analysis Being Reviewed\n${JSON.stringify(analysis, null, 2)}${groundingNote}${integrityNote}\n\nEvaluate this analysis rigorously. Score each dimension 1-10 and provide specific improvement guidance.`;
 
   try {
     const parsed = await callClaudeStructured({
-      system: QA_SYSTEM_PROMPT,
+      system: qaSystemPrompt(mode.mode),
       userMessage,
       schema: qaResponseSchema,
       toolName: "submit_qa_evaluation",
@@ -173,18 +248,33 @@ export async function evaluateAnalysis(
       purpose: "qa",
     });
 
-    const overallScore = grounding.ok ? parsed.overall_score : Math.min(parsed.overall_score, QA_THRESHOLD - 1);
+    const structuralOk = grounding.ok && integrityCheck.ok;
+    let overallScore = parsed.overall_score;
+    if (!structuralOk) {
+      overallScore = Math.min(overallScore, QA_THRESHOLD - 1);
+    }
+
+    const guidanceParts: string[] = [];
+    if (!grounding.ok) {
+      guidanceParts.push(
+        `Fix these grounded-evidence mismatches before anything else:\n${grounding.mismatches.map((m) => `- ${m.implication_title}: ${m.metric_id} claimed ${m.claimed_value}, actual ${m.actual_value ?? "N/A"}`).join("\n")}`,
+      );
+    }
+    if (!integrityCheck.ok) {
+      guidanceParts.push(integrityCheck.guidance);
+    }
+    guidanceParts.push(parsed.improvement_guidance);
 
     return {
       status: "assessed",
       overall_score: overallScore,
-      passed: grounding.ok && overallScore >= QA_THRESHOLD,
+      passed: structuralOk && overallScore >= QA_THRESHOLD,
       dimensions: parsed.dimensions,
-      improvement_guidance: grounding.ok
-        ? parsed.improvement_guidance
-        : `Fix these grounded-evidence mismatches before anything else:\n${grounding.mismatches.map((m) => `- ${m.implication_title}: ${m.metric_id} claimed ${m.claimed_value}, actual ${m.actual_value ?? "N/A"}`).join("\n")}\n\n${parsed.improvement_guidance}`,
+      improvement_guidance: guidanceParts.join("\n\n"),
       summary: parsed.summary,
       iterations: 1,
+      grounding_mismatches: grounding.ok ? undefined : grounding.mismatches,
+      analysis_mode: mode.mode,
     };
   } catch (e) {
     const errMsg = (e as Error).message;
@@ -197,6 +287,8 @@ export async function evaluateAnalysis(
       improvement_guidance: "",
       summary: `Quality assessment could not be completed: ${errMsg}. The analysis is shown as-is without QA validation.`,
       iterations: 0,
+      grounding_mismatches: grounding.ok ? undefined : grounding.mismatches,
+      analysis_mode: mode.mode,
     };
   }
 }

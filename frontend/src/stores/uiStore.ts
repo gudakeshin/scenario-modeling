@@ -77,6 +77,8 @@ interface UiState {
   setShowDocManager: (v: boolean) => void;
   setDocManagerInitialTab: (v: "documents" | "context" | "model" | null) => void;
   openDocManagerForValidation: () => void;
+  openDocManagerModel: () => void;
+  openReviewForRerun: () => void;
   setShowVersionHistory: (v: boolean) => void;
   setShowActualsCompare: (v: boolean) => void;
   setShowLiveWhatIf: (v: boolean) => void;
@@ -171,6 +173,17 @@ export const useUiStore = create<UiState>((set) => ({
       showDocManager: true,
       docManagerInitialTab: "context",
       expandedPanel: "docManager",
+    }),
+  openDocManagerModel: () =>
+    set({
+      showDocManager: true,
+      docManagerInitialTab: "model",
+      expandedPanel: "docManager",
+    }),
+  openReviewForRerun: () =>
+    set({
+      showReview: true,
+      expandedPanel: "review",
     }),
   setShowVersionHistory: (v) => set({ showVersionHistory: v }),
   setShowActualsCompare: (v) => set({ showActualsCompare: v }),

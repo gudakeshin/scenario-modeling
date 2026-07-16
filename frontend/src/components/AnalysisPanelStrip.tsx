@@ -102,7 +102,7 @@ export function AnalysisPanelStrip({
     if (showAudit) cards.push({ id: "audit", title: "Audit Trail", close: () => setShowAudit(false) });
     if (showTemplates) cards.push({ id: "templates", title: "Templates", close: () => setShowTemplates(false) });
     if (showRoles) cards.push({ id: "roles", title: "Roles", close: () => setShowRoles(false) });
-    if (showInsights && scenarioId) cards.push({ id: "insights", title: "Business Insights", close: () => { setShowInsights(false); setPreloadedInsight(null); } });
+    if (showInsights && scenarioId) cards.push({ id: "insights", title: "Business Insights", close: () => { setShowInsights(false); } });
     // Follow-up card first among interactive panels when present (visual priority)
     if (pendingQuestions && pendingQuestions.length > 0 && scenarioId) {
       cards.unshift({ id: "followUp", title: "Refine Scenario", close: () => setPendingQuestions(null) });
@@ -120,7 +120,7 @@ export function AnalysisPanelStrip({
     setShowDriverTree, setShowGoalSeek, setShowFidelity, setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
     setShowPeriods,
     setShowCharts, setShowSharing, setShowAudit, setShowTemplates, setShowRoles,
-    setShowInsights, setPreloadedInsight, setPendingQuestions, setShowDocuments, setShowDocManager,
+    setShowInsights, setPendingQuestions, setShowDocuments, setShowDocManager,
   ]);
 
   const closePanel = (id: string, closeFn: () => void) => {
@@ -168,7 +168,15 @@ export function AnalysisPanelStrip({
       case "roles":
         return <RoleManagement onClose={() => closePanel("roles", () => setShowRoles(false))} onMinimize={collapseModal} />;
       case "insights":
-        return sid ? <BusinessInsights scenarioId={sid} preloaded={preloadedInsight} onClose={() => closePanel("insights", () => { setShowInsights(false); setPreloadedInsight(null); })} onMinimize={collapseModal} /> : null;
+        return sid ? (
+          <BusinessInsights
+            scenarioId={sid}
+            preloaded={preloadedInsight}
+            onInsightChange={setPreloadedInsight}
+            onClose={() => closePanel("insights", () => { setShowInsights(false); })}
+            onMinimize={collapseModal}
+          />
+        ) : null;
       case "followUp":
         return pendingQuestions && pendingQuestions.length > 0 ? <FollowUpQuestions questions={pendingQuestions} onSubmit={onFollowUpAnswers} isLoading={isLoading} /> : null;
       case "documents":

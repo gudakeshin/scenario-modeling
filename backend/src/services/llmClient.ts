@@ -24,6 +24,25 @@ const DEFAULT_MODEL = "claude-haiku-4-5-20251001";
 const REQUEST_TIMEOUT_MS = Number(process.env.LLM_TIMEOUT_MS) || 60_000;
 const MAX_RETRIES = Number(process.env.LLM_MAX_RETRIES) || 3;
 
+/**
+ * Opus 4.7+, Opus 4.8, and Sonnet 5 reject temperature/top_p/top_k with HTTP 400.
+ * Sonnet 4.5 / Haiku 4.5 still accept them.
+ */
+export function modelSupportsSamplingParams(model: string): boolean {
+  const m = model.toLowerCase();
+  // Match claude-sonnet-5 / claude-sonnet-5-… but not claude-sonnet-4-5-…
+  if (/^claude-sonnet-5(?:$|-)/.test(m)) return false;
+  const opusMinor = m.match(/claude-opus-4-(\d+)/);
+  if (opusMinor && Number(opusMinor[1]) >= 7) return false;
+  if (/^claude-opus-[5-9](?:$|-)/.test(m)) return false;
+  return true;
+}
+
+/** Spread into messages.create so unsupported models omit temperature entirely. */
+function samplingParams(model: string, temperature: number): { temperature?: number } {
+  return modelSupportsSamplingParams(model) ? { temperature } : {};
+}
+
 export type LlmPurpose =
   | "parse"
   | "reflection"
@@ -166,7 +185,7 @@ export async function callClaude(opts: {
       {
         model,
         max_tokens: opts.maxTokens ?? 2000,
-        temperature: opts.temperature ?? 0.2,
+        ...samplingParams(model, opts.temperature ?? 0.2),
         system: cachedSystem(opts.system),
         messages: [{ role: "user", content: opts.userMessage }],
       },
@@ -238,7 +257,7 @@ export async function callClaudeStructured<T>(opts: {
       {
         model,
         max_tokens: opts.maxTokens ?? 2000,
-        temperature: opts.temperature ?? 0.2,
+        ...samplingParams(model, opts.temperature ?? 0.2),
         system: cachedSystem(opts.system),
         messages: [{ role: "user", content: opts.userMessage }],
         tools: [
@@ -364,7 +383,7 @@ export async function callClaudeAgentLoop(opts: {
         {
           model,
           max_tokens: 4096,
-          temperature: 0.2,
+          ...samplingParams(model, 0.2),
           system,
           messages,
           tools: anthropicTools,

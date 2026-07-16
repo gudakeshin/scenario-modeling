@@ -1,10 +1,11 @@
 "use client";
 
-import { useState, useCallback } from "react";
+import { useState, useCallback, useEffect, useRef } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { MarkdownContent } from "./MarkdownContent";
 import {
   generateBusinessAnalysis,
+  getBusinessAnalysis,
   type BusinessInsight,
   type BusinessImplication,
   type BusinessRisk,
@@ -13,6 +14,7 @@ import {
   type ReflectionStep,
 } from "@/lib/api";
 import { strings } from "@/lib/strings";
+import { useUiStore } from "@/stores/uiStore";
 
 interface BusinessInsightsProps {
   scenarioId: string;
@@ -20,6 +22,8 @@ interface BusinessInsightsProps {
   onMinimize?: () => void;
   /** If provided, display immediately instead of fetching */
   preloaded?: BusinessInsight | null;
+  /** Keep parent store in sync when analysis is loaded or regenerated */
+  onInsightChange?: (insight: BusinessInsight) => void;
 }
 
 // ── Visual helpers ──
@@ -74,8 +78,25 @@ function RiskCard({ item }: { item: BusinessRisk }) {
   );
 }
 
-function RecommendationCard({ item, index }: { item: BusinessRecommendation; index: number }) {
+function RecommendationCard({
+  item,
+  index,
+  onCta,
+}: {
+  item: BusinessRecommendation;
+  index: number;
+  onCta?: (cta: NonNullable<BusinessRecommendation["cta"]>) => void;
+}) {
   const style = PRIORITY_STYLES[item.priority] || PRIORITY_STYLES.monitor;
+  const ctaLabel =
+    item.cta === "open_doc_manager_model" || item.cta === "open_doc_manager"
+      ? "Open Document Manager"
+      : item.cta === "open_review"
+        ? "Review & Re-run"
+        : item.cta === "refresh_analysis"
+          ? "Refresh analysis"
+          : null;
+
   return (
     <div className={`rounded-xl border border-[var(--card-border)] bg-[var(--card-bg)] border-l-4 ${style.border} p-3.5 shadow-card`}>
       <div className="flex items-start gap-2">
@@ -95,16 +116,135 @@ function RecommendationCard({ item, index }: { item: BusinessRecommendation; ind
             )}
           </div>
           <p className="text-xs text-[var(--text-muted)] mt-1">{item.rationale}</p>
+          {item.cta && ctaLabel && onCta && (
+            <button
+              type="button"
+              onClick={() => onCta(item.cta!)}
+              className="mt-2.5 inline-flex items-center gap-1.5 rounded-lg bg-accent px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-accent-hover transition-colors"
+            >
+              {ctaLabel}
+              <span aria-hidden>→</span>
+            </button>
+          )}
         </div>
       </div>
     </div>
   );
 }
 
-export function BusinessInsights({ scenarioId, onClose, onMinimize, preloaded }: BusinessInsightsProps) {
+function IntegrityRemediationBanner({
+  reasons,
+  onFixModel,
+  onReview,
+  onRefresh,
+}: {
+  reasons?: string[];
+  onFixModel: () => void;
+  onReview: () => void;
+  onRefresh: () => void;
+}) {
+  return (
+    <section className="rounded-xl border border-[var(--warning)]/40 bg-[var(--warning-bg)] p-4 space-y-3">
+      <div className="flex items-start gap-2.5">
+        <div className="w-7 h-7 rounded-lg bg-[var(--warning)]/15 flex items-center justify-center shrink-0 mt-0.5">
+          <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" className="text-[var(--warning)]">
+            <path d="M10.29 3.86L1.82 18a2 2 0 001.71 3h16.94a2 2 0 001.71-3L13.71 3.86a2 2 0 00-3.42 0z" />
+            <line x1="12" y1="9" x2="12" y2="13" />
+            <line x1="12" y1="17" x2="12.01" y2="17" />
+          </svg>
+        </div>
+        <div className="min-w-0">
+          <p className="text-xs font-semibold text-[var(--warning)]">Remediation required — baseline integrity failure</p>
+          <p className="text-[11px] text-[var(--text-secondary)] mt-1 leading-relaxed">
+            {reasons?.[0] ||
+              "Base P&L is missing or ~0, so % deltas are math artifacts. Fix the model baseline, re-run the scenario, then refresh this analysis before making decisions."}
+          </p>
+        </div>
+      </div>
+      <ol className="space-y-2 pl-1">
+        <li className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-secondary)]">
+          <span className="font-semibold text-[var(--text-primary)] w-4">1.</span>
+          <span className="flex-1 min-w-[12rem]">Load or correct non-zero base P&L in Document Manager → Model</span>
+          <button
+            type="button"
+            onClick={onFixModel}
+            className="rounded-lg bg-accent px-3 py-1.5 text-[11px] font-semibold text-white hover:bg-accent-hover"
+          >
+            Open Model
+          </button>
+        </li>
+        <li className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-secondary)]">
+          <span className="font-semibold text-[var(--text-primary)] w-4">2.</span>
+          <span className="flex-1 min-w-[12rem]">Re-approve parameters and run the scenario against the fixed baseline</span>
+          <button
+            type="button"
+            onClick={onReview}
+            className="rounded-lg border border-[var(--border)] bg-[var(--card-bg)] px-3 py-1.5 text-[11px] font-semibold text-[var(--text-primary)] hover:bg-[var(--panel-bg)]"
+          >
+            Review &amp; Run
+          </button>
+        </li>
+        <li className="flex flex-wrap items-center gap-2 text-[11px] text-[var(--text-secondary)]">
+          <span className="font-semibold text-[var(--text-primary)] w-4">3.</span>
+          <span className="flex-1 min-w-[12rem]">Refresh So What? to replace this integrity warning with impact analysis</span>
+          <button
+            type="button"
+            onClick={onRefresh}
+            className="rounded-lg border border-[var(--border)] bg-[var(--card-bg)] px-3 py-1.5 text-[11px] font-semibold text-[var(--text-primary)] hover:bg-[var(--panel-bg)]"
+          >
+            Refresh analysis
+          </button>
+        </li>
+      </ol>
+    </section>
+  );
+}
+
+export function BusinessInsights({ scenarioId, onClose, onMinimize, preloaded, onInsightChange }: BusinessInsightsProps) {
   const [insight, setInsight] = useState<BusinessInsight | null>(preloaded || null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const loadedForRef = useRef<string | null>(null);
+  const openDocManagerModel = useUiStore((s) => s.openDocManagerModel);
+  const openDocManagerForValidation = useUiStore((s) => s.openDocManagerForValidation);
+  const openReviewForRerun = useUiStore((s) => s.openReviewForRerun);
+
+  // Restore persisted analysis once per scenario (avoid remount / store-sync fetch storms)
+  useEffect(() => {
+    let cancelled = false;
+
+    if (preloaded) {
+      setInsight(preloaded);
+      loadedForRef.current = scenarioId;
+      setLoading(false);
+      return;
+    }
+
+    if (loadedForRef.current === scenarioId) return;
+    loadedForRef.current = scenarioId;
+
+    (async () => {
+      setLoading(true);
+      setError(null);
+      try {
+        const stored = await getBusinessAnalysis(scenarioId);
+        if (cancelled) return;
+        if (stored) setInsight(stored);
+      } catch (e) {
+        if (!cancelled) {
+          loadedForRef.current = null;
+          setError((e as Error).message);
+        }
+      } finally {
+        if (!cancelled) setLoading(false);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- only re-fetch when scenario changes
+  }, [scenarioId]);
 
   const run = useCallback(async () => {
     setLoading(true);
@@ -112,11 +252,27 @@ export function BusinessInsights({ scenarioId, onClose, onMinimize, preloaded }:
     try {
       const data = await generateBusinessAnalysis(scenarioId);
       setInsight(data);
+      loadedForRef.current = scenarioId;
+      onInsightChange?.(data);
     } catch (e) {
       setError((e as Error).message);
     }
     setLoading(false);
-  }, [scenarioId]);
+  }, [scenarioId, onInsightChange]);
+
+  const handleCta = useCallback(
+    (cta: NonNullable<BusinessRecommendation["cta"]>) => {
+      if (cta === "open_doc_manager_model") openDocManagerModel();
+      else if (cta === "open_doc_manager") openDocManagerForValidation();
+      else if (cta === "open_review") openReviewForRerun();
+      else if (cta === "refresh_analysis") void run();
+    },
+    [openDocManagerModel, openDocManagerForValidation, openReviewForRerun, run],
+  );
+
+  const isIntegrity =
+    insight?.analysis_mode === "integrity" ||
+    (!!insight && /baseline|zero[\s-]?base|math artifact|reload.*base|fix model setup/i.test(insight.headline));
 
   return (
     <div className="border-t border-[var(--border)] bg-background max-h-[70vh] overflow-auto">
@@ -161,7 +317,24 @@ export function BusinessInsights({ scenarioId, onClose, onMinimize, preloaded }:
       {loading && !insight && (
         <div className="px-4 py-8 text-center">
           <div className="inline-block w-6 h-6 border-2 border-accent/30 border-t-accent rounded-full animate-spin mb-3" />
-          <p className="text-xs text-[var(--text-muted)]">Analyzing scenario impact...</p>
+          <p className="text-xs text-[var(--text-muted)]">
+            {preloaded ? "Analyzing scenario impact..." : "Loading saved analysis..."}
+          </p>
+        </div>
+      )}
+
+      {!loading && !insight && !error && (
+        <div className="px-4 py-8 text-center">
+          <p className="text-xs text-[var(--text-muted)] mb-3">
+            No saved business analysis for this scenario yet.
+          </p>
+          <button
+            onClick={run}
+            disabled={loading}
+            className="rounded-lg bg-accent px-4 py-1.5 text-xs font-medium text-white hover:bg-accent-hover disabled:opacity-40 shadow-sm transition-colors"
+          >
+            Generate Analysis
+          </button>
         </div>
       )}
 
@@ -171,6 +344,15 @@ export function BusinessInsights({ scenarioId, onClose, onMinimize, preloaded }:
           <div className="rounded-xl bg-accent/5 border border-accent/15 p-4">
             <p className="text-sm font-semibold leading-relaxed text-[var(--text-primary)]">{insight.headline}</p>
           </div>
+
+          {isIntegrity && (
+            <IntegrityRemediationBanner
+              reasons={insight.mode_reasons}
+              onFixModel={openDocManagerModel}
+              onReview={openReviewForRerun}
+              onRefresh={() => void run()}
+            />
+          )}
 
           {/* Implications */}
           <section>
@@ -203,7 +385,7 @@ export function BusinessInsights({ scenarioId, onClose, onMinimize, preloaded }:
             </h4>
             <div className="grid gap-2">
               {insight.recommendations.map((item, i) => (
-                <RecommendationCard key={i} item={item} index={i} />
+                <RecommendationCard key={i} item={item} index={i} onCta={handleCta} />
               ))}
             </div>
           </section>

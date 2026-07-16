@@ -250,7 +250,7 @@ test("E2E: Business analysis agent (So What?)", async () => {
   assert.ok(insight.decision_context, "should have decision_context");
   assert.ok(insight.confidence_note, "should have confidence_note");
 
-  // Verify stored in outputs
+  // Verify stored in outputs and retrievable via GET
   const outputsRes = await agent
     .get(`/api/v1/scenarios/${scenarioId}/outputs`)
     .expect(200);
@@ -258,6 +258,13 @@ test("E2E: Business analysis agent (So What?)", async () => {
     (o: { output_type: string }) => o.output_type === "business_analysis"
   );
   assert.ok(analysisOutput, "business analysis should be stored in scenario_outputs");
+
+  const getRes = await agent
+    .get(`/api/v1/scenarios/${scenarioId}/business-analysis`)
+    .expect(200);
+  assert.equal(getRes.body.headline, insight.headline);
+  assert.ok(getRes.body.qa_report !== undefined, "persisted payload should include qa_report field");
+  assert.ok(Array.isArray(getRes.body.reflection_log), "persisted payload should include reflection_log");
 });
 
 // ═══════════════════════════════════════════════════════════════
