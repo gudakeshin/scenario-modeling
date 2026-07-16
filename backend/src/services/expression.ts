@@ -17,6 +17,7 @@
 
 import type { ModelDefinition, ModelVariable } from "../models/registry.js";
 import { inferMetricTypeFromId, type MetricType } from "./metricTypes.js";
+import { LruCache } from "../utils/lruCache.js";
 
 export class ExpressionError extends Error {
   variableId?: string;
@@ -67,7 +68,10 @@ const FUNCTION_NAMES = new Set(Object.keys(SAFE_FUNCTIONS));
 
 const TOKEN_RE = /([A-Za-z_][A-Za-z0-9_]*)|(\d+(?:\.\d+)?(?:[eE][+-]?\d+)?)|([+\-*/%(),])|(\s+)|(.)/g;
 
-const formulaCache = new Map<string, CompiledFn>();
+// Keyed by the raw formula string across all models in the process, so the
+// keyspace grows with distinct formula text, not distinct models — bound it
+// generously since compiled entries are cheap (a single JS function each).
+const formulaCache = new LruCache<string, CompiledFn>({ maxEntries: 5000 });
 
 /**
  * Compile a formula string into a function of (ctx, fns).

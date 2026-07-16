@@ -7,6 +7,7 @@
  */
 
 import { pool } from "../db/index.js";
+import { LruCache } from "../utils/lruCache.js";
 import { getModelDefinition } from "../models/registry.js";
 import { CompiledModel, type EvaluableModel, type TypedOverride, type DeltaType } from "./expression.js";
 import { getXlsxRuntime, type XlsxModelSchemaLike } from "./xlsxRuntime.js";
@@ -113,7 +114,13 @@ async function resolveExternalModel(row: ActiveUserModelRow): Promise<ResolvedMo
   };
 }
 
-const dimensionalCache = new Map<string, DimensionalModel>();
+// Each entry holds a fully materialized dimensional model (all leaf facts
+// resolved into memory), so keep the ceiling modest — this is a small number
+// of distinct external-model snapshots actively in use, not a per-request
+// cache. Explicit invalidation (clearDimensionalRuntimeCache) still applies
+// after a snapshot refresh; the cap only guards against unbounded growth
+// from long-tail/abandoned snapshots.
+const dimensionalCache = new LruCache<string, DimensionalModel>({ maxEntries: 200 });
 
 async function getDimensionalRuntime(
   snapshotId: string,

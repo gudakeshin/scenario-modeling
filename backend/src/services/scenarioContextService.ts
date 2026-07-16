@@ -1,5 +1,6 @@
 import { logger } from "../logger.js";
 import { config } from "../config.js";
+import { LruCache } from "../utils/lruCache.js";
 
 export interface TouchedLever {
   id: string;
@@ -43,7 +44,14 @@ export interface ScenarioContext {
   comparisonVersions: ScenarioComparisonVersion[];
 }
 
-const scenarioContexts = new Map<string, ScenarioContext>();
+// L1 cache only — Redis + scenarios.context_data are the durable stores, so
+// bounding this is safe: a dropped/evicted entry is re-hydrated on next read
+// (see hydrateScenarioContext). Sized generously for concurrent active
+// scenarios; TTL mirrors session TTL so L1 doesn't outlive a session.
+const scenarioContexts = new LruCache<string, ScenarioContext>({
+  maxEntries: 2000,
+  ttlMs: config.SESSION_TTL_MS,
+});
 
 const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
 const REDIS_KEY_PREFIX = "sm:ctx:";
@@ -129,7 +137,7 @@ function defaultContext(): ScenarioContext {
 }
 
 /**
- * Write-through persistence: L1 Map + optional Redis + scenarios.context_data.
+ * Write-through persistence: L1 LruCache + optional Redis + scenarios.context_data.
  * Non-UUID ids (tests) skip durable stores.
  */
 function persist(scenarioId: string): void {
