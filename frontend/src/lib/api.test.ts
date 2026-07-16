@@ -5,6 +5,7 @@ import {
   setTokens,
   clearTokens,
   getAccessToken,
+  hydrateSessionFromCookie,
 } from "./api";
 
 describe("apiFetch", () => {
@@ -112,5 +113,20 @@ describe("apiFetch", () => {
     expect(res.status).toBe(401);
     expect(getAccessToken()).toBeNull();
     expect(window.location.href).toMatch(/^\/login\?next=/);
+  });
+
+  it("hydrates access token from refresh cookie", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(
+        JSON.stringify({
+          access_token: "hydrated-access",
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } }
+      )
+    );
+
+    const ok = await hydrateSessionFromCookie();
+    expect(ok).toBe(true);
+    expect(getAccessToken()).toBe("hydrated-access");
   });
 });

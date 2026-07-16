@@ -141,6 +141,31 @@ test("refresh token rotation invalidates old token", async () => {
     .expect(200);
 });
 
+test("login sets auth cookies and refresh works from cookie", async () => {
+  const admin = await loginSeedAdmin();
+  const email = `cookie-${suffix}@test.local`;
+  const password = "cookie-pass-123";
+  await adminCreateUser(admin.access_token, email, password, "analyst", "Cookie User");
+
+  const loginRes = await agent.post("/api/v1/auth/login").send({ email, password }).expect(200);
+  const rawSetCookie = loginRes.headers["set-cookie"];
+  const setCookie = Array.isArray(rawSetCookie)
+    ? rawSetCookie
+    : typeof rawSetCookie === "string"
+      ? [rawSetCookie]
+      : [];
+  assert.ok(setCookie?.some((c) => c.startsWith("sm_refresh=")), "sm_refresh cookie should be set");
+  assert.ok(setCookie?.some((c) => c.startsWith("sm_session=1")), "sm_session hint cookie should be set");
+
+  const cookieHeader = (setCookie ?? []).map((c) => c.split(";")[0]).join("; ");
+  const refreshRes = await agent
+    .post("/api/v1/auth/refresh")
+    .set("Cookie", cookieHeader)
+    .send({})
+    .expect(200);
+  assert.ok(refreshRes.body.access_token, "refresh via cookie should issue access token");
+});
+
 test("audit export is scoped to approver visibility", async () => {
   const admin = await loginSeedAdmin();
   const pass = "test-password-123";
@@ -187,6 +212,28 @@ test("audit export is scoped to approver visibility", async () => {
   const actionTypes = res.body.map((e: { action_type: string }) => e.action_type);
   assert.ok(actionTypes.includes("audit_action_a"), "A should see its own audit rows");
   assert.ok(!actionTypes.includes("audit_action_b"), "A must not see B's unshared audit rows");
+});
+
+test("run endpoint returns 409 when simulation already in progress", async () => {
+  const admin = await loginSeedAdmin();
+  const email = `runner-${suffix}@test.local`;
+  const pass = "runner-pass-123";
+  const runnerUser = await adminCreateUser(admin.access_token, email, pass, "analyst", "Runner");
+  const runner = await login(email, pass);
+
+  const scenario = await pool.query(
+    `INSERT INTO scenarios (nl_input, name, status, creator_id, model_version_hash)
+     VALUES ('run lock test', 'run-lock', 'running', $1, 'v0')
+     RETURNING scenario_id`,
+    [runnerUser.user_id],
+  );
+  const scenarioId = scenario.rows[0].scenario_id as string;
+
+  const res = await agent
+    .post(`/api/v1/scenarios/${scenarioId}/run`)
+    .set("Authorization", `Bearer ${runner.access_token}`)
+    .expect(409);
+  assert.match(String(res.body?.error || ""), /already in progress/i);
 });
 
 test("cleanup pool", async () => {
