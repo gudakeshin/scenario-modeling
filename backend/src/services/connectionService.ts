@@ -9,6 +9,7 @@ import type { FactQuery, PlanningModelMetadata, PlanningModelSummary } from "../
 import { encryptSecret } from "./secretVault.js";
 import { getRequestContext } from "../requestContext.js";
 import type { Scope } from "../middleware/workspace.js";
+import { assertSafeEgress } from "../connectors/egressGuard.js";
 import type {
   CreateConnectionBody,
   UpdateConnectionBody,
@@ -97,6 +98,7 @@ export async function createConnection(
   scope: Scope,
   body: CreateConnectionBody,
 ): Promise<ConnectionPublic> {
+  await assertSafeEgress(body.base_url);
   const ciphertext = encryptSecret(body.secret);
   try {
     const r = await pool.query(
@@ -201,6 +203,7 @@ export async function updateConnection(
 
   const name = body.name ?? existing.name;
   const baseUrl = body.base_url ?? existing.base_url;
+  await assertSafeEgress(baseUrl);
   const authKind = body.auth_kind ?? existing.auth_kind;
   const authPublic = body.auth_public ?? existing.auth_public;
   const ciphertext = body.secret
@@ -283,6 +286,7 @@ export async function testConnection(
 ): Promise<{ ok: boolean; message?: string }> {
   const row = await getConnectionWithSecret(scope.workspaceId, connectionId);
   if (!row) throw new ConnectionError("Connection not found", 404);
+  await assertSafeEgress(row.base_url);
 
   const connector = createConnector(row);
   let result: { ok: boolean; message?: string };
@@ -315,6 +319,7 @@ export async function testConnection(
 export async function testConnectionDraft(
   body: TestConnectionBody,
 ): Promise<{ ok: boolean; message?: string; model_count?: number }> {
+  await assertSafeEgress(body.base_url);
   try {
     const connector = createConnectorFromDraft({
       provider: body.provider,

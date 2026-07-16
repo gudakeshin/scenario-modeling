@@ -40,11 +40,16 @@ auditRouter.get("/export", requireRole("approver"), async (req, res) => {
   try {
     const scenario_id = req.query.scenario_id as string | undefined;
     const format = req.query.format === "json" ? "json" : "csv";
+    const scope = {
+      scenarioId: scenario_id,
+      userId: req.user!.userId,
+      role: req.user!.role,
+    };
     if (format === "json") {
-      const data = await exportAuditJson(scenario_id);
+      const data = await exportAuditJson(scope);
       return res.json(data);
     }
-    const csv = await exportAuditCsv(scenario_id);
+    const csv = await exportAuditCsv(scope);
     res.setHeader("Content-Type", "text/csv");
     res.setHeader("Content-Disposition", "attachment; filename=audit_trail.csv");
     return res.send(csv);

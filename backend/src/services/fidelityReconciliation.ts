@@ -123,7 +123,7 @@ export function reconcileFidelity(
   let hf: HyperFormula;
   try {
     hf = HyperFormula.buildFromSheets(dense as Record<string, (string | number | null)[][]>, {
-      licenseKey: "gpl-v3",
+      licenseKey: config.HYPERFORMULA_LICENSE_KEY,
       useColumnIndex: false,
     });
   } catch (e) {

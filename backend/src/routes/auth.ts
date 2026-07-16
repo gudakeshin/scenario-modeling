@@ -12,6 +12,7 @@ import {
 import { pool } from "../db/index.js";
 import { config } from "../config.js";
 import { isOidcConfigured, OidcAuthProvider } from "../auth/oidcProvider.js";
+import { setAuthCookies, clearAuthCookies, readRefreshToken } from "../auth/cookies.js";
 
 export const authRouter = Router();
 
@@ -20,6 +21,29 @@ function clientMeta(req: { headers: Record<string, unknown>; ip?: string }) {
     userAgent: typeof req.headers["user-agent"] === "string" ? req.headers["user-agent"] : undefined,
     ip: req.ip,
   };
+}
+
+function tokenResponse(
+  res: import("express").Response,
+  user: { userId: string; email: string; name: string | null; role: string },
+  tokens: { accessToken: string; refreshToken: string; expiresIn: number },
+  status = 200,
+) {
+  setAuthCookies(res, tokens.refreshToken);
+  const body: Record<string, unknown> = {
+    user: {
+      user_id: user.userId,
+      email: user.email,
+      name: user.name,
+      role: user.role,
+    },
+    access_token: tokens.accessToken,
+    expires_in: tokens.expiresIn,
+  };
+  if (config.AUTH_REFRESH_BODY_FALLBACK) {
+    body.refresh_token = tokens.refreshToken;
+  }
+  return res.status(status).json(body);
 }
 
 function sendError(res: import("express").Response, e: unknown) {
@@ -67,17 +91,12 @@ authRouter.post("/register", validateBody(registerSchema), async (req, res) => {
       { email: req.body.email, password: req.body.password },
       clientMeta(req),
     );
-    return res.status(201).json({
-      user: {
-        user_id: user.userId,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-      },
-      access_token: tokens.accessToken,
-      refresh_token: tokens.refreshToken,
-      expires_in: tokens.expiresIn,
-    });
+    return tokenResponse(
+      res,
+      { userId: user.userId, email: user.email, name: user.name, role: user.role },
+      tokens,
+      201,
+    );
   } catch (e) {
     return sendError(res, e);
   }
@@ -91,17 +110,11 @@ authRouter.post("/login", validateBody(loginSchema), async (req, res) => {
       });
     }
     const { user, tokens } = await getLocalAuthProvider().login(req.body, clientMeta(req));
-    return res.json({
-      user: {
-        user_id: user.userId,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-      },
-      access_token: tokens.accessToken,
-      refresh_token: tokens.refreshToken,
-      expires_in: tokens.expiresIn,
-    });
+    return tokenResponse(
+      res,
+      { userId: user.userId, email: user.email, name: user.name, role: user.role },
+      tokens,
+    );
   } catch (e) {
     return sendError(res, e);
   }
@@ -114,12 +127,20 @@ authRouter.post("/refresh", validateBody(refreshSchema), async (req, res) => {
         error: "Refresh via IdP token endpoint when AUTH_PROVIDER=oidc",
       });
     }
-    const tokens = await getLocalAuthProvider().refresh(req.body.refresh_token, clientMeta(req));
-    return res.json({
+    const refreshToken = readRefreshToken(req, req.body.refresh_token);
+    if (!refreshToken) {
+      return res.status(401).json({ error: "Refresh token required" });
+    }
+    const tokens = await getLocalAuthProvider().refresh(refreshToken, clientMeta(req));
+    setAuthCookies(res, tokens.refreshToken);
+    const body: Record<string, unknown> = {
       access_token: tokens.accessToken,
-      refresh_token: tokens.refreshToken,
       expires_in: tokens.expiresIn,
-    });
+    };
+    if (config.AUTH_REFRESH_BODY_FALLBACK) {
+      body.refresh_token = tokens.refreshToken;
+    }
+    return res.json(body);
   } catch (e) {
     return sendError(res, e);
   }
@@ -127,7 +148,11 @@ authRouter.post("/refresh", validateBody(refreshSchema), async (req, res) => {
 
 authRouter.post("/logout", validateBody(logoutSchema), async (req, res) => {
   try {
-    await getAuthProvider().logout(req.body.refresh_token);
+    const refreshToken = readRefreshToken(req, req.body.refresh_token);
+    if (refreshToken) {
+      await getAuthProvider().logout(refreshToken);
+    }
+    clearAuthCookies(res);
     return res.json({ ok: true });
   } catch (e) {
     return sendError(res, e);
@@ -182,17 +207,6 @@ authRouter.get("/oidc/callback", async (req, res) => {
         ? (getAuthProvider() as OidcAuthProvider)
         : new OidcAuthProvider();
     const { user, tokens } = await provider.handleCallback(code, clientMeta(req));
-    const payload = {
-      user: {
-        user_id: user.userId,
-        email: user.email,
-        name: user.name,
-        role: user.role,
-      },
-      access_token: tokens.accessToken,
-      refresh_token: tokens.refreshToken,
-      expires_in: tokens.expiresIn,
-    };
     const fromState = OidcAuthProvider.parseStateNext(
       typeof req.query.state === "string" ? req.query.state : undefined,
     );
@@ -203,14 +217,15 @@ authRouter.get("/oidc/callback", async (req, res) => {
       fromState ||
       "/";
     if (req.query.format === "json") {
-      return res.json(payload);
+      return tokenResponse(
+        res,
+        { userId: user.userId, email: user.email, name: user.name, role: user.role },
+        tokens,
+      );
     }
+    setAuthCookies(res, tokens.refreshToken);
     const dest = new URL(next, config.FRONTEND_ORIGIN);
-    dest.hash = new URLSearchParams({
-      access_token: tokens.accessToken,
-      refresh_token: tokens.refreshToken,
-      expires_in: String(tokens.expiresIn),
-    }).toString();
+    dest.searchParams.set("oidc", "1");
     return res.redirect(302, dest.toString());
   } catch (e) {
     return sendError(res, e);

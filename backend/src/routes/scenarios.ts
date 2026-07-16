@@ -902,21 +902,55 @@ scenariosRouter.post("/:id/approve", requireRole("approver"), async (req, res) =
     const sid = req.params.id;
     const userId = req.user!.userId;
     await assertCanWriteScenario(userId, req.user!.role, sid);
-    const params = await pool.query(
-      "SELECT status FROM scenario_parameters WHERE scenario_id = $1",
-      [sid]
-    );
-    if (params.rows.length === 0) return res.status(400).json({ error: "No parameters to approve" });
-    const hasAccepted = params.rows.some((p: { status: string }) => p.status === "accepted");
-    if (!hasAccepted) {
-      return res.status(400).json({ error: "At least one parameter must be accepted before approval" });
+
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+
+      const params = await client.query(
+        "SELECT status FROM scenario_parameters WHERE scenario_id = $1",
+        [sid],
+      );
+      if (params.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "No parameters to approve" });
+      }
+      const hasAccepted = params.rows.some((p: { status: string }) => p.status === "accepted");
+      if (!hasAccepted) {
+        await client.query("ROLLBACK");
+        return res.status(400).json({ error: "At least one parameter must be accepted before approval" });
+      }
+
+      const updated = await client.query(
+        `UPDATE scenarios
+         SET status = 'approved', approved_at = NOW(), approved_by = $2
+         WHERE scenario_id = $1 AND status <> 'approved'
+         RETURNING scenario_id, status`,
+        [sid, userId],
+      );
+
+      if (updated.rows.length === 0) {
+        const current = await client.query(
+          "SELECT status FROM scenarios WHERE scenario_id = $1",
+          [sid],
+        );
+        if (current.rows[0]?.status === "approved") {
+          await client.query("COMMIT");
+          return res.json({ scenario_id: sid, status: "approved", idempotent: true });
+        }
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Scenario not found" });
+      }
+
+      await logAudit(sid, "approved", { approved_by: userId }, userId, undefined, undefined, client);
+      await client.query("COMMIT");
+      return res.json({ scenario_id: sid, status: "approved" });
+    } catch (e) {
+      await client.query("ROLLBACK");
+      throw e;
+    } finally {
+      client.release();
     }
-    await pool.query(
-      `UPDATE scenarios SET status = 'approved', approved_at = NOW(), approved_by = $2 WHERE scenario_id = $1`,
-      [sid, userId]
-    );
-    await logAudit(sid, "approved", { approved_by: userId }, userId);
-    return res.json({ scenario_id: sid, status: "approved" });
   } catch (e) {
     const status = authzError(e);
     if (status) return res.status(status).json({ error: (e as Error).message });
@@ -927,38 +961,112 @@ scenariosRouter.post("/:id/approve", requireRole("approver"), async (req, res) =
 
 // ── Run simulation (requires approval) ──
 scenariosRouter.post("/:id/run", requireRole("analyst"), async (req, res) => {
+  const sid = req.params.id;
+  const userId = req.user!.userId;
+  let priorStatus: string | null = null;
+
   try {
-    const sid = req.params.id;
-    const userId = req.user!.userId;
     await assertCanWriteScenario(userId, req.user!.role, sid);
-    const sRes = await pool.query("SELECT status FROM scenarios WHERE scenario_id = $1", [sid]);
-    if (sRes.rows.length === 0) return res.status(404).json({ error: "Scenario not found" });
-    if (sRes.rows[0].status !== "approved" && sRes.rows[0].status !== "completed") {
-      return res.status(400).json({ error: "Scenario must be approved before running. Accept parameters and click Approve first." });
-    }
-    await hydrateScenarioContext(sid);
-    const output = await runSimulation(sid);
-    addComparisonVersion(sid, `run_${new Date().toISOString()}`, output.pl);
+
+    const lockClient = await pool.connect();
     try {
-      const { createScenarioVersion } = await import("../services/scenarioVersionService.js");
-      await createScenarioVersion(sid, {
-        label: `run_${new Date().toISOString()}`,
-        outputs: output.pl,
-        userId,
-        workspaceId: scopeOf(req).workspaceId,
-      });
-    } catch (verErr) {
-      logger.warn({ detail: (verErr as Error).message }, "[Versions] persist failed (non-fatal)");
+      await lockClient.query("BEGIN");
+      await lockClient.query(`SELECT pg_advisory_xact_lock(hashtext($1))`, [sid]);
+
+      const sRes = await lockClient.query(
+        "SELECT status FROM scenarios WHERE scenario_id = $1 FOR UPDATE",
+        [sid],
+      );
+      if (sRes.rows.length === 0) {
+        await lockClient.query("ROLLBACK");
+        return res.status(404).json({ error: "Scenario not found" });
+      }
+      priorStatus = String(sRes.rows[0].status);
+      if (priorStatus === "running") {
+        await lockClient.query("ROLLBACK");
+        return res.status(409).json({ error: "Simulation already in progress" });
+      }
+      if (priorStatus !== "approved" && priorStatus !== "completed") {
+        await lockClient.query("ROLLBACK");
+        return res.status(400).json({
+          error: "Scenario must be approved before running. Accept parameters and click Approve first.",
+        });
+      }
+
+      const flip = await lockClient.query(
+        `UPDATE scenarios SET status = 'running', updated_at = NOW()
+         WHERE scenario_id = $1 AND status IN ('approved', 'completed')
+         RETURNING scenario_id`,
+        [sid],
+      );
+      if (flip.rows.length === 0) {
+        await lockClient.query("ROLLBACK");
+        return res.status(409).json({ error: "Simulation already in progress" });
+      }
+      await lockClient.query("COMMIT");
+    } catch (e) {
+      await lockClient.query("ROLLBACK");
+      throw e;
+    } finally {
+      lockClient.release();
     }
-    await logAudit(
-      sid,
-      "simulation_run",
-      { metrics: Object.keys(output.pl) },
-      userId,
-      getTouchedLeverSnapshot(sid) as unknown as Record<string, unknown>[],
-    );
+
+    await hydrateScenarioContext(sid);
+    const output = await runSimulation(sid, { skipPersist: true });
+    addComparisonVersion(sid, `run_${new Date().toISOString()}`, output.pl);
+
+    const persistClient = await pool.connect();
+    try {
+      await persistClient.query("BEGIN");
+      await persistClient.query(
+        `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
+        [sid, JSON.stringify(output.pl)],
+      );
+      await persistClient.query(
+        `UPDATE scenarios SET status = 'completed', updated_at = NOW() WHERE scenario_id = $1`,
+        [sid],
+      );
+      const { createScenarioVersion } = await import("../services/scenarioVersionService.js");
+      await createScenarioVersion(
+        sid,
+        {
+          label: `run_${new Date().toISOString()}`,
+          outputs: output.pl,
+          userId,
+          workspaceId: scopeOf(req).workspaceId,
+        },
+        persistClient,
+      );
+      await logAudit(
+        sid,
+        "simulation_run",
+        { metrics: Object.keys(output.pl) },
+        userId,
+        getTouchedLeverSnapshot(sid) as unknown as Record<string, unknown>[],
+        undefined,
+        persistClient,
+      );
+      await persistClient.query("COMMIT");
+    } catch (verErr) {
+      await persistClient.query("ROLLBACK");
+      logger.warn({ detail: (verErr as Error).message }, "[Versions] persist failed");
+      throw verErr;
+    } finally {
+      persistClient.release();
+    }
+
     return res.json({ scenario_id: sid, ...output });
   } catch (e) {
+    if (priorStatus === "approved" || priorStatus === "completed") {
+      await pool
+        .query(
+          `UPDATE scenarios SET status = $2, updated_at = NOW() WHERE scenario_id = $1 AND status = 'running'`,
+          [sid, priorStatus],
+        )
+        .catch((restoreErr) => {
+          logger.error({ err: restoreErr, scenario_id: sid }, "Failed to restore scenario status after run error");
+        });
+    }
     if (e instanceof SimulationFiniteError) {
       return res.status(422).json({
         error: e.message,

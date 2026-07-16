@@ -13,11 +13,11 @@ export const loginSchema = z.object({
 });
 
 export const refreshSchema = z.object({
-  refresh_token: z.string().min(1),
+  refresh_token: z.string().min(1).optional(),
 });
 
 export const logoutSchema = z.object({
-  refresh_token: z.string().min(1),
+  refresh_token: z.string().min(1).optional(),
 });
 
 export const updateRoleSchema = z.object({

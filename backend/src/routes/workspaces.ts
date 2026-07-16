@@ -12,7 +12,9 @@ import {
   deleteWorkspace,
 } from "../services/workspaceService.js";
 import { requireRole } from "../middleware/rbac.js";
+import { validateBody } from "../middleware/validate.js";
 import { logger } from "../logger.js";
+import { createWorkspaceSchema, renameWorkspaceSchema } from "../schemas/workspaces.js";
 
 export const workspacesRouter = Router();
 
@@ -30,7 +32,7 @@ workspacesRouter.get("/", async (req, res) => {
   }
 });
 
-workspacesRouter.post("/", requireRole("analyst"), async (req, res) => {
+workspacesRouter.post("/", requireRole("analyst"), validateBody(createWorkspaceSchema), async (req, res) => {
   try {
     const workspace = await createWorkspace(req.user!.userId, req.body?.name);
     return res.status(201).json(workspace);
@@ -42,9 +44,9 @@ workspacesRouter.post("/", requireRole("analyst"), async (req, res) => {
   }
 });
 
-workspacesRouter.put("/:id", requireRole("analyst"), async (req, res) => {
+workspacesRouter.put("/:id", requireRole("analyst"), validateBody(renameWorkspaceSchema), async (req, res) => {
   try {
-    const workspace = await renameWorkspace(req.user!.userId, req.params.id, req.body?.name);
+    const workspace = await renameWorkspace(req.user!.userId, req.params.id, req.body.name);
     return res.json(workspace);
   } catch (e) {
     const status = statusOf(e);

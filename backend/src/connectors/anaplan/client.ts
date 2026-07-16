@@ -1,5 +1,6 @@
 import { logger } from "../../logger.js";
 import type { ConnectorAuth } from "../types.js";
+import { fetchWithTimeout } from "../http.js";
 
 export type FetchLike = typeof fetch;
 
@@ -71,8 +72,9 @@ export class AnaplanClient {
       return { token: this.auth.apiKey, expiresAt: Number.POSITIVE_INFINITY };
     }
     const basic = Buffer.from(`${this.auth.clientId}:${this.auth.clientSecret}`).toString("base64");
-    const response = await this.fetchImpl(
-      this.auth.tokenUrl || "https://auth.anaplan.com/token/authenticate",
+    const tokenUrl = this.auth.tokenUrl || "https://auth.anaplan.com/token/authenticate";
+    const response = await fetchWithTimeout(
+      tokenUrl,
       {
         method: "POST",
         headers: {
@@ -81,6 +83,7 @@ export class AnaplanClient {
           "Content-Type": "application/json",
         },
       },
+      this.fetchImpl,
     );
     if (!response.ok) {
       const detail = await response.text().catch(() => "");
@@ -92,14 +95,18 @@ export class AnaplanClient {
   }
 
   private async refresh(current: TokenCache): Promise<TokenCache> {
-    const response = await this.fetchImpl("https://auth.anaplan.com/token/refresh", {
-      method: "POST",
-      headers: {
-        Authorization: `AnaplanAuthToken ${current.token}`,
-        Accept: "application/json",
-        "Content-Type": "application/json",
+    const response = await fetchWithTimeout(
+      "https://auth.anaplan.com/token/refresh",
+      {
+        method: "POST",
+        headers: {
+          Authorization: `AnaplanAuthToken ${current.token}`,
+          Accept: "application/json",
+          "Content-Type": "application/json",
+        },
       },
-    });
+      this.fetchImpl,
+    );
     if (!response.ok) {
       throw new Error(`Anaplan token refresh failed (${response.status})`);
     }
@@ -139,14 +146,18 @@ export class AnaplanClient {
     let lastError: Error | null = null;
     for (let attempt = 0; attempt <= this.maxRetries; attempt += 1) {
       const token = await this.getAccessToken();
-      const response = await this.fetchImpl(url, {
-        ...init,
-        headers: {
-          Accept: "application/json",
-          Authorization: `AnaplanAuthToken ${token}`,
-          ...(init?.headers || {}),
+      const response = await fetchWithTimeout(
+        url,
+        {
+          ...init,
+          headers: {
+            Accept: "application/json",
+            Authorization: `AnaplanAuthToken ${token}`,
+            ...(init?.headers || {}),
+          },
         },
-      });
+        this.fetchImpl,
+      );
       if (response.ok) return response;
 
       if (response.status === 401 && retry401 && this.auth.kind !== "api_key") {

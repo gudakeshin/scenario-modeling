@@ -141,6 +141,54 @@ test("refresh token rotation invalidates old token", async () => {
     .expect(200);
 });
 
+test("audit export is scoped to approver visibility", async () => {
+  const admin = await loginSeedAdmin();
+  const pass = "test-password-123";
+
+  const aEmail = `approver-a-${suffix}@test.local`;
+  const bEmail = `approver-b-${suffix}@test.local`;
+
+  const aUser = await adminCreateUser(admin.access_token, aEmail, pass, "approver", "Approver A");
+  await adminCreateUser(admin.access_token, bEmail, pass, "approver", "Approver B");
+
+  const bLogin = await login(bEmail, pass);
+
+  const aScenario = await pool.query(
+    `INSERT INTO scenarios (nl_input, name, status, creator_id, model_version_hash)
+     VALUES ('audit export test A', 'audit-a', 'approved', $1, 'v0')
+     RETURNING scenario_id`,
+    [aUser.user_id],
+  );
+  const bScenario = await pool.query(
+    `INSERT INTO scenarios (nl_input, name, status, creator_id, model_version_hash)
+     VALUES ('audit export test B', 'audit-b', 'approved', $1, 'v0')
+     RETURNING scenario_id`,
+    [bLogin.user.user_id],
+  );
+
+  await pool.query(
+    `INSERT INTO audit_trail (scenario_id, action_type, user_id, action_details, touched_levers_snapshot)
+     VALUES ($1, 'audit_action_a', $2, '{}'::jsonb, NULL)`,
+    [aScenario.rows[0].scenario_id, aUser.user_id],
+  );
+  await pool.query(
+    `INSERT INTO audit_trail (scenario_id, action_type, user_id, action_details, touched_levers_snapshot)
+     VALUES ($1, 'audit_action_b', $2, '{}'::jsonb, NULL)`,
+    [bScenario.rows[0].scenario_id, bLogin.user.user_id],
+  );
+
+  const aLogin = await login(aEmail, pass);
+  const res = await agent
+    .get("/api/v1/audit/export?format=json")
+    .set("Authorization", `Bearer ${aLogin.access_token}`)
+    .expect(200);
+
+  assert.ok(Array.isArray(res.body));
+  const actionTypes = res.body.map((e: { action_type: string }) => e.action_type);
+  assert.ok(actionTypes.includes("audit_action_a"), "A should see its own audit rows");
+  assert.ok(!actionTypes.includes("audit_action_b"), "A must not see B's unshared audit rows");
+});
+
 test("cleanup pool", async () => {
   await pool.end();
 });

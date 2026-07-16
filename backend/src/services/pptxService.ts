@@ -47,7 +47,14 @@ function fmtNum(n: number, currency = "USD"): string {
   return sym + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
 }
 
-function addSectionTitle(slide: { addText: Function; addShape: Function }, pptx: { ShapeType: { rect: unknown } }, title: string) {
+function addSectionTitle(
+  slide: {
+    addText: (text: string, options?: Record<string, unknown>) => unknown;
+    addShape: (shapeType: unknown, options?: Record<string, unknown>) => unknown;
+  },
+  pptx: { ShapeType: { rect: unknown } },
+  title: string,
+) {
   slide.addText(title, {
     x: 0.5, y: 0.3, w: 10, h: 0.6,
     fontSize: 22, fontFace: "Arial",

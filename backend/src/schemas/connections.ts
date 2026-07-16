@@ -1,9 +1,16 @@
 import { z } from "zod";
+import { refineEgressUrl } from "../connectors/egressGuard.js";
+
+const baseUrlSchema = z
+  .string()
+  .url()
+  .or(z.literal("mock://local"))
+  .superRefine((url, ctx) => refineEgressUrl(url, ctx));
 
 export const createConnectionSchema = z.object({
   provider: z.enum(["sap_sac", "anaplan", "oracle_pbcs", "mock"]),
   name: z.string().trim().min(1).max(200),
-  base_url: z.string().url().or(z.literal("mock://local")),
+  base_url: baseUrlSchema,
   auth_kind: z.enum(["oauth2_client_credentials", "api_key"]),
   auth_public: z.record(z.unknown()).default({}),
   /** Client secret or API key — encrypted at rest, never echoed. */
@@ -12,7 +19,7 @@ export const createConnectionSchema = z.object({
 
 export const updateConnectionSchema = z.object({
   name: z.string().trim().min(1).max(200).optional(),
-  base_url: z.string().url().or(z.literal("mock://local")).optional(),
+  base_url: baseUrlSchema.optional(),
   auth_kind: z.enum(["oauth2_client_credentials", "api_key"]).optional(),
   auth_public: z.record(z.unknown()).optional(),
   /** Omit to keep existing secret. */
@@ -22,7 +29,7 @@ export const updateConnectionSchema = z.object({
 /** Unsaved connection config — tested in-memory without persisting. */
 export const testConnectionSchema = z.object({
   provider: z.enum(["sap_sac", "anaplan", "oracle_pbcs", "mock"]),
-  base_url: z.string().url().or(z.literal("mock://local")),
+  base_url: baseUrlSchema,
   auth_kind: z.enum(["oauth2_client_credentials", "api_key"]),
   auth_public: z.record(z.unknown()).default({}),
   secret: z.string().min(1),

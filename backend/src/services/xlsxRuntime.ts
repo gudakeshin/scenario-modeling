@@ -7,6 +7,7 @@
  */
 
 import { HyperFormula, DetailedCellError } from "hyperformula";
+import { config } from "../config.js";
 import type { WorkbookGraph } from "./excelExtractor.js";
 import type { EvaluableModel, ModelInput, PeriodSlice } from "./expression.js";
 import {
@@ -213,7 +214,7 @@ export class XlsxModelRuntime implements EvaluableModel {
     let hf: HyperFormula;
     try {
       hf = HyperFormula.buildFromSheets(snapshot as Record<string, (string | number | null)[][]>, {
-        licenseKey: "gpl-v3",
+        licenseKey: config.HYPERFORMULA_LICENSE_KEY,
         useColumnIndex: false,
       });
     } catch (e) {

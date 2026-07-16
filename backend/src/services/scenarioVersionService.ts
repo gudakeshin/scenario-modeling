@@ -4,6 +4,7 @@
 
 import { pool } from "../db/index.js";
 import { getScenarioContext, getTouchedLeverSnapshot } from "./scenarioContextService.js";
+import type { PoolClient } from "pg";
 
 export interface ScenarioVersionRow {
   version_id: string;
@@ -26,21 +27,23 @@ export async function createScenarioVersion(
     userId?: string;
     workspaceId?: string | null;
   },
+  client?: PoolClient,
 ): Promise<ScenarioVersionRow> {
-  const maxRes = await pool.query(
+  const db = client ?? pool;
+  const maxRes = await db.query(
     `SELECT COALESCE(MAX(version_number), 0) AS n FROM scenario_versions WHERE scenario_id = $1`,
     [scenarioId],
   );
   const next = Number(maxRes.rows[0]?.n || 0) + 1;
   const label = opts.label || `v${next}`;
   const levers = getTouchedLeverSnapshot(scenarioId);
-  const params = await pool.query(
+  const params = await db.query(
     `SELECT extracted_name, mapped_variable_id, scenario_value, delta_type, status
      FROM scenario_parameters WHERE scenario_id = $1 AND status != 'rejected'`,
     [scenarioId],
   );
 
-  const r = await pool.query(
+  const r = await db.query(
     `INSERT INTO scenario_versions (
        scenario_id, workspace_id, label, version_number,
        touched_levers, parameters_snapshot, outputs, created_by

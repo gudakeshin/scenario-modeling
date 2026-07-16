@@ -21,7 +21,11 @@ async function main() {
   const client = new pg.Client({ connectionString });
   await client.connect();
   try {
-    const password = process.env.SEED_ADMIN_PASSWORD || "changeme-admin-password";
+    const password = process.env.SEED_ADMIN_PASSWORD;
+    if (!password) {
+      console.error("SEED_ADMIN_PASSWORD is required for seeding in CI/test/dev.");
+      process.exit(1);
+    }
     const hash = await argon2.hash(password, { type: argon2.argon2id });
 
     await client.query(
@@ -33,7 +37,7 @@ async function main() {
              is_active = TRUE`,
       [hash]
     );
-    console.log("Seeded admin user: dev@example.com / (SEED_ADMIN_PASSWORD or changeme-admin-password)");
+    console.log("Seeded admin user: dev@example.com / (SEED_ADMIN_PASSWORD)");
 
     await client.query(
       `INSERT INTO model_mappings (business_term, model_variable_id, synonyms) VALUES

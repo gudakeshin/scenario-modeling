@@ -28,6 +28,8 @@ import { portfolioRouter } from "./routes/portfolio.js";
 import { organizationsRouter } from "./routes/organizations.js";
 import { startServer } from "./server.js";
 import { initSentry } from "./errorReporter.js";
+import { captureException } from "./errorReporter.js";
+import type { Request, Response, NextFunction } from "express";
 
 const app = express();
 
@@ -123,7 +125,15 @@ app.get("/ready", async (_req, res) => {
   }
 });
 
-app.get("/metrics", async (_req, res) => {
+function metricsAuth(req: Request, res: Response, next: NextFunction) {
+  if (config.NODE_ENV !== "production") return next();
+  const expected = config.METRICS_TOKEN;
+  const header = req.headers.authorization;
+  if (expected && header === `Bearer ${expected}`) return next();
+  return res.status(401).json({ error: "Unauthorized" });
+}
+
+app.get("/metrics", metricsAuth, async (_req, res) => {
   res.setHeader("Content-Type", registry.contentType);
   res.send(await registry.metrics());
 });
@@ -148,6 +158,29 @@ app.use("/api/v1/config", configRouter);
 app.use("/api/v1/connections", connectionsRouter);
 app.use("/api/v1/portfolio", portfolioRouter);
 app.use("/api/v1/organizations", organizationsRouter);
+
+function requestIdOf(req: Request): string | undefined {
+  const id = (req as Request & { id?: string }).id;
+  return id ? String(id) : undefined;
+}
+
+app.use((req, res) => {
+  res.status(404).json({
+    error: "Not found",
+    requestId: requestIdOf(req),
+  });
+});
+
+// eslint-disable-next-line @typescript-eslint/no-unused-vars
+app.use((err: unknown, req: Request, res: Response, _next: NextFunction) => {
+  const requestId = requestIdOf(req);
+  const message = (err as Error)?.message || "Internal server error";
+  if (message.includes("CORS blocked")) {
+    return res.status(403).json({ error: "CORS policy blocked this origin", requestId });
+  }
+  captureException(err, { requestId });
+  return res.status(500).json({ error: "Internal server error", requestId });
+});
 
 export { app };
 

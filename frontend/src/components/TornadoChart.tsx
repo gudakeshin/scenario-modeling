@@ -68,7 +68,6 @@ export function TornadoChart({ scenarioId, onClose, onMinimize }: TornadoChartPr
   const [varOptions, setVarOptions] = useState<{ value: string; label: string }[]>([]);
   const [varA, setVarA] = useState("");
   const [varB, setVarB] = useState("");
-  const [metricsReady, setMetricsReady] = useState(false);
 
   useEffect(() => {
     getActiveModel().then(({ model }) => {
@@ -97,11 +96,9 @@ export function TornadoChart({ scenarioId, onClose, onMinimize }: TornadoChartPr
         setTargetMetric("ebitda");
         setMetricOptions([{ value: "ebitda", label: "EBITDA" }]);
       }
-      setMetricsReady(true);
     }).catch(() => {
       setTargetMetric("ebitda");
       setMetricOptions([{ value: "ebitda", label: "EBITDA" }]);
-      setMetricsReady(true);
     });
   }, []);
 

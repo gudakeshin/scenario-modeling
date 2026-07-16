@@ -333,6 +333,11 @@ async function storeAndComplete(scenarioId: string, outputData: Record<string, u
   );
 }
 
+export interface RunSimulationOptions {
+  /** When true, caller persists outputs/status/version/audit atomically. */
+  skipPersist?: boolean;
+}
+
 async function enforceConstraints(scenarioId: string, absolute: Record<string, number>): Promise<void> {
   const ctx = (await hydrateScenarioContext(scenarioId)) ?? getScenarioContext(scenarioId);
   const result = validateAgainstConstraints(absolute, ctx?.constraints ?? []);
@@ -346,8 +351,15 @@ async function enforceConstraints(scenarioId: string, absolute: Record<string, n
 
 // ── Entry point ──
 
-export async function runSimulation(scenarioId: string): Promise<SimulationOutput> {
-  return withTimeout(_runSimulationDispatcher(scenarioId), SIMULATION_TIMEOUT_MS, "Simulation");
+export async function runSimulation(
+  scenarioId: string,
+  options?: RunSimulationOptions,
+): Promise<SimulationOutput> {
+  return withTimeout(
+    _runSimulationDispatcher(scenarioId, options),
+    SIMULATION_TIMEOUT_MS,
+    "Simulation",
+  );
 }
 
 /**
@@ -479,7 +491,10 @@ export async function previewSimulationForScenario(
   };
 }
 
-async function _runSimulationDispatcher(scenarioId: string): Promise<SimulationOutput> {
+async function _runSimulationDispatcher(
+  scenarioId: string,
+  options?: RunSimulationOptions,
+): Promise<SimulationOutput> {
   const resolved = await getEvaluableModelForScenario(scenarioId);
   const overrides = await loadScenarioOverrides(scenarioId);
   const { absolute } = resolveOverridesToAbsolute(resolved.model, overrides);
@@ -487,14 +502,14 @@ async function _runSimulationDispatcher(scenarioId: string): Promise<SimulationO
 
   if (resolved.source === "external_model") {
     simulationsRun.inc({ engine: "dimensional" });
-    return _runDimensionalSimulation(scenarioId, resolved, overrides);
+    return _runDimensionalSimulation(scenarioId, resolved, overrides, options);
   }
   if (resolved.source === "xlsx_cell_graph") {
     simulationsRun.inc({ engine: "xlsx" });
-    return _runXlsxSimulation(scenarioId, resolved, overrides);
+    return _runXlsxSimulation(scenarioId, resolved, overrides, options);
   }
   simulationsRun.inc({ engine: "formula" });
-  return _runFormulaSimulation(scenarioId, overrides);
+  return _runFormulaSimulation(scenarioId, overrides, options);
 }
 
 // ── External dimensional model path ──
@@ -503,6 +518,7 @@ async function _runDimensionalSimulation(
   scenarioId: string,
   resolved: ResolvedModel,
   overrides: ScenarioOverride[],
+  options?: RunSimulationOptions,
 ): Promise<SimulationOutput> {
   const model = resolved.model as DimensionalModel;
   const def = resolved.dimensionalDef!;
@@ -622,7 +638,9 @@ async function _runDimensionalSimulation(
     ...(notices.length > 0 ? { notices } : {}),
     ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
   };
-  await storeAndComplete(scenarioId, outputData);
+  if (!options?.skipPersist) {
+    await storeAndComplete(scenarioId, outputData);
+  }
 
   return {
     pl,
@@ -646,17 +664,21 @@ async function _runXlsxSimulation(
   scenarioId: string,
   resolved: ResolvedModel,
   overrides: ScenarioOverride[],
+  options?: RunSimulationOptions,
 ): Promise<SimulationOutput> {
   const runtime = resolved.model;
   const { absolute, unresolved } = resolveOverridesToAbsolute(runtime, overrides);
 
   // Prefer multi-period evaluation when the runtime supports it
   const evaluatePeriods =
-    "evaluatePeriods" in runtime && typeof (runtime as { evaluatePeriods?: Function }).evaluatePeriods === "function"
-      ? (runtime as {
-          evaluatePeriods: (o: Record<string, number>) => Array<{ period: string; values: Record<string, number> }>;
-        }).evaluatePeriods.bind(runtime)
-      : null;
+    (() => {
+      const maybe = (runtime as { evaluatePeriods?: unknown }).evaluatePeriods;
+      if (typeof maybe !== "function") return null;
+      const typed = maybe as (
+        o: Record<string, number>,
+      ) => Array<{ period: string; values: Record<string, number> }>;
+      return typed.bind(runtime);
+    })();
 
   const baseOut = runtime.evaluate({});
   const scenarioOut = runtime.evaluate(absolute);
@@ -761,7 +783,9 @@ async function _runXlsxSimulation(
     ...(notices.length > 0 ? { notices } : {}),
     ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
   };
-  await storeAndComplete(scenarioId, outputData);
+  if (!options?.skipPersist) {
+    await storeAndComplete(scenarioId, outputData);
+  }
 
   return {
     pl,
@@ -783,6 +807,7 @@ async function _runXlsxSimulation(
 async function _runFormulaSimulation(
   scenarioId: string,
   overrides: ScenarioOverride[],
+  options?: RunSimulationOptions,
 ): Promise<SimulationOutput> {
   const scenarioRes = await pool.query(
     "SELECT model_version_hash FROM scenarios WHERE scenario_id = $1",
@@ -881,7 +906,9 @@ async function _runFormulaSimulation(
   if (warnings.length > 0) {
     logger.warn(`[Simulation] ${warnings.length} absurdity warning(s) generated`);
   }
-  await storeAndComplete(scenarioId, outputData);
+  if (!options?.skipPersist) {
+    await storeAndComplete(scenarioId, outputData);
+  }
 
   return {
     pl: aggregatePl,

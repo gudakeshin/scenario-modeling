@@ -8,7 +8,7 @@ import {
   isAuthenticated,
   getAuthConfig,
   oidcAuthorizeHref,
-  setTokens,
+  hydrateSessionFromCookie,
 } from "@/lib/api";
 
 export default function LoginClient() {
@@ -29,20 +29,18 @@ export default function LoginClient() {
   const [authProvider, setAuthProvider] = useState<"local" | "oidc">("local");
 
   useEffect(() => {
-    // Capture tokens from OIDC redirect hash (access_token=…&refresh_token=…)
-    if (typeof window !== "undefined" && window.location.hash.length > 1) {
-      const hash = new URLSearchParams(window.location.hash.slice(1));
-      const access = hash.get("access_token");
-      const refresh = hash.get("refresh_token");
-      if (access && refresh) {
-        setTokens(access, refresh);
-        window.history.replaceState(null, "", window.location.pathname + window.location.search);
-        router.replace(nextPath);
-        return;
+    void (async () => {
+      const oidcReturn = searchParams.get("oidc") === "1";
+      if (oidcReturn || document.cookie.includes("sm_session=1")) {
+        const ok = await hydrateSessionFromCookie();
+        if (ok) {
+          router.replace(nextPath);
+          return;
+        }
       }
-    }
-    if (isAuthenticated()) router.replace(nextPath);
-  }, [router, nextPath]);
+      if (isAuthenticated()) router.replace(nextPath);
+    })();
+  }, [router, nextPath, searchParams]);
 
   useEffect(() => {
     void getAuthConfig()

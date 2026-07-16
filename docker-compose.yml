@@ -39,6 +39,9 @@ services:
       JWT_ISSUER: scenario-modeling
       JWT_AUDIENCE: scenario-modeling-api
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
+      # Required in production (fail-fast).
+      HYPERFORMULA_LICENSE_KEY: ${HYPERFORMULA_LICENSE_KEY:?Set HYPERFORMULA_LICENSE_KEY in the environment or a .env file}
+      METRICS_TOKEN: ${METRICS_TOKEN:?Set METRICS_TOKEN in the environment or a .env file}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in the environment or a .env file}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5-20251001}
       PERPLEXITY_API_KEY: ${PERPLEXITY_API_KEY:-}

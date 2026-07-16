@@ -4,6 +4,7 @@
 
 import { logger } from "../../logger.js";
 import type { ConnectorAuth } from "../types.js";
+import { fetchWithTimeout } from "../http.js";
 
 export type FetchLike = typeof fetch;
 
@@ -68,11 +69,11 @@ export class ODataClient {
           client_id: this.auth.clientId,
           client_secret: this.auth.clientSecret,
         });
-        const res = await this.fetchImpl(this.auth.tokenUrl, {
+        const res = await fetchWithTimeout(this.auth.tokenUrl, {
           method: "POST",
           headers: { "Content-Type": "application/x-www-form-urlencoded" },
           body,
-        });
+        }, this.fetchImpl);
         if (!res.ok) {
           const text = await res.text().catch(() => "");
           throw new Error(`SAC token fetch failed (${res.status}): ${text.slice(0, 200)}`);
@@ -96,7 +97,7 @@ export class ODataClient {
     let lastErr: Error | null = null;
     for (let attempt = 0; attempt <= this.maxRetries; attempt++) {
       const token = await this.getAccessToken();
-      const res = await this.fetchImpl(url, {
+      const res = await fetchWithTimeout(url, {
         ...init,
         headers: {
           Accept: "application/json, application/xml, text/xml, */*",
@@ -104,7 +105,7 @@ export class ODataClient {
             this.auth.kind === "api_key" ? `Bearer ${token}` : `Bearer ${token}`,
           ...(init?.headers || {}),
         },
-      });
+      }, this.fetchImpl);
 
       if (res.ok) return res;
 

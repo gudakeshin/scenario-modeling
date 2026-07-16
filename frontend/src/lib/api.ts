@@ -1,8 +1,9 @@
 const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
 
-const ACCESS_KEY = "sm_access_token";
-const REFRESH_KEY = "sm_refresh_token";
 const WORKSPACE_KEY = "sm_workspace_id";
+
+/** Access token lives in module memory only — never localStorage (XSS mitigation). */
+let accessToken: string | null = null;
 
 function storage(): Storage | null {
   if (typeof window === "undefined") return null;
@@ -22,50 +23,55 @@ export function setActiveWorkspaceId(id: string | null): void {
 }
 
 export function getAccessToken(): string | null {
-  return storage()?.getItem(ACCESS_KEY) ?? null;
+  return accessToken;
 }
 
+/** @deprecated refresh token is httpOnly cookie — kept for tests / body-fallback only */
 export function getRefreshToken(): string | null {
-  return storage()?.getItem(REFRESH_KEY) ?? null;
+  return null;
 }
 
-export function setTokens(accessToken: string, refreshToken: string): void {
-  const s = storage();
-  if (!s) return;
-  s.setItem(ACCESS_KEY, accessToken);
-  s.setItem(REFRESH_KEY, refreshToken);
+export function setAccessToken(token: string | null): void {
+  accessToken = token;
+}
+
+/** Store access token after login / refresh (refresh token is set via httpOnly cookie). */
+export function setTokens(access: string): void {
+  accessToken = access;
 }
 
 export function clearTokens(): void {
-  const s = storage();
-  if (!s) return;
-  s.removeItem(ACCESS_KEY);
-  s.removeItem(REFRESH_KEY);
+  accessToken = null;
 }
 
 export function isAuthenticated(): boolean {
-  return !!getAccessToken();
+  return !!accessToken;
+}
+
+/** Bootstrap session from httpOnly refresh cookie (page reload / OIDC return). */
+export async function hydrateSessionFromCookie(): Promise<boolean> {
+  if (accessToken) return true;
+  return tryRefresh();
 }
 
 let refreshInFlight: Promise<boolean> | null = null;
 
 async function tryRefresh(): Promise<boolean> {
-  const refresh = getRefreshToken();
-  if (!refresh) return false;
   if (!refreshInFlight) {
     refreshInFlight = (async () => {
       try {
         const res = await fetch(`${API_BASE}/api/v1/auth/refresh`, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ refresh_token: refresh }),
+          credentials: "include",
+          body: JSON.stringify({}),
         });
         if (!res.ok) {
           clearTokens();
           return false;
         }
         const data = await res.json();
-        setTokens(data.access_token, data.refresh_token);
+        setTokens(data.access_token);
         return true;
       } catch {
         clearTokens();
@@ -105,7 +111,7 @@ async function fetchWithTimeout(input: string, init: RequestInit, timeoutMs: num
     init.signal.addEventListener("abort", () => controller.abort(), { once: true });
   }
   try {
-    return await fetch(input, { ...init, signal: controller.signal });
+    return await fetch(input, { ...init, signal: controller.signal, credentials: init.credentials ?? "include" });
   } catch (e) {
     if (controller.signal.aborted && !(init.signal?.aborted)) {
       throw new ApiTimeoutError(timeoutMs);
@@ -133,8 +139,8 @@ export type ApiFetchInit = RequestInit & { timeoutMs?: number };
 /** Authenticated fetch: Bearer token + workspace header, timeout, 401 → refresh → retry → login redirect. */
 export async function apiFetch(input: string, init: ApiFetchInit = {}, timeoutMs?: number): Promise<Response> {
   // Prefer explicit 3rd arg, then init.timeoutMs, then default — so LLM callers can't silently get 30s.
-  const ms = timeoutMs ?? init.timeoutMs ?? DEFAULT_TIMEOUT_MS;
-  const { timeoutMs: _ignored, ...fetchInit } = init;
+  const { timeoutMs: initTimeoutMs, ...fetchInit } = init;
+  const ms = timeoutMs ?? initTimeoutMs ?? DEFAULT_TIMEOUT_MS;
   let res = await fetchWithTimeout(input, { ...fetchInit, headers: buildAuthHeaders(fetchInit) }, ms);
   if (res.status === 401 && !input.includes("/api/v1/auth/")) {
     const ok = await tryRefresh();
@@ -731,7 +737,7 @@ export interface AuthUser {
 export interface AuthResponse {
   user: AuthUser;
   access_token: string;
-  refresh_token: string;
+  refresh_token?: string;
   expires_in: number;
 }
 
@@ -739,6 +745,7 @@ export async function login(email: string, password: string): Promise<AuthRespon
   const res = await fetch(`${API_BASE}/api/v1/auth/login`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify({ email, password }),
   });
   if (!res.ok) {
@@ -746,7 +753,7 @@ export async function login(email: string, password: string): Promise<AuthRespon
     throw new Error((err as { error?: string }).error || "Login failed");
   }
   const data = await res.json();
-  setTokens(data.access_token, data.refresh_token);
+  setTokens(data.access_token);
   return data;
 }
 
@@ -770,6 +777,7 @@ export async function register(email: string, password: string, name?: string): 
   const res = await fetch(`${API_BASE}/api/v1/auth/register`, {
     method: "POST",
     headers: { "Content-Type": "application/json" },
+    credentials: "include",
     body: JSON.stringify({ email, password, name }),
   });
   if (!res.ok) {
@@ -777,20 +785,18 @@ export async function register(email: string, password: string, name?: string): 
     throw new Error((err as { error?: string }).error || "Registration failed");
   }
   const data = await res.json();
-  if (data.access_token) setTokens(data.access_token, data.refresh_token);
+  if (data.access_token) setTokens(data.access_token);
   return data;
 }
 
 export async function logout(): Promise<void> {
-  const refresh = getRefreshToken();
   try {
-    if (refresh) {
-      await fetch(`${API_BASE}/api/v1/auth/logout`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ refresh_token: refresh }),
-      });
-    }
+    await fetch(`${API_BASE}/api/v1/auth/logout`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
+      body: JSON.stringify({}),
+    });
   } finally {
     clearTokens();
   }

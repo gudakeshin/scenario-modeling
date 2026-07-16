@@ -34,6 +34,9 @@ coverage/
 # TypeScript
 *.tsbuildinfo
 
+# Excel lock files
+~$*
+
 # Misc
 *.pem
 .vercel

@@ -63,7 +63,7 @@ describe("apiFetch", () => {
   });
 
   it("refreshes tokens and retries once on 401", async () => {
-    setTokens("expired-access", "valid-refresh");
+    setTokens("expired-access");
 
     const fetchMock = vi.mocked(fetch);
     fetchMock
@@ -101,7 +101,7 @@ describe("apiFetch", () => {
   });
 
   it("clears tokens and redirects to login when refresh fails after 401", async () => {
-    setTokens("expired-access", "bad-refresh");
+    setTokens("expired-access");
 
     const fetchMock = vi.mocked(fetch);
     fetchMock

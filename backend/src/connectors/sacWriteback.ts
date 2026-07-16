@@ -6,6 +6,7 @@
 import { pool } from "../db/index.js";
 import { createConnector, type ConnectionRow } from "./registry.js";
 import { logger } from "../logger.js";
+import { fetchWithTimeout } from "./http.js";
 
 export interface SacWritebackRequest {
   connection_id: string;
@@ -103,7 +104,7 @@ export async function writeBackToSac(req: SacWritebackRequest): Promise<SacWrite
         row.secret_ciphertext,
       );
       // Minimal bearer / client-credentials POST of fact payload
-      const res = await fetch(writeUrl, {
+      const res = await fetchWithTimeout(writeUrl, {
         method: "POST",
         headers: {
           "Content-Type": "application/json",

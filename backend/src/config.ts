@@ -118,6 +118,25 @@ const envSchema = z.object({
    * - enterprise: showcase + Redis/OIDC/object-store oriented defaults
    */
   DEPLOYMENT_PROFILE: z.enum(["standard", "showcase", "enterprise"]).default("standard"),
+  /** HyperFormula license key — gpl-v3 allowed in dev/test only. */
+  HYPERFORMULA_LICENSE_KEY: z.string().min(1).default("gpl-v3"),
+  /** Bearer token required to scrape /metrics in production. */
+  METRICS_TOKEN: z.string().min(16).optional(),
+  /** Postgres pool max connections. */
+  PG_POOL_MAX: z.coerce.number().int().positive().default(10),
+  /** Per-connection statement_timeout in milliseconds. */
+  PG_STATEMENT_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  /** Connector HTTP timeout (ms) — see connectors/http.ts. */
+  CONNECTOR_HTTP_TIMEOUT_MS: z.coerce.number().int().positive().default(30_000),
+  /** Comma-separated hostnames bypassing private-IP egress checks. */
+  CONNECTOR_EGRESS_ALLOWLIST: z.string().optional(),
+  /** When true, accept refresh_token in POST body alongside httpOnly cookie. */
+  AUTH_REFRESH_BODY_FALLBACK: z
+    .string()
+    .optional()
+    .transform((v) => v === "1" || v?.toLowerCase() === "true"),
+  /** Additional CORS origins (comma-separated). FRONTEND_ORIGIN is always included. */
+  FRONTEND_ORIGINS: z.string().optional(),
 });
 
 const DEFAULT_ANALYSIS_MODEL = "claude-sonnet-5";
@@ -155,6 +174,20 @@ function loadConfig(): AppConfig {
       );
       process.exit(1);
     }
+  }
+  if (env.NODE_ENV === "production" && env.DEMO_MODE) {
+    console.error("DEMO_MODE must not be enabled in production");
+    process.exit(1);
+  }
+  if (env.NODE_ENV === "production" && env.HYPERFORMULA_LICENSE_KEY === "gpl-v3") {
+    console.error(
+      "HYPERFORMULA_LICENSE_KEY=gpl-v3 is not permitted in production — procure a commercial Handsoncode license",
+    );
+    process.exit(1);
+  }
+  if (env.NODE_ENV === "production" && !env.METRICS_TOKEN) {
+    console.error("METRICS_TOKEN is required in production (min 16 characters)");
+    process.exit(1);
   }
   return {
     ...env,

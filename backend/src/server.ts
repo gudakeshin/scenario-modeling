@@ -3,8 +3,15 @@ import type http from "node:http";
 import { config } from "./config.js";
 import { pool } from "./db/index.js";
 import { logger } from "./logger.js";
+import { captureException } from "./errorReporter.js";
 
 const SHUTDOWN_FORCE_KILL_MS = 10_000;
+
+let shutdownHandler: ((signal: string) => void) | null = null;
+
+export function requestShutdown(signal: string): void {
+  shutdownHandler?.(signal);
+}
 
 export function startServer(app: Express): http.Server {
   const server = app.listen(config.PORT, () => {
@@ -38,8 +45,19 @@ export function startServer(app: Express): http.Server {
     });
   };
 
+  shutdownHandler = shutdown;
+
   process.on("SIGTERM", () => shutdown("SIGTERM"));
   process.on("SIGINT", () => shutdown("SIGINT"));
+
+  process.on("unhandledRejection", (reason) => {
+    captureException(reason, { kind: "unhandledRejection" });
+  });
+
+  process.on("uncaughtException", (err) => {
+    captureException(err, { kind: "uncaughtException" });
+    shutdown("uncaughtException");
+  });
 
   return server;
 }

@@ -238,7 +238,7 @@ test("SacConnector listModels uses Administration Providers", async () => {
   const creds: ConnectionCredentials = {
     connectionId: "c1",
     provider: "sap_sac",
-    baseUrl: "https://example.sapanalytics.cloud",
+    baseUrl: "https://example.com",
     auth: {
       kind: "oauth2_client_credentials",
       tokenUrl: "https://example.com/token",

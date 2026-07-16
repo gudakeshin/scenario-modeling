@@ -1,4 +1,5 @@
 import { createHash, randomUUID } from "node:crypto";
+import type { PoolClient } from "pg";
 import { pool } from "../db/index.js";
 import type { Role } from "../auth/provider.js";
 import { getRequestContext } from "../requestContext.js";
@@ -82,6 +83,7 @@ export async function logAudit(
   userId?: string,
   touchedLeversSnapshot?: Record<string, unknown>[],
   meta?: AuditMeta,
+  client?: PoolClient,
 ): Promise<void> {
   if (!userId) {
     throw new Error("logAudit requires userId");
@@ -98,17 +100,18 @@ export async function logAudit(
   const actionDetailsJson = details ? JSON.stringify(details) : null;
   const touchedJson = touchedLeversSnapshot ? JSON.stringify(touchedLeversSnapshot) : null;
 
-  const client = await pool.connect();
+  const ownsTxn = !client;
+  const db = client ?? (await pool.connect());
   try {
-    await client.query("BEGIN");
+    if (ownsTxn) await db.query("BEGIN");
 
     // Ensure singleton head row exists, then lock it for the chain append.
-    await client.query(
+    await db.query(
       `INSERT INTO audit_chain_head (id, last_hash, last_audit_id)
        VALUES (1, NULL, NULL)
        ON CONFLICT (id) DO NOTHING`,
     );
-    const headRes = await client.query<{ last_hash: string | null }>(
+    const headRes = await db.query<{ last_hash: string | null }>(
       `SELECT last_hash FROM audit_chain_head WHERE id = 1 FOR UPDATE`,
     );
     const prevHash = headRes.rows[0]?.last_hash ?? "";
@@ -130,7 +133,7 @@ export async function logAudit(
     });
     const rowHash = computeRowHash(prevHash, canonical);
 
-    await client.query(
+    await db.query(
       `INSERT INTO audit_trail (
          audit_id, scenario_id, action_type, user_id, action_details,
          touched_levers_snapshot, timestamp, prev_hash, row_hash,
@@ -152,17 +155,17 @@ export async function logAudit(
       ],
     );
 
-    await client.query(
+    await db.query(
       `UPDATE audit_chain_head SET last_hash = $1, last_audit_id = $2 WHERE id = 1`,
       [rowHash, auditId],
     );
 
-    await client.query("COMMIT");
+    if (ownsTxn) await db.query("COMMIT");
   } catch (e) {
-    await client.query("ROLLBACK");
+    if (ownsTxn) await db.query("ROLLBACK");
     throw e;
   } finally {
-    client.release();
+    if (ownsTxn) db.release();
   }
 }
 
@@ -315,8 +318,17 @@ export async function getAuditTrail(
   }
 }
 
-export async function exportAuditCsv(scenarioId?: string): Promise<string> {
-  const { entries } = await getAuditTrail({ scenario_id: scenarioId, limit: 500 });
+export async function exportAuditCsv(opts: {
+  scenarioId?: string;
+  userId: string;
+  role: Role;
+}): Promise<string> {
+  const { entries } = await getAuditTrail({
+    scenario_id: opts.scenarioId,
+    limit: 500,
+    userId: opts.userId,
+    role: opts.role,
+  });
   const lines = ["audit_id,scenario_id,action_type,user_id,timestamp,details,touched_levers_snapshot"];
   for (const e of entries) {
     const details = e.action_details ? JSON.stringify(e.action_details).replace(/"/g, '""') : "";
@@ -326,7 +338,16 @@ export async function exportAuditCsv(scenarioId?: string): Promise<string> {
   return lines.join("\n");
 }
 
-export async function exportAuditJson(scenarioId?: string): Promise<AuditEntry[]> {
-  const { entries } = await getAuditTrail({ scenario_id: scenarioId, limit: 500 });
+export async function exportAuditJson(opts: {
+  scenarioId?: string;
+  userId: string;
+  role: Role;
+}): Promise<AuditEntry[]> {
+  const { entries } = await getAuditTrail({
+    scenario_id: opts.scenarioId,
+    limit: 500,
+    userId: opts.userId,
+    role: opts.role,
+  });
   return entries;
 }

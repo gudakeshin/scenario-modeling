@@ -13,8 +13,14 @@ import {
 import { buildContextForUser } from "../services/contextEngineFactory.js";
 import { pool } from "../db/index.js";
 import { requireRole } from "../middleware/rbac.js";
+import { validateBody } from "../middleware/validate.js";
 import { scopeOf } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
+import {
+  updateContextSchema,
+  acknowledgeTieOutSchema,
+  updateModelSchemaEndpointSchema,
+} from "../schemas/context.js";
 
 export const contextRouter = Router();
 
@@ -78,7 +84,7 @@ contextRouter.get("/", async (req, res) => {
 });
 
 // ── Update context data ──
-contextRouter.put("/", requireRole("analyst"), async (req, res) => {
+contextRouter.put("/", requireRole("analyst"), validateBody(updateContextSchema), async (req, res) => {
   try {
     const existing = await getActiveContext(scopeOf(req));
     if (!existing) return res.status(404).json({ error: "No active context to update" });
@@ -91,7 +97,7 @@ contextRouter.put("/", requireRole("analyst"), async (req, res) => {
 });
 
 // ── Acknowledge text-path tie-out variances and activate the model ──
-contextRouter.post("/acknowledge-tie-out", requireRole("analyst"), async (req, res) => {
+contextRouter.post("/acknowledge-tie-out", requireRole("analyst"), validateBody(acknowledgeTieOutSchema), async (req, res) => {
   try {
     const scope = scopeOf(req);
     const existing = await getActiveContext(scope);
@@ -165,12 +171,11 @@ contextRouter.get("/model", async (req, res) => {
 });
 
 // ── Update model definition ──
-contextRouter.put("/model", requireRole("analyst"), async (req, res) => {
+contextRouter.put("/model", requireRole("analyst"), validateBody(updateModelSchemaEndpointSchema), async (req, res) => {
   try {
     const scope = scopeOf(req);
     const model = await getActiveModel(scope);
     if (!model) return res.status(404).json({ error: "No active model to update" });
-    if (!req.body.model_definition) return res.status(400).json({ error: "model_definition is required" });
     await updateModel(model.model_id, req.body.model_definition);
     const updated = await getActiveModel(scope);
     return res.json({ model: updated });

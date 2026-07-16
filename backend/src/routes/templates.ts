@@ -9,8 +9,16 @@ import {
   saveScenarioAsTemplate,
 } from "../services/templateService.js";
 import { requireRole } from "../middleware/rbac.js";
+import { validateBody, validateQuery } from "../middleware/validate.js";
 import { assertCanWriteScenario } from "../services/authzService.js";
 import { logger } from "../logger.js";
+import {
+  createTemplateSchema,
+  updateTemplateSchema,
+  cloneTemplateSchema,
+  saveScenarioAsTemplateSchema,
+  listTemplatesQuerySchema,
+} from "../schemas/templates.js";
 
 export const templatesRouter = Router();
 
@@ -18,9 +26,9 @@ function authzError(e: unknown) {
   return (e as { status?: number }).status;
 }
 
-templatesRouter.get("/", async (req, res) => {
+templatesRouter.get("/", validateQuery(listTemplatesQuerySchema), async (req, res) => {
   try {
-    const scope = req.query.scope as string | undefined;
+    const scope = (req as typeof req & { validatedQuery: { scope?: string } }).validatedQuery.scope;
     const templates = await listTemplates(req.user!.userId, scope);
     return res.json({ templates });
   } catch (e) {
@@ -40,10 +48,9 @@ templatesRouter.get("/:id", async (req, res) => {
   }
 });
 
-templatesRouter.post("/", requireRole("analyst"), async (req, res) => {
+templatesRouter.post("/", requireRole("analyst"), validateBody(createTemplateSchema), async (req, res) => {
   try {
     const { name, description, parameter_set, model_version_hash, is_shared, sharing_scope } = req.body;
-    if (!name || !parameter_set) return res.status(400).json({ error: "name and parameter_set required" });
     const t = await createTemplate(req.user!.userId, { name, description, parameter_set, model_version_hash, is_shared, sharing_scope });
     return res.status(201).json(t);
   } catch (e) {
@@ -52,7 +59,7 @@ templatesRouter.post("/", requireRole("analyst"), async (req, res) => {
   }
 });
 
-templatesRouter.put("/:id", requireRole("analyst"), async (req, res) => {
+templatesRouter.put("/:id", requireRole("analyst"), validateBody(updateTemplateSchema), async (req, res) => {
   try {
     const t = await updateTemplate(req.params.id, req.body);
     if (!t) return res.status(404).json({ error: "Template not found" });
@@ -75,7 +82,7 @@ templatesRouter.delete("/:id", requireRole("analyst"), async (req, res) => {
 });
 
 // Clone template → new scenario
-templatesRouter.post("/:id/clone", requireRole("analyst"), async (req, res) => {
+templatesRouter.post("/:id/clone", requireRole("analyst"), validateBody(cloneTemplateSchema), async (req, res) => {
   try {
     const nlInput = req.body.nl_input as string | undefined;
     const scenarioId = await cloneTemplateToScenario(
@@ -94,10 +101,13 @@ templatesRouter.post("/:id/clone", requireRole("analyst"), async (req, res) => {
 });
 
 // Save scenario as template
-templatesRouter.post("/from-scenario/:scenarioId", requireRole("analyst"), async (req, res) => {
+templatesRouter.post(
+  "/from-scenario/:scenarioId",
+  requireRole("analyst"),
+  validateBody(saveScenarioAsTemplateSchema),
+  async (req, res) => {
   try {
     const { name, description, is_shared } = req.body;
-    if (!name) return res.status(400).json({ error: "name required" });
     await assertCanWriteScenario(req.user!.userId, req.user!.role, req.params.scenarioId);
     const t = await saveScenarioAsTemplate(req.params.scenarioId, req.user!.userId, name, description, is_shared);
     return res.status(201).json(t);

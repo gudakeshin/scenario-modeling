@@ -1,8 +1,20 @@
 import pg from "pg";
 import { config } from "../config.js";
+import { logger } from "../logger.js";
 
 const pool = new pg.Pool({
   connectionString: config.DATABASE_URL,
+  max: config.PG_POOL_MAX,
+  connectionTimeoutMillis: 5000,
+  idleTimeoutMillis: 30_000,
+});
+
+pool.on("connect", (client) => {
+  void client.query(`SET statement_timeout = ${config.PG_STATEMENT_TIMEOUT_MS}`);
+});
+
+pool.on("error", (err) => {
+  logger.error({ err }, "Unexpected Postgres pool error");
 });
 
 /**
