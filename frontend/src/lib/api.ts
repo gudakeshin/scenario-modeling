@@ -2433,3 +2433,130 @@ export async function streamAgentReasoning(
   if (streamError) throw new Error(streamError);
   return result;
 }
+
+// ── Chat conversation persistence ──
+
+export interface StoredMessageMetadata {
+  thinking?: {
+    thinking: string;
+    intent: string;
+    assumptions: string[];
+    second_order_effects: string[];
+    duration_ms: number;
+  };
+  agentTrace?: Array<{ tool: string; input: unknown; output: unknown }>;
+  causalChain?: Array<{
+    step: string;
+    detail?: string;
+    kind?: "decomposition" | "research" | "levers" | "preview" | "other";
+  }>;
+  agentConfidence?: number;
+  agentCitations?: Array<{ source: string; snippet?: string; url?: string }>;
+  previewPl?: Record<string, number>;
+  previewReconciliation?: { reconciled: boolean; max_abs_diff: number; message?: string };
+  constraintViolations?: Array<{ lever: string; reason: string }>;
+}
+
+export interface StoredMessage {
+  id: string;
+  conversation_id: string;
+  role: "user" | "assistant";
+  content: string;
+  metadata: StoredMessageMetadata | null;
+  created_at: string;
+}
+
+export interface StoredConversation {
+  id: string;
+  workspace_id: string;
+  user_id: string;
+  title: string;
+  scenario_id: string | null;
+  session_id: string | null;
+  created_at: string;
+  updated_at: string;
+  message_count: number;
+}
+
+export interface StoredConversationWithMessages extends StoredConversation {
+  messages: StoredMessage[];
+}
+
+/** List conversations in the active workspace, most-recently-updated first. */
+export async function listStoredConversations(): Promise<StoredConversation[]> {
+  const res = await apiFetch(`${API_BASE}/api/v1/conversations`);
+  if (!res.ok) throw new Error("Failed to list conversations");
+  const data = await res.json();
+  return data.conversations ?? [];
+}
+
+export async function getStoredConversation(id: string): Promise<StoredConversationWithMessages> {
+  const res = await apiFetch(`${API_BASE}/api/v1/conversations/${encodeURIComponent(id)}`);
+  if (!res.ok) throw new Error("Failed to load conversation");
+  return res.json();
+}
+
+export async function createStoredConversation(opts: {
+  id?: string;
+  title: string;
+  scenario_id?: string;
+  session_id?: string;
+}): Promise<StoredConversation> {
+  const res = await apiFetch(`${API_BASE}/api/v1/conversations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(opts),
+  });
+  if (!res.ok) throw new Error("Failed to create conversation");
+  return res.json();
+}
+
+export async function updateStoredConversation(
+  id: string,
+  patch: { title?: string; scenario_id?: string | null; session_id?: string | null },
+): Promise<StoredConversation> {
+  const res = await apiFetch(`${API_BASE}/api/v1/conversations/${encodeURIComponent(id)}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(patch),
+  });
+  if (!res.ok) throw new Error("Failed to update conversation");
+  return res.json();
+}
+
+export async function appendStoredMessage(
+  conversationId: string,
+  message: {
+    id?: string;
+    role: "user" | "assistant";
+    content: string;
+    timestamp?: string;
+    metadata?: StoredMessageMetadata;
+  },
+): Promise<StoredMessage> {
+  const res = await apiFetch(`${API_BASE}/api/v1/conversations/${encodeURIComponent(conversationId)}/messages`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(message),
+  });
+  if (!res.ok) throw new Error("Failed to persist message");
+  return res.json();
+}
+
+export async function deleteStoredConversation(id: string): Promise<void> {
+  const res = await apiFetch(`${API_BASE}/api/v1/conversations/${encodeURIComponent(id)}`, {
+    method: "DELETE",
+  });
+  if (!res.ok && res.status !== 204) throw new Error("Failed to delete conversation");
+}
+
+export async function deleteStoredConversations(ids: string[]): Promise<{ deleted: string[] }> {
+  if (ids.length === 0) return { deleted: [] };
+  const res = await apiFetch(`${API_BASE}/api/v1/conversations/bulk-delete`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ conversation_ids: ids }),
+  });
+  if (!res.ok) throw new Error("Failed to delete conversations");
+  return res.json();
+}

@@ -21,8 +21,10 @@ import { authRouter } from "./routes/auth.js";
 import { authenticate } from "./auth/middleware.js";
 import { requireRole } from "./middleware/rbac.js";
 import { resolveWorkspace } from "./middleware/workspace.js";
+import { createRateLimitStore } from "./middleware/rateLimitStore.js";
 import { workspacesRouter } from "./routes/workspaces.js";
 import { connectionsRouter } from "./routes/connections.js";
+import { conversationsRouter } from "./routes/conversations.js";
 import { configRouter } from "./routes/config.js";
 import { portfolioRouter } from "./routes/portfolio.js";
 import { organizationsRouter } from "./routes/organizations.js";
@@ -93,11 +95,21 @@ app.use(
 );
 app.use(express.json({ limit: "5mb" }));
 
+// Redis-backed stores when REDIS_URL is set so limits are shared across
+// horizontally-scaled instances; falls back to express-rate-limit's default
+// per-process MemoryStore otherwise (each limiter gets its own instance —
+// hence separate key prefixes — so auth and general-API counts never mix).
+const [authLimiterStore, apiLimiterStore] = await Promise.all([
+  createRateLimitStore("sm:rl:auth:"),
+  createRateLimitStore("sm:rl:api:"),
+]);
+
 const authLimiter = rateLimit({
   windowMs: config.RATE_LIMIT_WINDOW_MS,
-  max: config.AUTH_RATE_LIMIT_MAX,
+  max: config.NODE_ENV === "test" ? 10_000 : config.AUTH_RATE_LIMIT_MAX,
   standardHeaders: true,
   legacyHeaders: false,
+  store: authLimiterStore,
   message: { error: "Too many auth attempts. Try again later." },
 });
 
@@ -108,6 +120,7 @@ const apiLimiter = rateLimit({
   legacyHeaders: false,
   keyGenerator: (req) => req.user?.userId || req.ip || "anon",
   validate: { keyGeneratorIpFallback: false },
+  store: apiLimiterStore,
   message: { error: "Rate limit exceeded. Try again in a minute." },
 });
 
@@ -156,6 +169,7 @@ app.use("/api/v1/documents", documentsRouter);
 app.use("/api/v1/context", contextRouter);
 app.use("/api/v1/config", configRouter);
 app.use("/api/v1/connections", connectionsRouter);
+app.use("/api/v1/conversations", conversationsRouter);
 app.use("/api/v1/portfolio", portfolioRouter);
 app.use("/api/v1/organizations", organizationsRouter);
 

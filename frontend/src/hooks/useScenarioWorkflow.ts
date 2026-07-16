@@ -24,8 +24,19 @@ import { useUiStore } from "@/stores/uiStore";
 import { useSessionStore } from "@/stores/sessionStore";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
 
-function generateId() {
-  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+/** Real UUIDs so conversation ids created locally can be persisted to the
+ *  backend (chat_conversations.id is UUID) without any remapping later. */
+function generateId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID();
+  }
+  // Fallback (older environments / non-secure contexts) — not cryptographically
+  // strong but structurally a valid v4 UUID.
+  return "xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx".replace(/[xy]/g, (c) => {
+    const r = (Math.random() * 16) | 0;
+    const v = c === "x" ? r : (r & 0x3) | 0x8;
+    return v.toString(16);
+  });
 }
 
 function firstLine(text: string, maxLen = 50) {
@@ -44,6 +55,7 @@ export function useScenarioWorkflow() {
   const renameConversation = useChatStore((s) => s.renameConversation);
   const deleteConversation = useChatStore((s) => s.deleteConversation);
   const deleteConversations = useChatStore((s) => s.deleteConversations);
+  const hydrateFromBackend = useChatStore((s) => s.hydrateFromBackend);
   const assistantMode = useChatStore((s) => s.assistantMode);
   const documentConversationId = useChatStore((s) => s.documentConversationId);
   const setDocumentConversationId = useChatStore((s) => s.setDocumentConversationId);
@@ -82,13 +94,22 @@ export function useScenarioWorkflow() {
     }).catch(() => {});
   }, [setOnboardingStatus, activeWorkspaceId]);
 
-  // Load the workspace's scenarios; re-runs on workspace switch
+  // Restore persisted chat history for this workspace, then backfill any
+  // scenarios that predate chat persistence (or never got a chat row) as
+  // read-only synthetic conversations. Sequenced (not parallel effects) so
+  // the backfill never races the hydrate and gets clobbered by it.
+  // Re-runs on workspace switch — workspaceStore.resetWorkspaceState()
+  // clears conversations synchronously on switch, this refills them.
   useEffect(() => {
-    listScenarios()
+    if (!workspacesLoaded) return;
+    let cancelled = false;
+    hydrateFromBackend()
+      .catch(() => {})
+      .then(() => listScenarios())
       .then((scenarios) => {
-        if (scenarios.length === 0) return;
+        if (cancelled || scenarios.length === 0) return;
         setConversations((prev) => {
-          // Merge: keep any in-memory conversations (with messages), add DB scenarios not yet in memory
+          // Merge: keep hydrated/in-memory conversations, add DB scenarios not yet represented
           const existingScenarioIds = new Set(prev.map((c) => c.scenarioId).filter(Boolean));
           const newConvs = scenarios
             .filter((s) => !existingScenarioIds.has(s.scenario_id))
@@ -112,7 +133,10 @@ export function useScenarioWorkflow() {
       .catch(() => {
         // If API is not reachable, silently continue with empty state
       });
-  }, [setConversations, activeWorkspaceId]);
+    return () => {
+      cancelled = true;
+    };
+  }, [setConversations, hydrateFromBackend, workspacesLoaded, activeWorkspaceId]);
 
   const active = activeId ? conversations.find((c) => c.id === activeId) : null;
   const messages = active?.messages ?? [];
@@ -702,11 +726,14 @@ export function useScenarioWorkflow() {
       content: `Template cloned as new scenario \`${newScenarioId.slice(0, 8)}...\`. Click **Review Parameters** to review and run.`,
       timestamp: new Date(),
     };
+    // Create empty first (with scenarioId set) so addMessage's write-through
+    // persists both the conversation row and this message.
     setConversations((prev) => [
-      { id: convId, title: "Template clone", messages: [msg], updatedAt: new Date(), scenarioId: newScenarioId },
+      { id: convId, title: "Template clone", messages: [], updatedAt: new Date(), scenarioId: newScenarioId },
       ...prev,
     ]);
     setActiveId(convId);
+    addMessage(convId, msg);
     setShowTemplates(false);
     setShowReview(true);
     setExpandedPanel("review");
@@ -717,7 +744,7 @@ export function useScenarioWorkflow() {
         persistSession(convId, sess.session_id, newScenarioId);
       })
       .catch(() => {});
-  }, [setConversations, setActiveId, setShowTemplates, setShowReview, setExpandedPanel, persistSession]);
+  }, [setConversations, setActiveId, addMessage, setShowTemplates, setShowReview, setExpandedPanel, persistSession]);
 
   return {
     conversations,

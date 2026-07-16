@@ -130,16 +130,22 @@ class RedisSessionStore implements SessionStore {
   }
 }
 
-let storePromise: Promise<SessionStore> | null = null;
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+export type RedisClientLike = any;
 
-export async function getSessionStore(): Promise<SessionStore> {
-  if (!storePromise) {
-    storePromise = (async () => {
+let redisClientPromise: Promise<RedisClientLike | null> | null = null;
+
+/**
+ * Shared Redis connection factory — reused by SessionStore and anything else
+ * that needs Redis (e.g. rate-limit stores) so a single process only ever
+ * opens one Redis connection. Returns null when REDIS_URL is unset or the
+ * connection fails; callers should fall back to an in-process alternative.
+ */
+export async function getRedisClient(): Promise<RedisClientLike | null> {
+  if (!redisClientPromise) {
+    redisClientPromise = (async () => {
       const url = config.REDIS_URL;
-      if (!url) {
-        logger.info("[SessionStore] Using in-memory store (set REDIS_URL for Redis)");
-        return new MemorySessionStore();
-      }
+      if (!url) return null;
       try {
         const mod = await import("ioredis");
         // ioredis CJS/ESM interop — default may be the module namespace under NodeNext
@@ -151,17 +157,44 @@ export async function getSessionStore(): Promise<SessionStore> {
           lazyConnect: true,
         }) as { connect: () => Promise<void> };
         await client.connect();
-        const redisStore = new RedisSessionStore(url);
-        redisStore.attach(client);
-        logger.info("[SessionStore] Connected to Redis");
-        return redisStore;
+        logger.info("[Redis] Connected (shared client)");
+        return client as RedisClientLike;
       } catch (e) {
         logger.warn(
           { detail: (e as Error).message },
-          "[SessionStore] Redis unavailable — falling back to memory",
+          "[Redis] Unavailable — falling back to in-process alternatives",
         );
+        return null;
+      }
+    })();
+  }
+  return redisClientPromise;
+}
+
+/** Test helper — reset the shared Redis client singleton between tests. */
+export function resetRedisClientForTests(): void {
+  redisClientPromise = null;
+}
+
+let storePromise: Promise<SessionStore> | null = null;
+
+export async function getSessionStore(): Promise<SessionStore> {
+  if (!storePromise) {
+    storePromise = (async () => {
+      const url = config.REDIS_URL;
+      if (!url) {
+        logger.info("[SessionStore] Using in-memory store (set REDIS_URL for Redis)");
         return new MemorySessionStore();
       }
+      const client = await getRedisClient();
+      if (!client) {
+        logger.warn("[SessionStore] Redis unavailable — falling back to memory");
+        return new MemorySessionStore();
+      }
+      const redisStore = new RedisSessionStore(url);
+      redisStore.attach(client);
+      logger.info("[SessionStore] Connected to Redis");
+      return redisStore;
     })();
   }
   return storePromise;
