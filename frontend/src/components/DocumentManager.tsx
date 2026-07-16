@@ -180,11 +180,19 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
     try {
       setValidating(true);
       setBuildError(null);
-      const result = await validateModelSchema();
+      // Validation requires model_schema from context build — run it first when missing.
+      if (!context?.context_data?.model_schema) {
+        const ctx = await buildContext();
+        setContext(ctx);
+        await loadModel();
+      }
+      const latestSpreadsheet = documents.find((d) => d.document_kind === "spreadsheet_model");
+      const result = await validateModelSchema(latestSpreadsheet?.document_id);
       if (result.fidelity) setFidelityReport(result.fidelity);
       await loadContext();
       await loadDocuments();
       setTab("context");
+      onContextBuilt?.();
     } catch (e) {
       const err = e as Error & { fidelity?: FidelityReport };
       if (err.fidelity) setFidelityReport(err.fidelity);
@@ -302,7 +310,7 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                 Spreadsheet model needs analyst validation
               </p>
               <p className="text-xs text-[var(--text-secondary)] mt-0.5">
-                Simulation is blocked until this model is marked ready. Validate against the Excel baseline, then re-run your scenario.
+                Simulation is blocked until this model is marked ready. This will build context (if needed), validate against the Excel baseline, then you can re-run your scenario.
               </p>
             </div>
             <button

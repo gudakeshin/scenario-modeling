@@ -191,7 +191,7 @@ export function AnalysisPanelStrip({
   return (
     <>
       {panelCards.length > 0 && (
-        <div className="px-3 py-2 border-t border-[var(--border)] bg-[var(--panel-bg)]/60 flex gap-2 overflow-x-auto shrink-0">
+        <div className="px-3 py-2 border-t border-[var(--border)] bg-[var(--panel-bg)]/60 flex gap-2 overflow-x-auto shrink-0 relative z-10">
           {panelCards.map((card) => (
             <div
               key={card.id}

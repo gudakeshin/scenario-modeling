@@ -10,14 +10,24 @@ interface MessageListProps {
 }
 
 export function MessageList({ messages, isLoading }: MessageListProps) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const lastMessageId = messages[messages.length - 1]?.id;
 
+  // Scroll inside the message pane only — avoid scrollIntoView, which can jump the page.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length]);
+    const el = listRef.current;
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      el.scrollTo({
+        top: el.scrollHeight,
+        behavior: isLoading ? "auto" : "smooth",
+      });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [lastMessageId, isLoading]);
 
   return (
-    <div className="chat-scroll flex-1 overflow-y-auto bg-background">
+    <div ref={listRef} className="chat-scroll flex-1 min-h-0 overflow-y-auto bg-background">
       <div className="mx-auto max-w-3xl pb-4">
         {messages.length === 0 && !isLoading && (
           <div className="px-4 pt-16 text-center">
@@ -53,7 +63,6 @@ export function MessageList({ messages, isLoading }: MessageListProps) {
             </div>
           )}
         </div>
-        <div ref={bottomRef} />
       </div>
     </div>
   );

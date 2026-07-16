@@ -32,9 +32,9 @@ export function AnalysisModal({ children, onCollapse, title }: AnalysisModalProp
       const focusables = dialog.querySelectorAll<HTMLElement>(FOCUSABLE);
       const first = focusables[0];
       if (first) {
-        first.focus();
+        first.focus({ preventScroll: true });
       } else {
-        dialog.focus();
+        dialog.focus({ preventScroll: true });
       }
     }
 

@@ -63,9 +63,29 @@ app.use((req, res, next) => {
   next();
 });
 
+const corsAllowedOrigins = new Set(
+  [
+    config.FRONTEND_ORIGIN,
+    ...(process.env.FRONTEND_ORIGINS || "")
+      .split(",")
+      .map((s) => s.trim())
+      .filter(Boolean),
+    // Local Next often lands on 3000 or 3001 depending on port conflicts.
+    ...(config.NODE_ENV === "development"
+      ? ["http://localhost:3000", "http://localhost:3001"]
+      : []),
+  ].filter(Boolean),
+);
+
 app.use(
   cors({
-    origin: config.FRONTEND_ORIGIN,
+    origin(origin, callback) {
+      if (!origin || corsAllowedOrigins.has(origin)) {
+        callback(null, origin || config.FRONTEND_ORIGIN);
+        return;
+      }
+      callback(new Error(`CORS blocked for origin ${origin}`));
+    },
     credentials: true,
   })
 );

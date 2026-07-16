@@ -45,7 +45,7 @@ export function ChatComposer({
   };
 
   return (
-    <div className="border-t border-[var(--border)] bg-background px-4 py-3">
+    <div className="border-t border-[var(--border)] bg-background px-4 py-3 shrink-0">
       {showModeToggle && (
         <div className="mx-auto max-w-3xl mb-2 flex items-center justify-between gap-2">
           <ChatAssistantModeToggle disabled={disabled} />

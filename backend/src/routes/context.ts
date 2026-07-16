@@ -223,21 +223,29 @@ contextRouter.post("/model/validate", requireRole("analyst"), async (req, res) =
 
     const docRes = targetDocId
       ? await pool.query(
-          `SELECT document_id, model_schema, workbook_graph, workbook_snapshot, ingestion_report
+          `SELECT document_id, model_schema, workbook_graph, workbook_snapshot, ingestion_report, original_filename
            FROM documents
            WHERE document_id = $1 AND workspace_id = $2 AND document_kind = 'spreadsheet_model'`,
           [targetDocId, scope.workspaceId],
         )
       : await pool.query(
-          `SELECT document_id, model_schema, workbook_graph, workbook_snapshot, ingestion_report
+          // Prefer docs that already have a schema, but still surface the latest
+          // spreadsheet_model so we can return an actionable "build context" error
+          // instead of a confusing 404 when the user validates before building.
+          `SELECT document_id, model_schema, workbook_graph, workbook_snapshot, ingestion_report, original_filename
            FROM documents
-           WHERE workspace_id = $1 AND document_kind = 'spreadsheet_model' AND model_schema IS NOT NULL
-           ORDER BY created_at DESC
+           WHERE workspace_id = $1
+             AND status = 'ready'
+             AND document_kind = 'spreadsheet_model'
+           ORDER BY CASE WHEN model_schema IS NOT NULL THEN 0 ELSE 1 END, created_at DESC
            LIMIT 1`,
           [scope.workspaceId],
         );
     if (docRes.rows.length === 0) {
-      return res.status(404).json({ error: "No spreadsheet model found for validation" });
+      return res.status(404).json({
+        error:
+          "No spreadsheet model found for validation in this workspace. Upload an .xlsx with formulas, then click Build Context.",
+      });
     }
 
     const row = docRes.rows[0] as {
@@ -246,11 +254,15 @@ contextRouter.post("/model/validate", requireRole("analyst"), async (req, res) =
       workbook_graph: unknown;
       workbook_snapshot: unknown;
       ingestion_report: unknown;
+      original_filename?: string;
     };
 
     if (!row.model_schema || !row.workbook_graph) {
       return res.status(422).json({
-        error: "Model schema or workbook graph missing. Build context from the XLSX first.",
+        error:
+          `Model schema missing for ${row.original_filename || "spreadsheet"}. Click Build Context first, then Mark Model Validated.`,
+        needs_context_build: true,
+        document_id: row.document_id,
       });
     }
 

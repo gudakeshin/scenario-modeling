@@ -87,7 +87,7 @@ export function ChatContainer() {
     } disabled:opacity-40`;
 
   return (
-    <div className="flex h-screen overflow-hidden bg-background">
+    <div className="flex h-[100dvh] overflow-hidden bg-background">
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:top-2 focus:left-2 focus:rounded-lg focus:bg-accent focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-white focus:shadow-panel"
@@ -141,7 +141,7 @@ export function ChatContainer() {
           </div>
         </div>
 
-        <main id="main-content" className="flex flex-col flex-1 min-h-0 min-w-0">
+        <main id="main-content" className="flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden">
           {/* Onboarding banner */}
           {onboardingStatus && !onboardingStatus.ready && messages.length === 0 && !active?.scenarioId && (
             <div className="mx-4 mt-4 rounded-xl border border-accent/20 bg-accent/5 p-5 space-y-3">
@@ -171,15 +171,18 @@ export function ChatContainer() {
             </div>
           )}
 
-          <MessageList messages={messages} isLoading={isLoading} />
+          {/* Scrollable message stage — composer/toolbar stay pinned below */}
+          <div className="flex flex-col flex-1 min-h-0 relative overflow-hidden">
+            <MessageList messages={messages} isLoading={isLoading} />
 
-          <AnalysisPanelStrip
-            scenarioId={active?.scenarioId}
-            isLoading={isLoading}
-            onApproved={handleApproved}
-            onFollowUpAnswers={handleFollowUpAnswers}
-            onTemplateCloned={handleTemplateCloned}
-          />
+            <AnalysisPanelStrip
+              scenarioId={active?.scenarioId}
+              isLoading={isLoading}
+              onApproved={handleApproved}
+              onFollowUpAnswers={handleFollowUpAnswers}
+              onTemplateCloned={handleTemplateCloned}
+            />
+          </div>
 
           {/* ── Action bar ── */}
           {active?.scenarioId && (
