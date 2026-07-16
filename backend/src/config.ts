@@ -189,6 +189,13 @@ function loadConfig(): AppConfig {
     console.error("METRICS_TOKEN is required in production (min 16 characters)");
     process.exit(1);
   }
+  if (env.DEPLOYMENT_PROFILE === "enterprise" && !env.SENTRY_DSN) {
+    console.error(
+      "SENTRY_DSN is required when DEPLOYMENT_PROFILE=enterprise (Sentry is the alerting " +
+        "path for this deployment — see docs/runbooks/incident.md)",
+    );
+    process.exit(1);
+  }
   return {
     ...env,
     anthropicModelParse: env.ANTHROPIC_MODEL_PARSE || env.ANTHROPIC_MODEL,
