@@ -101,6 +101,6 @@ export function readCookie(req: Request, name: string): string | undefined {
 export function readRefreshToken(req: Request, bodyToken?: string): string | undefined {
   const fromCookie = readCookie(req, REFRESH_COOKIE);
   if (fromCookie) return fromCookie;
-  if (config.AUTH_REFRESH_BODY_FALLBACK && bodyToken) return bodyToken;
-  return bodyToken;
+  if (config.AUTH_REFRESH_BODY_FALLBACK) return bodyToken;
+  return undefined;
 }

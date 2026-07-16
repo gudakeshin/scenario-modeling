@@ -115,30 +115,35 @@ test("non-owner cannot read another user's scenario", async () => {
     .expect(403);
 });
 
+function cookieHeaderFrom(res: { headers: Record<string, unknown> }): string {
+  const raw = res.headers["set-cookie"];
+  const list = Array.isArray(raw) ? raw : typeof raw === "string" ? [raw] : [];
+  return list.map((c) => c.split(";")[0]).join("; ");
+}
+
 test("refresh token rotation invalidates old token", async () => {
   const admin = await loginSeedAdmin();
   const email = `refresh-${suffix}@test.local`;
   await adminCreateUser(admin.access_token, email, "test-password-123", "analyst", "Refresh");
-  const auth = await login(email, "test-password-123");
-  assert.ok(auth.refresh_token);
 
-  const first = await agent
-    .post("/api/v1/auth/refresh")
-    .send({ refresh_token: auth.refresh_token })
+  const loginRes = await agent
+    .post("/api/v1/auth/login")
+    .send({ email, password: "test-password-123" })
     .expect(200);
+  const initialCookie = cookieHeaderFrom(loginRes);
+  assert.ok(initialCookie.includes("sm_refresh="), "login should set sm_refresh cookie");
+
+  const first = await agent.post("/api/v1/auth/refresh").set("Cookie", initialCookie).send({}).expect(200);
   assert.ok(first.body.access_token);
-  assert.ok(first.body.refresh_token);
-  assert.notEqual(first.body.refresh_token, auth.refresh_token);
+  const rotatedCookie = cookieHeaderFrom(first);
+  assert.ok(rotatedCookie.includes("sm_refresh="), "refresh should rotate the sm_refresh cookie");
+  assert.notEqual(rotatedCookie, initialCookie, "rotated refresh cookie should differ from the original");
 
-  await agent
-    .post("/api/v1/auth/refresh")
-    .send({ refresh_token: auth.refresh_token })
-    .expect(401);
+  // Old refresh cookie must now be rejected — rotation invalidates it.
+  await agent.post("/api/v1/auth/refresh").set("Cookie", initialCookie).send({}).expect(401);
 
-  await agent
-    .post("/api/v1/auth/refresh")
-    .send({ refresh_token: first.body.refresh_token })
-    .expect(200);
+  // The newly rotated cookie still works.
+  await agent.post("/api/v1/auth/refresh").set("Cookie", rotatedCookie).send({}).expect(200);
 });
 
 test("login sets auth cookies and refresh works from cookie", async () => {

@@ -1018,9 +1018,23 @@ scenariosRouter.post("/:id/run", requireRole("analyst"), async (req, res) => {
     const persistClient = await pool.connect();
     try {
       await persistClient.query("BEGIN");
+      const outputData: Record<string, unknown> = {
+        aggregate: output.pl,
+        base_pl: output.base_pl,
+        periods: output.periods,
+        granularity: output.granularity,
+        period_count: output.period_count,
+        simulation_mode: output.simulation_mode,
+        fidelity: output.fidelity,
+        status: "completed",
+        ...(output.dimensional ? { dimensional: output.dimensional } : {}),
+        ...(output.absurdity_warnings?.length ? { absurdity_warnings: output.absurdity_warnings } : {}),
+        ...(output.notices?.length ? { notices: output.notices } : {}),
+        ...(output.formula_error_metrics?.length ? { formula_error_metrics: output.formula_error_metrics } : {}),
+      };
       await persistClient.query(
         `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
-        [sid, JSON.stringify(output.pl)],
+        [sid, JSON.stringify(outputData)],
       );
       await persistClient.query(
         `UPDATE scenarios SET status = 'completed', updated_at = NOW() WHERE scenario_id = $1`,

@@ -489,6 +489,73 @@ test("Edge: Approve with no accepted parameters returns 400", async () => {
   assert.ok(res.body.error, "should return error about parameters");
 });
 
+test("Concurrency: two parallel /run requests on the same scenario yield one 200 and one 409", async () => {
+  const createRes = await agent
+    .post("/api/v1/scenarios")
+    .send({ nl_input: "Revenue up 5%" })
+    .expect(201);
+  const scenario_id = createRes.body.scenario_id;
+
+  const paramsRes = await agent
+    .get(`/api/v1/scenarios/${scenario_id}/parameters`)
+    .expect(200);
+  for (const p of paramsRes.body.parameters) {
+    await agent
+      .put(`/api/v1/scenarios/${scenario_id}/parameters/${p.parameter_id}`)
+      .send({ status: "accepted" })
+      .expect(200);
+  }
+  await agent.post(`/api/v1/scenarios/${scenario_id}/approve`).expect(200);
+
+  const [first, second] = await Promise.all([
+    agent.post(`/api/v1/scenarios/${scenario_id}/run`),
+    agent.post(`/api/v1/scenarios/${scenario_id}/run`),
+  ]);
+  const statuses = [first.status, second.status].sort();
+  assert.deepStrictEqual(statuses, [200, 409], "exactly one run should succeed and one should be rejected as in-progress");
+
+  const finalScenario = await agent.get(`/api/v1/scenarios/${scenario_id}`).expect(200);
+  assert.strictEqual(finalScenario.body.status, "completed", "scenario should not be left stuck in 'running'");
+});
+
+test("Concurrency: two parallel /approve requests on the same scenario are idempotent", async () => {
+  const createRes = await agent
+    .post("/api/v1/scenarios")
+    .send({ nl_input: "Costs down 3%" })
+    .expect(201);
+  const scenario_id = createRes.body.scenario_id;
+
+  const paramsRes = await agent
+    .get(`/api/v1/scenarios/${scenario_id}/parameters`)
+    .expect(200);
+  for (const p of paramsRes.body.parameters) {
+    await agent
+      .put(`/api/v1/scenarios/${scenario_id}/parameters/${p.parameter_id}`)
+      .send({ status: "accepted" })
+      .expect(200);
+  }
+
+  const [first, second] = await Promise.all([
+    agent.post(`/api/v1/scenarios/${scenario_id}/approve`),
+    agent.post(`/api/v1/scenarios/${scenario_id}/approve`),
+  ]);
+  assert.strictEqual(first.status, 200);
+  assert.strictEqual(second.status, 200);
+  assert.ok(
+    first.body.idempotent === true || second.body.idempotent === true,
+    "one of the two concurrent approvals should observe the idempotent branch",
+  );
+
+  const auditRes = await agent
+    .get(`/api/v1/audit?scenario_id=${scenario_id}&action_type=approved`)
+    .expect(200);
+  assert.strictEqual(
+    auditRes.body.entries.filter((e: { action_type: string }) => e.action_type === "approved").length,
+    1,
+    "approval should be audited exactly once despite the double-submit",
+  );
+});
+
 test("Edge: NL input with only qualitative description still creates scenario", async () => {
   const res = await agent
     .post("/api/v1/scenarios")

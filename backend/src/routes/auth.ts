@@ -193,8 +193,8 @@ authRouter.get("/oidc/authorize", (req, res) => {
 
 /**
  * OIDC callback: exchange code → upsert user → issue local JWT
- * (same response shape as password login). Redirects to the frontend with
- * tokens in the hash fragment (browser SSO flow).
+ * (same response shape as password login). Sets the refresh token as an
+ * httpOnly cookie and redirects to the frontend with no tokens in the URL.
  */
 authRouter.get("/oidc/callback", async (req, res) => {
   try {

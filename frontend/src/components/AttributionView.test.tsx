@@ -9,14 +9,22 @@ vi.mock("@/lib/api", async (importOriginal) => {
   return {
     ...actual,
     runAttribution: vi.fn(),
+    // Unmocked, this hits the network in jsdom and resolves/rejects on an
+    // unpredictable timer, racing the test's click against the component's
+    // async default-metric selection. Mock it so targetMetric settles deterministically.
+    getActiveModel: vi.fn().mockResolvedValue({ model: null }),
   };
 });
 
-vi.mock("@/lib/metrics", () => ({
-  fmtCurrency: (v: number) => `$${v}`,
-  fmtCurrencySigned: (v: number) => (v < 0 ? `-$${Math.abs(v)}` : `+$${v}`),
-  getCurrencySymbol: () => "$",
-}));
+vi.mock("@/lib/metrics", async (importOriginal) => {
+  const actual = await importOriginal<typeof import("@/lib/metrics")>();
+  return {
+    ...actual,
+    fmtCurrency: (v: number) => `$${v}`,
+    fmtCurrencySigned: (v: number) => (v < 0 ? `-$${Math.abs(v)}` : `+$${v}`),
+    getCurrencySymbol: () => "$",
+  };
+});
 
 vi.mock("recharts", async (importOriginal) => {
   const actual = await importOriginal<typeof import("recharts")>();
@@ -50,6 +58,13 @@ describe("AttributionView", () => {
   it("renders driver contributions after run", async () => {
     const user = userEvent.setup();
     render(<AttributionView scenarioId="sc-1" onClose={() => {}} />);
+
+    // The component picks a default target metric asynchronously (via
+    // getActiveModel) before `run` will do anything; wait for it to settle
+    // so the click below isn't racing that effect.
+    await waitFor(() => {
+      expect(screen.getByDisplayValue("net_income")).toBeInTheDocument();
+    });
 
     await user.click(screen.getByRole("button", { name: /run/i }));
 

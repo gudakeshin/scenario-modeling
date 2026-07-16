@@ -54,6 +54,7 @@ export interface FormulaErrorMetric {
 
 export interface SimulationOutput {
   pl: Record<string, number>;
+  base_pl?: Record<string, number>;
   variables: Record<string, number>;
   periods: PeriodResult[];
   period_count: number;
@@ -644,6 +645,7 @@ async function _runDimensionalSimulation(
 
   return {
     pl,
+    base_pl: basePl,
     variables,
     periods,
     period_count: periods.length,
@@ -789,6 +791,7 @@ async function _runXlsxSimulation(
 
   return {
     pl,
+    base_pl: basePl,
     variables,
     periods,
     period_count: periods.length,
@@ -912,6 +915,7 @@ async function _runFormulaSimulation(
 
   return {
     pl: aggregatePl,
+    base_pl: basePl,
     variables: lastPeriodVars,
     periods,
     period_count: periods.length,

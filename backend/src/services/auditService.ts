@@ -318,17 +318,37 @@ export async function getAuditTrail(
   }
 }
 
+const EXPORT_PAGE_SIZE = 500;
+
+/** Fetches every matching audit row (paginated internally) — exports must never silently truncate. */
+async function getFullAuditTrail(opts: {
+  scenarioId?: string;
+  userId: string;
+  role: Role;
+}): Promise<AuditEntry[]> {
+  const all: AuditEntry[] = [];
+  let offset = 0;
+  for (;;) {
+    const { entries, total } = await getAuditTrail({
+      scenario_id: opts.scenarioId,
+      limit: EXPORT_PAGE_SIZE,
+      offset,
+      userId: opts.userId,
+      role: opts.role,
+    });
+    all.push(...entries);
+    offset += entries.length;
+    if (entries.length === 0 || offset >= total) break;
+  }
+  return all;
+}
+
 export async function exportAuditCsv(opts: {
   scenarioId?: string;
   userId: string;
   role: Role;
 }): Promise<string> {
-  const { entries } = await getAuditTrail({
-    scenario_id: opts.scenarioId,
-    limit: 500,
-    userId: opts.userId,
-    role: opts.role,
-  });
+  const entries = await getFullAuditTrail(opts);
   const lines = ["audit_id,scenario_id,action_type,user_id,timestamp,details,touched_levers_snapshot"];
   for (const e of entries) {
     const details = e.action_details ? JSON.stringify(e.action_details).replace(/"/g, '""') : "";
@@ -343,11 +363,5 @@ export async function exportAuditJson(opts: {
   userId: string;
   role: Role;
 }): Promise<AuditEntry[]> {
-  const { entries } = await getAuditTrail({
-    scenario_id: opts.scenarioId,
-    limit: 500,
-    userId: opts.userId,
-    role: opts.role,
-  });
-  return entries;
+  return getFullAuditTrail(opts);
 }
