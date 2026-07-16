@@ -144,7 +144,7 @@ export async function buildScenarioContext(scenarioId: string): Promise<string> 
   const { getModelDefinition } = await import("../models/registry.js");
   const { resolveBasePl } = await import("./basePl.js");
   const model = await getModelDefinition(modelHash);
-  const base_pl = await resolveBasePl(rawPl, model);
+  const base_pl = await resolveBasePl(rawPl, model, scenarioId);
   const mode = detectAnalysisMode({ pl, base_pl, absurdity_warnings });
 
   const lines = [

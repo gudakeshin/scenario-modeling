@@ -118,7 +118,7 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
   const model = await getModelDefinition(modelHash);
 
   // Prefer persisted base_pl (needed for XLSX where model is null)
-  let baseCtx = await resolveBasePl(scenarioData[0]?.rawOutput, model);
+  let baseCtx = await resolveBasePl(scenarioData[0]?.rawOutput, model, scenarioIds[0]);
   let metricKeys: string[];
   if (model) {
     metricKeys = getPLMetrics(model);

@@ -147,7 +147,7 @@ async function resolveExportBase(
   const sRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
   const modelHash = sRef.rows[0]?.model_version_hash;
   const model = await getModelDefinition(modelHash);
-  let baseValues = await resolveBasePl(rawOutput, model);
+  let baseValues = await resolveBasePl(rawOutput, model, scenarioId);
   if (model) {
     if (Object.keys(baseValues).length === 0) baseValues = await computeBaseCase(model);
     return { baseValues, plMetrics: getPLMetrics(model) };

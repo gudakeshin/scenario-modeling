@@ -161,7 +161,7 @@ export async function exportToPptx(scenarioId: string): Promise<Buffer> {
   const sModelRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
   const modelHash = sModelRef.rows[0]?.model_version_hash;
   const model = await getModelDefinition(modelHash);
-  const baseValues = await resolveBasePl(rawOutput, model);
+  const baseValues = await resolveBasePl(rawOutput, model, scenarioId);
   const plMetrics = model
     ? getPLMetrics(model)
     : [...new Set([...Object.keys(pl), ...Object.keys(baseValues)])];

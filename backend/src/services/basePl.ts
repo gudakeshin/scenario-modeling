@@ -22,9 +22,30 @@ export function basePlFromOutput(
 export async function resolveBasePl(
   rawPl: Record<string, unknown> | null | undefined,
   model: ModelDefinition | null,
+  scenarioId?: string,
 ): Promise<Record<string, number>> {
   const fromOutput = basePlFromOutput(rawPl);
   if (fromOutput) return fromOutput;
-  if (model) return computeBaseCase(model);
-  return {};
+  if (!model) return {};
+
+  // Dimensional (Anaplan) models: computeBaseCase's fallback evaluates without
+  // loaded facts, so every fact-backed leaf reads as 0. Go through the scenario
+  // resolver instead, which loads the pinned snapshot's live cell values.
+  if (scenarioId) {
+    try {
+      const { isDimensionalModelDefinition } = await import("../models/dimensions.js");
+      if (isDimensionalModelDefinition(model)) {
+        const { getEvaluableModelForScenario } = await import("./modelResolver.js");
+        const { DimensionalModel } = await import("./dimensionalModel.js");
+        const resolved = await getEvaluableModelForScenario(scenarioId);
+        if (resolved.source === "external_model" && resolved.model instanceof DimensionalModel) {
+          return resolved.model.baseValues();
+        }
+      }
+    } catch {
+      // fall through to advisory fallback below
+    }
+  }
+
+  return computeBaseCase(model);
 }

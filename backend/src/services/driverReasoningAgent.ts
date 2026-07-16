@@ -171,6 +171,10 @@ export async function reasonDriverTree(
 Rules:
 - Every leaf id MUST be one of the known model variable ids provided.
 - Parent values MUST approximately equal the sum of children (additive decompositions).
+- Sign convention: children MUST use the same sign as their parent. If a cost/expense
+  parent is negative (e.g. total_variable_costs: -10000), each cost child MUST also be
+  negative (e.g. -4000, -3500, -2500) — do not flip costs to positive magnitudes even
+  though FP&A commentary usually states costs as positive numbers.
 - Preserve the root target metric id and value.
 - Prefer clear FP&A groupings over mechanical dependency dumps.
 - Include brief rationale on non-leaf nodes when helpful.`,

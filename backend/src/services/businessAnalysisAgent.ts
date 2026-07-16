@@ -259,7 +259,7 @@ async function loadAnalysisContext(
   const { getModelDefinition: getModel } = await import("../models/registry.js");
   const { resolveBasePl } = await import("./basePl.js");
   const model = await getModel(modelHash);
-  const base_pl = await resolveBasePl(rawPl, model);
+  const base_pl = await resolveBasePl(rawPl, model, scenarioId);
 
   const currency_symbol = await getCurrencyFromContext(scenarioId);
   const company = await getCompanyContextForScenario(scenarioId);
