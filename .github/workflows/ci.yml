@@ -44,6 +44,7 @@ jobs:
       # Intentionally unset — unit tests must pass without Anthropic
       DEMO_MODE: "false"
       EMBEDDING_PROVIDER: none
+      INGESTION_ASYNC_ENABLED: "false"
       # Keep legacy refresh_token-in-body for integration tests.
       AUTH_REFRESH_BODY_FALLBACK: "true"
     steps:
@@ -63,6 +64,33 @@ jobs:
       - run: npm run db:seed
       - run: npm run test:coverage
       - run: npm run test:e2e
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+      - name: Run upload-to-simulation load smoke
+        env:
+          ANALYST_EMAIL: dev@example.com
+          ANALYST_PASSWORD: ci-seed-admin-password
+          APPROVER_EMAIL: ci-load-approver@example.com
+          APPROVER_PASSWORD: ci-load-approver-password
+          VUS: "1"
+          ITERATIONS: "1"
+        run: |
+          npm start > "$RUNNER_TEMP/scenario-modeling-api.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:4000/health >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "true" ]; then
+            awk '{print}' "$RUNNER_TEMP/scenario-modeling-api.log"
+            exit 1
+          fi
+          k6 run ../docs/load/k6-smoke.js
   frontend:
     runs-on: ubuntu-latest
     defaults:

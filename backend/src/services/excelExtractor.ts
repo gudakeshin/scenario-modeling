@@ -2,6 +2,7 @@ import ExcelJS from "exceljs";
 import JSZip from "jszip";
 import { HyperFormula } from "hyperformula";
 import { detectDenominationFromText, normalizeCurrencyUnit, type CurrencyUnit } from "./denomination.js";
+import { PARITY_UNSUPPORTED_FUNCTIONS } from "./excelParitySupport.generated.js";
 import {
   ARTIFACT_VERSION,
   type IngestionWarning,
@@ -310,7 +311,10 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
   const inputCandidates: NonNullable<WorkbookGraph["inputCandidates"]> = [];
   const outputCandidates: NonNullable<WorkbookGraph["outputCandidates"]> = [];
   const warnings: IngestionWarning[] = [];
-  const unsupportedFunctions = new Map<string, { count: number; examples: string[] }>();
+  const unsupportedFunctions = new Map<
+    string,
+    { count: number; examples: string[]; reason: "unregistered" | "parity" }
+  >();
   const sheetOrder: string[] = [];
   let scenarioToggle: WorkbookGraph["scenarioToggle"];
   let timeAxis: WorkbookGraph["timeAxis"];
@@ -485,8 +489,14 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
           }
           for (const match of formula.matchAll(FUNCTION_TOKEN_REGEX)) {
             const functionName = match[1].toUpperCase();
-            if (HF_FUNCTIONS.has(functionName)) continue;
-            const record = unsupportedFunctions.get(functionName) ?? { count: 0, examples: [] };
+            const registered = HF_FUNCTIONS.has(functionName);
+            const failedParity = PARITY_UNSUPPORTED_FUNCTIONS.has(functionName);
+            if (registered && !failedParity) continue;
+            const record = unsupportedFunctions.get(functionName) ?? {
+              count: 0,
+              examples: [],
+              reason: failedParity ? "parity" : "unregistered",
+            };
             record.count += 1;
             if (record.examples.length < 3) record.examples.push(`${sheet.name}!${cell.address}`);
             unsupportedFunctions.set(functionName, record);
@@ -654,7 +664,10 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
   for (const [functionName, record] of unsupportedEntries.slice(0, 100)) {
     warnings.push({
       code: "unsupported_function",
-      message: `${functionName} is not registered by HyperFormula (${record.count} occurrence${record.count === 1 ? "" : "s"}).`,
+      message:
+        record.reason === "parity"
+          ? `${functionName} failed Excel compatibility validation (${record.count} occurrence${record.count === 1 ? "" : "s"}).`
+          : `${functionName} is not registered by HyperFormula (${record.count} occurrence${record.count === 1 ? "" : "s"}).`,
       detail: `Examples: ${record.examples.join(", ")}`,
     });
   }

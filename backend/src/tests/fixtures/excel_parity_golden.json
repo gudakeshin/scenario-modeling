@@ -1,0 +1,95 @@
+{
+  "generated_note": "Excel-correct expectations compared with HyperFormula 3.2. `unsupported` lists root functions whose representative Excel formula returned an error.",
+  "cells": [
+    {
+      "sheet": "Parity",
+      "cell": "E1",
+      "expected": 1,
+      "actual": 1,
+      "formula": "IF(A1>50,1,0)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E5",
+      "expected": 20,
+      "actual": null,
+      "formula": "VLOOKUP(\"y\",B1:C3,2,FALSE)",
+      "note": "HF error: NAME (FALSE is interpreted as an unknown named expression)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E6",
+      "expected": 20,
+      "actual": 20,
+      "formula": "INDEX(C1:C3,2)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E7",
+      "expected": 3,
+      "actual": 3,
+      "formula": "MATCH(\"z\",B1:B3,0)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E8",
+      "expected": 20,
+      "actual": 20,
+      "formula": "SUMIF(B1:B3,\"y\",C1:C3)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E9",
+      "expected": 14000,
+      "actual": 14000,
+      "formula": "SUMPRODUCT(A1:A3,C1:C3)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E10",
+      "expected": 481.59,
+      "actual": 481.59278738,
+      "formula": "NPV(0.1,100,200,300)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E11",
+      "expected": 188.71,
+      "actual": 188.71233644,
+      "formula": "PMT(0.05/12,60,-10000)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E12",
+      "expected": 1.23,
+      "actual": 1.23,
+      "formula": "ROUND(1.2345,2)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E18",
+      "expected": 200,
+      "actual": 200,
+      "formula": "BaseAmt*2",
+      "note": "named range"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E19",
+      "expected": 20,
+      "actual": 20,
+      "formula": "XLOOKUP(\"y\",B1:B3,C1:C3)"
+    },
+    {
+      "sheet": "Parity",
+      "cell": "E20",
+      "expected": null,
+      "actual": 20,
+      "formula": "FILTER(C1:C3,C1:C3>15)",
+      "note": "Representative scalar result accepted; dynamic spill parity remains out of scope"
+    }
+  ],
+  "unsupported": [
+    "VLOOKUP"
+  ]
+}

@@ -7,25 +7,26 @@
  */
 import test from "node:test";
 import assert from "node:assert/strict";
-import { writeFileSync, mkdirSync, readFileSync, existsSync } from "node:fs";
-import { join, dirname } from "node:path";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import ExcelJS from "exceljs";
 import { HyperFormula, DetailedCellError } from "hyperformula";
 import { config } from "../config.js";
+import { PARITY_UNSUPPORTED_FUNCTIONS } from "./excelParitySupport.generated.js";
 import { extractWorkbookArtifact } from "./excelExtractor.js";
 import { densifySnapshot } from "./ingestionArtifacts.js";
 import { toHyperFormulaNamedExpressions } from "./xlsxRuntime.js";
 
-const __dirname = dirname(fileURLToPath(import.meta.url));
-const FIXTURE_DIR = join(__dirname, "../tests/fixtures");
-const GOLDEN_PATH = join(FIXTURE_DIR, "excel_parity_golden.json");
+const BACKEND_ROOT = join(dirname(fileURLToPath(import.meta.url)), "../..");
+const GOLDEN_PATH = join(BACKEND_ROOT, "src/tests/fixtures/excel_parity_golden.json");
 
 interface GoldenCell {
   sheet: string;
   cell: string;
   /** Excel-correct expected value (null = expect unsupported / error). */
   expected: number | string | null;
+  actual?: number | string | boolean | null;
   formula: string;
   note?: string;
 }
@@ -115,7 +116,6 @@ function near(actual: number, expected: number, rel = 0.01): boolean {
 }
 
 test("excel parity: extract → HyperFormula → compare goldens", async () => {
-  mkdirSync(FIXTURE_DIR, { recursive: true });
   const buffer = await buildParityWorkbook();
   const artifact = await extractWorkbookArtifact(buffer);
   const dense = densifySnapshot(artifact.snapshot!);
@@ -163,6 +163,7 @@ test("excel parity: extract → HyperFormula → compare goldens", async () => {
         sheet: "Parity",
         cell: p.cell,
         expected: p.expected,
+        actual: null,
         formula: p.formula,
         note: `HF error: ${String((val as { type?: string })?.type || val)}`,
       });
@@ -172,7 +173,8 @@ test("excel parity: extract → HyperFormula → compare goldens", async () => {
     results.push({
       sheet: "Parity",
       cell: p.cell,
-      expected: typeof val === "number" || typeof val === "string" || typeof val === "boolean"
+      expected: p.expected,
+      actual: typeof val === "number" || typeof val === "string" || typeof val === "boolean"
         ? (val as number | string)
         : String(val),
       formula: p.formula,
@@ -189,21 +191,35 @@ test("excel parity: extract → HyperFormula → compare goldens", async () => {
     }
   }
 
-  // Strict cells must pass (already asserted above); write golden for audit.
-  const golden: GoldenFile = {
-    generated_note:
-      "Parity goldens from HyperFormula evaluation against Excel-correct expected values. " +
-      "`unsupported` lists functions that returned errors in this run.",
-    cells: results,
-    unsupported: [...new Set(unsupported)].sort(),
-  };
-  writeFileSync(GOLDEN_PATH, JSON.stringify(golden, null, 2));
-
-  // Re-read and ensure strict cells remain present
-  assert.ok(existsSync(GOLDEN_PATH));
+  // The committed artifact is reviewed and consumed by ingestion. A pinned-HF
+  // behavior change must fail here until the artifact is deliberately updated.
   const loaded = JSON.parse(readFileSync(GOLDEN_PATH, "utf8")) as GoldenFile;
+  const detectedUnsupported = [...new Set(unsupported)].sort();
+  assert.deepEqual(detectedUnsupported, loaded.unsupported);
+  assert.deepEqual(
+    detectedUnsupported,
+    [...PARITY_UNSUPPORTED_FUNCTIONS].sort(),
+    "generated ingestion list must match runtime parity failures",
+  );
+
   for (const g of STRICT_GOLDENS) {
     const row = loaded.cells.find((c) => c.cell === g.cell);
     assert.ok(row, `missing golden for ${g.cell}`);
+  }
+
+  const vlookupWarning = artifact.warnings.find(
+    (warning) =>
+      warning.code === "unsupported_function" &&
+      warning.message.includes("VLOOKUP") &&
+      warning.message.includes("compatibility validation"),
+  );
+  assert.ok(vlookupWarning, "registered functions that fail parity must warn during ingestion");
+
+  // Ensure every probed formula remains represented in the reviewed artifact.
+  for (const result of results) {
+    assert.ok(
+      loaded.cells.some((cell) => cell.cell === result.cell && cell.formula === result.formula),
+      `missing reviewed parity artifact row for ${result.cell}`,
+    );
   }
 });
