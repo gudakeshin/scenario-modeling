@@ -11,6 +11,7 @@ import { scenariosRouter } from "./routes/scenarios.js";
 import { mappingsRouter } from "./routes/mappings.js";
 import { auditRouter } from "./routes/audit.js";
 import { exportsRouter } from "./routes/exports.js";
+import { boardPackPrintRouter } from "./routes/boardPackPrint.js";
 import { usersRouter } from "./routes/users.js";
 import { analysisRouter } from "./routes/monteCarlo.js";
 import { templatesRouter } from "./routes/templates.js";
@@ -152,6 +153,8 @@ app.get("/metrics", metricsAuth, async (_req, res) => {
 });
 
 app.use("/api/v1/auth", authLimiter, authRouter);
+// Short-lived signed-token endpoint for Puppeteer print rendering.
+app.use("/api/v1/board-pack-print", boardPackPrintRouter);
 
 // All other API routes require authentication and an active workspace scope
 app.use("/api/v1", authenticate, resolveWorkspace, apiLimiter);

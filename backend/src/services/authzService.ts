@@ -1,6 +1,10 @@
 import { pool } from "../db/index.js";
 import type { Role } from "../auth/provider.js";
 import { assertOrgGateForWorkspace } from "./organizationService.js";
+import {
+  assertUpsIWorkspaceMembership,
+  logUpsIAccess,
+} from "./upsiGovernanceService.js";
 
 export type SharePermission = "view" | "edit";
 
@@ -51,7 +55,15 @@ export async function canReadScenario(
   scenarioId: string,
 ): Promise<boolean> {
   const access = await getScenarioAccess(userId, role, scenarioId);
-  return access.exists && (access.isOwner || access.permission !== null || role === "admin");
+  if (!(access.exists && (access.isOwner || access.permission !== null || role === "admin"))) {
+    return false;
+  }
+  try {
+    await assertUpsIWorkspaceMembership(userId, access.workspaceId);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function canWriteScenario(
@@ -61,8 +73,14 @@ export async function canWriteScenario(
 ): Promise<boolean> {
   const access = await getScenarioAccess(userId, role, scenarioId);
   if (!access.exists) return false;
-  if (role === "admin" || access.isOwner) return true;
-  return access.permission === "edit";
+  const baseAllowed = role === "admin" || access.isOwner || access.permission === "edit";
+  if (!baseAllowed) return false;
+  try {
+    await assertUpsIWorkspaceMembership(userId, access.workspaceId);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function assertCanReadScenario(
@@ -83,6 +101,15 @@ export async function assertCanReadScenario(
   }
   // Org gate: when workspace has organization_id, require org member or workspace owner
   await assertOrgGateForWorkspace(userId, access.workspaceId);
+  await assertUpsIWorkspaceMembership(userId, access.workspaceId);
+  if (access.workspaceId) {
+    await logUpsIAccess({
+      workspaceId: access.workspaceId,
+      userId,
+      artifactType: "scenario",
+      artifactId: scenarioId,
+    });
+  }
 }
 
 export async function assertCanWriteScenario(
@@ -106,6 +133,7 @@ export async function assertCanWriteScenario(
     throw Object.assign(new Error("Forbidden"), { status: 403 });
   }
   await assertOrgGateForWorkspace(userId, access.workspaceId);
+  await assertUpsIWorkspaceMembership(userId, access.workspaceId);
 }
 
 /**
@@ -121,10 +149,27 @@ export function scenarioVisibilityClause(
   workspaceId: string,
   alias = "s",
 ): { sql: string; params: unknown[] } {
+  // Shared scenarios remain visible across workspaces, but UPSI artifact
+  // workspaces still require explicit need-to-know membership.
   return {
-    sql: `((${alias}.creator_id = $1 AND ${alias}.workspace_id = $2) OR EXISTS (
-      SELECT 1 FROM scenario_sharing ss
-      WHERE ss.scenario_id = ${alias}.scenario_id AND ss.shared_with = $1
+    sql: `((${alias}.creator_id = $1 AND ${alias}.workspace_id = $2) OR (
+      EXISTS (
+        SELECT 1 FROM scenario_sharing ss
+        WHERE ss.scenario_id = ${alias}.scenario_id AND ss.shared_with = $1
+      )
+      AND (
+        ${alias}.workspace_id IS NULL
+        OR NOT EXISTS (
+          SELECT 1 FROM workspaces w
+          WHERE w.workspace_id = ${alias}.workspace_id
+            AND w.sensitivity = 'upsi'
+            AND w.status = 'active'
+        )
+        OR EXISTS (
+          SELECT 1 FROM workspace_memberships wm
+          WHERE wm.workspace_id = ${alias}.workspace_id AND wm.user_id = $1
+        )
+      )
     ))`,
     params: [userId, workspaceId],
   };
@@ -135,12 +180,8 @@ export async function canReadDocument(
   role: Role,
   documentId: string,
 ): Promise<boolean> {
-  if (role === "admin") {
-    const r = await pool.query("SELECT 1 FROM documents WHERE document_id = $1", [documentId]);
-    return !!r.rows[0];
-  }
   const r = await pool.query(
-    `SELECT d.created_by, w.owner_id
+    `SELECT d.created_by, d.workspace_id, w.owner_id
      FROM documents d
      LEFT JOIN workspaces w ON w.workspace_id = d.workspace_id
      WHERE d.document_id = $1`,
@@ -148,7 +189,14 @@ export async function canReadDocument(
   );
   const row = r.rows[0];
   if (!row) return false;
-  return row.created_by === userId || row.owner_id === userId;
+  const baseAllowed = role === "admin" || row.created_by === userId || row.owner_id === userId;
+  if (!baseAllowed) return false;
+  try {
+    await assertUpsIWorkspaceMembership(userId, row.workspace_id);
+    return true;
+  } catch {
+    return false;
+  }
 }
 
 export async function assertCanReadDocument(
@@ -172,4 +220,11 @@ export async function assertCanReadDocument(
     throw Object.assign(new Error("Forbidden"), { status: 403 });
   }
   await assertOrgGateForWorkspace(userId, row.workspace_id);
+  await assertUpsIWorkspaceMembership(userId, row.workspace_id);
+  await logUpsIAccess({
+    workspaceId: row.workspace_id,
+    userId,
+    artifactType: "document",
+    artifactId: documentId,
+  });
 }

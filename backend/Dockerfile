@@ -16,7 +16,9 @@ RUN npm run build && npm prune --omit=dev
 FROM node:20-alpine AS runner
 WORKDIR /app
 ENV NODE_ENV=production
-RUN addgroup -S app && adduser -S app -G app
+ENV PUPPETEER_EXECUTABLE_PATH=/usr/bin/chromium-browser
+RUN apk add --no-cache chromium nss freetype harfbuzz ca-certificates ttf-freefont \
+    && addgroup -S app && adduser -S app -G app
 COPY --from=build --chown=app:app /app/node_modules ./node_modules
 COPY --from=build --chown=app:app /app/dist ./dist
 COPY --from=build --chown=app:app /app/package.json ./package.json

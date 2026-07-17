@@ -105,6 +105,22 @@ export async function getSignedUrl(key: string, expiresInSec = 3600): Promise<st
   return getSignedObjectUrl(key, expiresInSec);
 }
 
+export async function deleteObject(key: string): Promise<void> {
+  if (!isObjectStorageEnabled() || !key) return;
+  try {
+    const { DeleteObjectCommand } = await import("@aws-sdk/client-s3");
+    const client = await getClient();
+    await client.send(
+      new DeleteObjectCommand({
+        Bucket: config.OBJECT_STORAGE_BUCKET!,
+        Key: key,
+      }),
+    );
+  } catch (e) {
+    logger.warn({ detail: (e as Error).message, key }, "[ObjectStorage] deleteObject failed");
+  }
+}
+
 /**
  * Dual-read original bytes: storage_key → S3, else Postgres BYTEA.
  */
@@ -112,15 +128,19 @@ export async function loadDocumentBytes(doc: {
   document_id: string;
   storage_key?: string | null;
   file_bytes?: Buffer | Uint8Array | null;
+  encryption_version?: string | null;
 }): Promise<Buffer | null> {
+  let stored: Buffer | null = null;
   if (doc.storage_key) {
     const fromS3 = await getObject(doc.storage_key);
-    if (fromS3) return fromS3;
+    if (fromS3) stored = fromS3;
   }
-  if (doc.file_bytes) {
-    return Buffer.isBuffer(doc.file_bytes) ? doc.file_bytes : Buffer.from(doc.file_bytes);
+  if (!stored && doc.file_bytes) {
+    stored = Buffer.isBuffer(doc.file_bytes) ? doc.file_bytes : Buffer.from(doc.file_bytes);
   }
-  return null;
+  if (!stored) return null;
+  const { decryptDocumentBytes } = await import("./documentCrypto.js");
+  return decryptDocumentBytes(doc.document_id, stored, doc.encryption_version);
 }
 
 /**
@@ -136,7 +156,7 @@ export async function backfillDocumentsToObjectStorage(opts?: {
   const { pool } = await import("../db/index.js");
   const limit = opts?.limit ?? 100;
   const r = await pool.query(
-    `SELECT document_id, workspace_id, file_bytes, file_type, storage_key
+    `SELECT document_id, workspace_id, file_bytes, file_type, storage_key, encryption_version
      FROM documents
      WHERE file_bytes IS NOT NULL
        AND (storage_key IS NULL OR storage_backend = 'postgres')
@@ -156,19 +176,32 @@ export async function backfillDocumentsToObjectStorage(opts?: {
       const buf = Buffer.isBuffer(row.file_bytes)
         ? row.file_bytes
         : Buffer.from(row.file_bytes);
+      const { encryptDocumentBytes } = await import("./documentCrypto.js");
+      const encrypted = row.encryption_version
+        ? { bytes: buf, version: row.encryption_version }
+        : encryptDocumentBytes(row.document_id, buf);
       const stored = await storeWorkbookBytes(
         row.workspace_id,
         row.document_id,
-        buf,
-        row.file_type || "application/octet-stream",
+        encrypted.bytes,
+        "application/octet-stream",
       );
       if (!stored) {
         skipped += 1;
         continue;
       }
       await pool.query(
-        `UPDATE documents SET storage_key = $2, storage_backend = $3 WHERE document_id = $1`,
-        [row.document_id, stored.storage_key, stored.storage_backend],
+        `UPDATE documents
+         SET storage_key = $2, storage_backend = $3, file_bytes = $4,
+             encryption_version = $5
+         WHERE document_id = $1`,
+        [
+          row.document_id,
+          stored.storage_key,
+          stored.storage_backend,
+          encrypted.bytes,
+          encrypted.version,
+        ],
       );
       migrated += 1;
     } catch (e) {

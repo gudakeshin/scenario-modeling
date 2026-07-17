@@ -1,5 +1,7 @@
 import ExcelJS from "exceljs";
-import { detectDenominationFromText, normalizeCurrencyUnit, toCanonical, type CurrencyUnit } from "./denomination.js";
+import JSZip from "jszip";
+import { HyperFormula } from "hyperformula";
+import { detectDenominationFromText, normalizeCurrencyUnit, type CurrencyUnit } from "./denomination.js";
 import {
   ARTIFACT_VERSION,
   type IngestionWarning,
@@ -32,7 +34,15 @@ export interface WorkbookGraph {
   inputCandidates?: Array<{ id: string; label: string; sheet: string; cell: string; value: number }>;
   outputCandidates?: Array<{ id: string; label: string; sheet: string; row: number; cell?: string; value: number }>;
   scenarioToggle?: { cell: string; values: string[] };
-  timeAxis?: { sheet: string; columns: string[]; aggregateCol?: string };
+  timeAxis?: {
+    sheet: string;
+    columns: string[];
+    aggregateCol?: string;
+    /** Year-over-year comparison columns (FY25/FY24) are not forecast periods. */
+    kind?: "periods" | "year_comparison";
+    /** Primary (current) year column when kind === "year_comparison". */
+    primaryColumn?: string;
+  };
   currency?: string;
   unit?: string;
   /** Per-sheet denomination map (sheet name → currency/unit). */
@@ -45,6 +55,8 @@ export interface WorkbookGraph {
   cellSnapshot?: Record<string, (string | number | null)[][]>;
   /** Soft flag when workbook is large (still snapshotted sparsely). */
   largeWorkbook?: boolean;
+  /** ISO date (YYYY-MM-DD) when the workbook was extracted — for TODAY/NOW explainability. */
+  extractionDate?: string;
 }
 
 /** Soft threshold for "large workbook" warning — snapshots are still kept. */
@@ -54,6 +66,9 @@ const MONTH_REGEX = /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[
 const QUARTER_REGEX = /\bq[1-4](?:[-\s]?fy?\s?\d{0,4})?\b/i;
 const FY_REGEX = /\bfy[-\s]?\d{2,4}\b/i;
 const AGG_COL_REGEX = /\b(total|fy|annual|year)\b/i;
+const VOLATILE_FN_REGEX = /\b(RAND|RANDBETWEEN|RANDARRAY|NOW|TODAY)\s*\(/i;
+const FUNCTION_TOKEN_REGEX = /(?:_xlfn\.)?([A-Z][A-Z0-9._]*)\s*\(/gi;
+const HF_FUNCTIONS = new Set(HyperFormula.getRegisteredFunctionNames("enGB"));
 
 /**
  * Cross-sheet / cell refs including quoted sheet names:
@@ -179,6 +194,17 @@ function isTimeHeader(value: string): boolean {
   return MONTH_REGEX.test(value) || QUARTER_REGEX.test(value) || FY_REGEX.test(value);
 }
 
+/**
+ * Compact period column labels (e.g. "FY25 (₹ Cr)", "Q1 FY25", "Apr-24").
+ * Rejects prose titles that merely embed an FY token.
+ */
+function isPeriodColumnHeader(value: string): boolean {
+  const t = value.trim();
+  if (!t || t.length > 32) return false;
+  if (MONTH_REGEX.test(t) || QUARTER_REGEX.test(t)) return true;
+  return /^fy[-\s]?\d{2,4}\b/i.test(t);
+}
+
 function classifySheet(
   sheetName: string,
   rowCount: number,
@@ -203,6 +229,17 @@ function classifySheet(
 
 function toId(label: string): string {
   return label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
+}
+
+function colToLetters(col: number): string {
+  let n = col + 1;
+  let s = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    s = String.fromCharCode(65 + rem) + s;
+    n = Math.floor((n - 1) / 26);
+  }
+  return s;
 }
 
 /** Render formula-aware text for secondary RAG chunks (does not drive the model). */
@@ -273,17 +310,38 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
   const inputCandidates: NonNullable<WorkbookGraph["inputCandidates"]> = [];
   const outputCandidates: NonNullable<WorkbookGraph["outputCandidates"]> = [];
   const warnings: IngestionWarning[] = [];
+  const unsupportedFunctions = new Map<string, { count: number; examples: string[] }>();
   const sheetOrder: string[] = [];
   let scenarioToggle: WorkbookGraph["scenarioToggle"];
   let timeAxis: WorkbookGraph["timeAxis"];
-  let currency: string | undefined;
-  let unit: string | undefined;
   let formulaCount = 0;
   let crossSheetLinkCount = 0;
   let cellCount = 0;
 
   const sparseSheets: SparseWorkbookSnapshot["sheets"] = {};
   const denomTextChunks: string[] = [];
+  /** Cells containing volatile functions — dependents marked after dependency walk. */
+  const volatileCells = new Set<string>();
+  /** ISO date of extraction — for TODAY/NOW explainability in run manifests. */
+  const extractionDate = new Date().toISOString().slice(0, 10);
+
+  try {
+    const archive = await JSZip.loadAsync(buffer);
+    if (Object.keys(archive.files).some((name) => /^xl\/pivot(Cache|Tables)\//i.test(name))) {
+      warnings.push({
+        code: "pivot_static",
+        message: "Pivot tables are imported as cached static values; pivot refresh is not supported.",
+      });
+    }
+    if (archive.file("xl/vbaProject.bin")) {
+      warnings.push({
+        code: "macro_not_executed",
+        message: "VBA macros are preserved in the original workbook but are never executed.",
+      });
+    }
+  } catch {
+    // ExcelJS provides the authoritative malformed-workbook error below.
+  }
 
   const namedRanges: Array<{ name: string; refersTo: string }> = [];
   try {
@@ -425,11 +483,40 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
               cell: cell.address,
             });
           }
-          // Heuristic for Excel-only functions HyperFormula may not support
-          if (/\b(XLOOKUP|FILTER|SORT|UNIQUE|LAMBDA|LET|SEQUENCE|TEXTJOIN)\s*\(/i.test(formula)) {
+          for (const match of formula.matchAll(FUNCTION_TOKEN_REGEX)) {
+            const functionName = match[1].toUpperCase();
+            if (HF_FUNCTIONS.has(functionName)) continue;
+            const record = unsupportedFunctions.get(functionName) ?? { count: 0, examples: [] };
+            record.count += 1;
+            if (record.examples.length < 3) record.examples.push(`${sheet.name}!${cell.address}`);
+            unsupportedFunctions.set(functionName, record);
+          }
+          if (/\b[A-Z_][A-Z0-9_.]*\s*\[[^\]]+\]/i.test(formula)) {
             warnings.push({
-              code: "unsupported_formula_hint",
-              message: "Formula may use Excel functions with limited HyperFormula support",
+              code: "structured_reference",
+              message: "Structured table reference requires review",
+              sheet: sheet.name,
+              cell: cell.address,
+              detail: formula.slice(0, 200),
+            });
+          }
+          const formulaType = (cell as unknown as { formulaType?: string }).formulaType;
+          if (formulaType === "array" || formulaType === "shared") {
+            warnings.push({
+              code: "array_formula",
+              message: `${formulaType === "array" ? "Array" : "Shared"} formula requires parity review`,
+              sheet: sheet.name,
+              cell: cell.address,
+              detail: formula.slice(0, 200),
+            });
+          }
+          if (VOLATILE_FN_REGEX.test(formula)) {
+            VOLATILE_FN_REGEX.lastIndex = 0;
+            volatileCells.add(fromRef.replace(/\$/g, "").toUpperCase());
+            warnings.push({
+              code: "volatile_function",
+              message:
+                "Volatile function (RAND/NOW/TODAY) — value is non-deterministic vs Excel cached result",
               sheet: sheet.name,
               cell: cell.address,
               detail: formula.slice(0, 120),
@@ -536,21 +623,54 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
       }
     }
 
-    if (!timeAxis && timeHeaders.length >= 2) {
-      const aggregateCol = timeHeaders.find((h) => AGG_COL_REGEX.test(h));
-      timeAxis = {
-        sheet: sheet.name,
-        columns: [...new Set(timeHeaders)],
-        aggregateCol,
-      };
+    // Prefer compact period column headers so prose titles with an embedded FY
+    // token (e.g. cover sheets) do not steal the time axis from FY25/FY24 cols.
+    const periodCols = [...new Set(timeHeaders.filter(isPeriodColumnHeader))];
+    if (!timeAxis && periodCols.length >= 2) {
+      const hasMonthOrQuarter = periodCols.some(
+        (h) => MONTH_REGEX.test(h) || QUARTER_REGEX.test(h),
+      );
+      const fyCols = periodCols.filter((h) => FY_REGEX.test(h));
+      if (!hasMonthOrQuarter && fyCols.length >= 1) {
+        timeAxis = {
+          sheet: sheet.name,
+          columns: periodCols,
+          kind: "year_comparison",
+          primaryColumn: fyCols[0],
+        };
+      } else {
+        const aggregateCol = periodCols.find((h) => AGG_COL_REGEX.test(h));
+        timeAxis = {
+          sheet: sheet.name,
+          columns: periodCols,
+          kind: "periods",
+          aggregateCol,
+        };
+      }
     }
   });
 
+  const unsupportedEntries = [...unsupportedFunctions.entries()].sort();
+  for (const [functionName, record] of unsupportedEntries.slice(0, 100)) {
+    warnings.push({
+      code: "unsupported_function",
+      message: `${functionName} is not registered by HyperFormula (${record.count} occurrence${record.count === 1 ? "" : "s"}).`,
+      detail: `Examples: ${record.examples.join(", ")}`,
+    });
+  }
+  if (unsupportedEntries.length > 100) {
+    warnings.push({
+      code: "unsupported_function",
+      message: `${unsupportedEntries.length - 100} additional unsupported function names were omitted from this report.`,
+    });
+  }
+
   const denom = detectDenominationFromText(denomTextChunks.join("\n"));
-  currency = denom.currency;
-  unit = denom.unit || normalizeCurrencyUnit(denomTextChunks.join(" "));
+  const currency = denom.currency;
+  const unit = denom.unit || normalizeCurrencyUnit(denomTextChunks.join(" "));
 
   // Stamp per-cell source denomination, preferring per-sheet hints over document-global.
+  // Candidate values stay in document-native denomination (Crore/MT/₹/t) — unit is metadata only.
   for (const sheetName of sheetOrder) {
     const snap = sparseSheets[sheetName];
     if (!snap) continue;
@@ -565,26 +685,46 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
     }
   }
 
-  // Canonicalize candidate numeric values into Million using per-sheet unit when available.
-  const canonicalize = (value: number, sheetName: string): number => {
-    const sheetMeta = sheets[sheetName];
-    const sourceUnit =
-      (sheetMeta?.unit as CurrencyUnit | undefined) ?? (unit as CurrencyUnit | undefined);
-    const sourceCurrency = sheetMeta?.currency ?? currency;
-    try {
-      return toCanonical(value, { unit: sourceUnit, currency: sourceCurrency }).value;
-    } catch {
-      return value;
+  // Propagate volatile flag to formula dependents (fixpoint).
+  // extractReadsFrom only captures cross-sheet refs — also match same-sheet A1 refs.
+  const SAME_SHEET_REF = /(?:^|[^A-Z0-9_!'"])(\$?[A-Z]{1,3}\$?\d+)/gi;
+  if (volatileCells.size > 0) {
+    let grown = true;
+    while (grown) {
+      grown = false;
+      for (const dep of dependencies) {
+        const fromKey = dep.from.replace(/\$/g, "").toUpperCase();
+        if (volatileCells.has(fromKey)) continue;
+        const sheetOfFrom = fromKey.includes("!") ? fromKey.split("!")[0] : "";
+        const readsVolatile = dep.readsFrom.some((r) =>
+          volatileCells.has(r.replace(/\$/g, "").toUpperCase()),
+        );
+        let sameSheetVolatile = false;
+        if (!readsVolatile && sheetOfFrom) {
+          SAME_SHEET_REF.lastIndex = 0;
+          let m: RegExpExecArray | null;
+          while ((m = SAME_SHEET_REF.exec(dep.formula)) !== null) {
+            const cellRef = m[1].replace(/\$/g, "").toUpperCase();
+            if (volatileCells.has(`${sheetOfFrom}!${cellRef}`)) {
+              sameSheetVolatile = true;
+              break;
+            }
+          }
+        }
+        if (readsVolatile || sameSheetVolatile) {
+          volatileCells.add(fromKey);
+          grown = true;
+        }
+      }
     }
-  };
-  for (const c of inputCandidates) {
-    if (typeof c.value === "number" && Number.isFinite(c.value)) {
-      c.value = canonicalize(c.value, c.sheet);
-    }
-  }
-  for (const c of outputCandidates) {
-    if (typeof c.value === "number" && Number.isFinite(c.value)) {
-      c.value = canonicalize(c.value, c.sheet);
+    for (const sheetName of sheetOrder) {
+      const snap = sparseSheets[sheetName];
+      if (!snap) continue;
+      for (const cell of snap.cells) {
+        const a1 = `${colToLetters(cell.c)}${cell.r + 1}`;
+        const key = `${sheetName}!${a1}`.toUpperCase();
+        if (volatileCells.has(key)) cell.volatile = true;
+      }
     }
   }
 
@@ -630,6 +770,7 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
     ...(unit ? { unit } : {}),
     ...(namedRanges.length > 0 ? { namedRanges } : {}),
     ...(largeWorkbook ? { largeWorkbook: true } : {}),
+    extractionDate,
     sheetDenominations: Object.fromEntries(
       Object.entries(sheets)
         .filter(([, meta]) => meta.currency || meta.unit)

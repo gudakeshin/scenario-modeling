@@ -26,8 +26,8 @@ test("aggregate xlsx: margin weighted, revenue summed", () => {
   ];
   const { aggregate } = aggregateXlsxPeriodPl(periods, ["revenue", "gross_margin"]);
   assert.strictEqual(aggregate.revenue, 4000);
-  // weighted: (0.4*1000 + 0.5*3000) / 4000 = 0.475 → round2 → 0.48
-  assert.ok(Math.abs(aggregate.gross_margin - 0.48) < 1e-9, `got ${aggregate.gross_margin}`);
+  // weighted: (0.4*1000 + 0.5*3000) / 4000 = 0.475 (full float64, no premature round)
+  assert.ok(Math.abs(aggregate.gross_margin - 0.475) < 1e-9, `got ${aggregate.gross_margin}`);
 });
 
 test("aggregate: revenue sums, gross_margin is ratio not ×N", () => {

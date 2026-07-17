@@ -61,12 +61,41 @@ const CURRENCY_SYMBOLS: Record<string, string> = {
   KRW: "₩", BRL: "R$", ZAR: "R", MXN: "MX$", SEK: "kr",
 };
 
+/** Ones multipliers — keep aligned with backend denomination.ts */
+const UNIT_TO_ONES = {
+  Thousand: 1_000,
+  Lakh: 100_000,
+  Million: 1_000_000,
+  Crore: 10_000_000,
+  Billion: 1_000_000_000,
+} as const;
+
+export type DisplayUnit = keyof typeof UNIT_TO_ONES;
+
 let _currency = "USD";
 let _currencyUnit = "";
+/** Workspace preference for scale display (Crore vs Million). */
+let _preferUnit: DisplayUnit | "auto" = "auto";
+
+const numberFormatCache = new Map<string, Intl.NumberFormat>();
+
+function indianFmt(opts: Intl.NumberFormatOptions): Intl.NumberFormat {
+  const key = JSON.stringify(opts);
+  let fmt = numberFormatCache.get(key);
+  if (!fmt) {
+    fmt = new Intl.NumberFormat("en-IN", opts);
+    numberFormatCache.set(key, fmt);
+  }
+  return fmt;
+}
 
 export function setCurrency(code: string, unit?: string) {
   _currency = code || "USD";
   _currencyUnit = unit || "";
+}
+
+export function setPreferDisplayUnit(unit: DisplayUnit | "auto") {
+  _preferUnit = unit;
 }
 
 export function getCurrencySymbol(): string {
@@ -78,9 +107,62 @@ export function getCurrencyLabel(): string {
   return _currencyUnit ? `${sym} ${_currencyUnit}` : sym;
 }
 
+export function fmtIndianNumber(
+  n: number,
+  opts: { maximumFractionDigits?: number; minimumFractionDigits?: number } = {},
+): string {
+  if (!Number.isFinite(n)) return String(n);
+  return indianFmt({
+    maximumFractionDigits: opts.maximumFractionDigits ?? 0,
+    minimumFractionDigits: opts.minimumFractionDigits,
+  }).format(n);
+}
+
+/**
+ * Format absolute (ones) amounts with Indian scale labels.
+ * When `_currencyUnit` is Crore/Lakh/Million, values are treated as already in that unit.
+ */
+export function fmtIndianScale(n: number, onesAlready = false): string {
+  if (!Number.isFinite(n)) return String(n);
+  const sym = getCurrencySymbol();
+  const sign = n < 0 ? "-" : "";
+  const abs = Math.abs(n);
+
+  // If workspace already stores in a known unit, format that unit directly.
+  const unitFromMeta = (_currencyUnit || "") as DisplayUnit | "";
+  if (!onesAlready && unitFromMeta && unitFromMeta in UNIT_TO_ONES) {
+    const short =
+      unitFromMeta === "Crore" ? "Cr" :
+      unitFromMeta === "Lakh" ? "L" :
+      unitFromMeta === "Million" ? "Mn" :
+      unitFromMeta === "Billion" ? "Bn" : "K";
+    return `${sign}${sym} ${fmtIndianNumber(abs, { maximumFractionDigits: 2 })} ${short}`;
+  }
+
+  const ones = onesAlready
+    ? abs
+    : abs * (unitFromMeta && unitFromMeta in UNIT_TO_ONES ? UNIT_TO_ONES[unitFromMeta as DisplayUnit] : 1);
+
+  let unit: DisplayUnit;
+  if (_preferUnit !== "auto") unit = _preferUnit;
+  else if (ones >= UNIT_TO_ONES.Crore) unit = "Crore";
+  else if (ones >= UNIT_TO_ONES.Lakh) unit = "Lakh";
+  else if (ones >= UNIT_TO_ONES.Thousand) unit = "Thousand";
+  else return `${sign}${sym}${fmtIndianNumber(ones, { maximumFractionDigits: 2 })}`;
+
+  const scaled = ones / UNIT_TO_ONES[unit];
+  const short =
+    unit === "Crore" ? "Cr" : unit === "Lakh" ? "L" : unit === "Million" ? "Mn" : unit === "Billion" ? "Bn" : "K";
+  return `${sign}${sym} ${fmtIndianNumber(scaled, { maximumFractionDigits: 2 })} ${short}`;
+}
+
 export function fmtCurrency(n: number): string {
   const sym = getCurrencySymbol();
-  return sym + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+  // Prefer scale-aware Indian formatting when currency is INR or unit is Indian.
+  if (_currency === "INR" || /crore|lakh|cr\b|lac/i.test(_currencyUnit)) {
+    return fmtIndianScale(n);
+  }
+  return sym + fmtIndianNumber(Math.abs(n), { maximumFractionDigits: 0 });
 }
 
 export function fmtCurrencySigned(n: number): string {
@@ -106,7 +188,7 @@ export function inferMetricType(id: string, name?: string): MetricType {
  */
 export function fmtPercent(n: number): string {
   const pct = Math.abs(n) > 0 && Math.abs(n) <= 1 ? n * 100 : n;
-  return `${pct.toLocaleString(undefined, { maximumFractionDigits: 1 })}%`;
+  return `${fmtIndianNumber(pct, { maximumFractionDigits: 1 })}%`;
 }
 
 export function fmtPercentSigned(n: number): string {
@@ -119,10 +201,10 @@ export function fmtMetric(id: string, n: number, name?: string): string {
   const kind = inferMetricType(id, name);
   if (kind === "percent") return fmtPercent(n);
   if (kind === "ratio") {
-    return `${n.toLocaleString(undefined, { maximumFractionDigits: 2 })}x`;
+    return `${fmtIndianNumber(n, { maximumFractionDigits: 2 })}x`;
   }
   if (kind === "count" || kind === "volume") {
-    return n.toLocaleString(undefined, { maximumFractionDigits: 0 });
+    return fmtIndianNumber(n, { maximumFractionDigits: 0 });
   }
   return fmtCurrency(n);
 }
@@ -132,11 +214,11 @@ export function fmtMetricSigned(id: string, n: number, name?: string): string {
   if (kind === "percent") return fmtPercentSigned(n);
   if (kind === "ratio") {
     const prefix = n >= 0 ? "+" : "-";
-    return `${prefix}${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 2 })}x`;
+    return `${prefix}${fmtIndianNumber(Math.abs(n), { maximumFractionDigits: 2 })}x`;
   }
   if (kind === "count" || kind === "volume") {
     const prefix = n >= 0 ? "+" : "-";
-    return `${prefix}${Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 })}`;
+    return `${prefix}${fmtIndianNumber(Math.abs(n), { maximumFractionDigits: 0 })}`;
   }
   return fmtCurrencySigned(n);
 }

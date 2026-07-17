@@ -15,6 +15,7 @@
 
 import { pool } from "../db/index.js";
 import { monteCarloIterations } from "../metrics.js";
+import { config as appConfig } from "../config.js";
 import {
   getEvaluableModelForScenario,
   loadScenarioOverrides,
@@ -72,6 +73,7 @@ export interface CorrelationSpec {
 
 export interface MonteCarloConfig {
   scenario_id: string;
+  created_by?: string;
   iterations: number;
   distributions: DistributionConfig[];
   correlations?: CorrelationSpec[];
@@ -113,6 +115,10 @@ export interface PercentileResult {
 export interface MonteCarloResult {
   iterations: number;
   requested_iterations: number;
+  completed: number;
+  truncated: boolean;
+  degraded: boolean;
+  completion_ratio: number;
   seed: number;
   metrics: Record<string, PercentileResult>;
   /** Raw distribution data: metric → array of iteration values (for histograms) */
@@ -214,8 +220,9 @@ function sampleStddev(arr: number[], mean: number): number {
   return Math.sqrt(sumSq / (arr.length - 1));
 }
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
+/** Display/serialization rounding only — draws stay full float64. */
+function round6(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
 }
 
 // ── Main engine ──
@@ -223,7 +230,7 @@ function round2(n: number): number {
 export const MC_MIN_ITERATIONS = 100;
 export const MC_MAX_ITERATIONS = 20_000;
 export const MC_DEFAULT_ITERATIONS = 10_000;
-const MC_TIME_BUDGET_MS = Number(process.env.MC_TIME_BUDGET_MS) || 30_000;
+const MC_TIME_BUDGET_MS = appConfig.MC_TIME_BUDGET_MS;
 
 class McConfigError extends Error {
   status = 422;
@@ -405,7 +412,7 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
         ]).totals
       : model.evaluate(absVals);
     for (const m of outputIds) {
-      results[m].push(round2(out[m] ?? 0));
+      results[m].push(out[m] ?? 0);
     }
     completed++;
 
@@ -443,21 +450,21 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
     const ciHalf = 1.96 * (sd / Math.sqrt(n));
 
     metrics[m] = {
-      p5: round2(p5),
-      p10: round2(percentile(arr, 10)),
-      p25: round2(percentile(arr, 25)),
-      p50: round2(percentile(arr, 50)),
-      p75: round2(percentile(arr, 75)),
-      p90: round2(percentile(arr, 90)),
-      p95: round2(percentile(arr, 95)),
-      mean: round2(mean),
-      stddev: round2(sd),
+      p5: round6(p5),
+      p10: round6(percentile(arr, 10)),
+      p25: round6(percentile(arr, 25)),
+      p50: round6(percentile(arr, 50)),
+      p75: round6(percentile(arr, 75)),
+      p90: round6(percentile(arr, 90)),
+      p95: round6(percentile(arr, 95)),
+      mean: round6(mean),
+      stddev: round6(sd),
       min: arr[0],
       max: arr[n - 1],
-      var_5: round2(p5),
-      cvar_5: round2(cvar),
-      prob_negative: round2(arr.filter((v) => v < 0).length / n),
-      mean_ci_95: [round2(mean - ciHalf), round2(mean + ciHalf)],
+      var_5: round6(p5),
+      cvar_5: round6(cvar),
+      prob_negative: round6(arr.filter((v) => v < 0).length / n),
+      mean_ci_95: [round6(mean - ciHalf), round6(mean + ciHalf)],
     };
     fan_chart[m] = {
       p5: metrics[m].p5,
@@ -471,24 +478,87 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
   }
 
   const dedupedNotices = [...new Set(notices)];
+  const truncated = completed < requestedIterations;
+  const completionRatio = requestedIterations > 0 ? completed / requestedIterations : 1;
+  const degraded = completionRatio < 0.5;
+  if (degraded) {
+    dedupedNotices.unshift(
+      `DEGRADED: only ${completed} of ${requestedIterations} requested iterations completed ` +
+        `(${(completionRatio * 100).toFixed(1)}%). Treat percentile estimates with caution.`,
+    );
+  }
 
-  // Store result (seed included for reproducibility / audit)
-  await pool.query(
-    `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'monte_carlo', $2)`,
-    [
-      config.scenario_id,
-      JSON.stringify({
+  const storedResult = {
         iterations: completed,
         requested_iterations: requestedIterations,
+        completed,
+        truncated,
+        degraded,
+        completion_ratio: completionRatio,
         seed,
         metrics,
         fan_chart,
         correlations_applied: !!correlated,
         ...(dedupedNotices.length > 0 ? { notices: dedupedNotices } : {}),
         ...(fittedAssumptions ? { fitted_assumptions: fittedAssumptions } : {}),
-      }),
-    ],
-  );
+  };
+
+  // Store result and its immutable manifest atomically.
+  const persistClient = await pool.connect();
+  try {
+    await persistClient.query("BEGIN");
+    const inserted = await persistClient.query<{ output_id: string }>(
+      `INSERT INTO scenario_outputs (scenario_id, output_type, output_data)
+       VALUES ($1, 'monte_carlo', $2)
+       RETURNING output_id`,
+      [config.scenario_id, JSON.stringify(storedResult)],
+    );
+    if (config.created_by) {
+      const provenance = await persistClient.query<{
+        version_id: string;
+        workspace_id: string | null;
+      }>(
+        `SELECT sv.version_id, s.workspace_id
+         FROM scenarios s
+         JOIN LATERAL (
+           SELECT version_id FROM scenario_versions
+           WHERE scenario_id = s.scenario_id
+           ORDER BY version_number DESC LIMIT 1
+         ) sv ON TRUE
+         WHERE s.scenario_id = $1`,
+        [config.scenario_id],
+      );
+      if (provenance.rows.length === 0) {
+        throw new Error("Monte Carlo requires a persisted deterministic run/version first");
+      }
+      const { createRunManifest } = await import("./runManifestService.js");
+      await createRunManifest(
+        {
+          runId: inserted.rows[0].output_id,
+          scenarioId: config.scenario_id,
+          scenarioVersionId: provenance.rows[0].version_id,
+          workspaceId: provenance.rows[0].workspace_id,
+          createdBy: config.created_by,
+          resolvedVariables: {},
+          mc: {
+            seed,
+            requested: requestedIterations,
+            completed,
+            truncated,
+            degraded,
+            completion_ratio: completionRatio,
+          },
+        },
+        persistClient,
+      );
+    }
+    await persistClient.query("COMMIT");
+  } catch (error) {
+    await persistClient.query("ROLLBACK");
+    throw error;
+  } finally {
+    persistClient.release();
+  }
 
   // Return truncated distributions (max 200 samples per metric for histograms)
   const truncatedDist: Record<string, number[]> = {};
@@ -504,6 +574,10 @@ export async function runMonteCarlo(config: MonteCarloConfig): Promise<MonteCarl
   return {
     iterations: completed,
     requested_iterations: requestedIterations,
+    completed,
+    truncated,
+    degraded,
+    completion_ratio: completionRatio,
     seed,
     metrics,
     distributions: truncatedDist,
@@ -555,7 +629,7 @@ export function fitDistributionsFromHistory(
       if (n < 3) continue;
       const rho = pearson(xa.slice(0, n), xb.slice(0, n));
       if (!Number.isFinite(rho) || Math.abs(rho) < 0.05) continue;
-      correlations.push({ a, b, rho: Math.max(-1, Math.min(1, round2(rho))) });
+      correlations.push({ a, b, rho: Math.max(-1, Math.min(1, round6(rho))) });
     }
   }
 

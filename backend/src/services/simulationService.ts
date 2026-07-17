@@ -110,12 +110,9 @@ function isFiniteNumber(n: unknown): n is number {
   return typeof n === "number" && Number.isFinite(n);
 }
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
-
 /**
  * Copy finite metrics into `out`, listing non-finite ones in `errors`.
+ * Persists full float64 — round only at display/serialization edges.
  */
 export function collectFiniteMetrics(
   source: Record<string, number | undefined | null>,
@@ -125,7 +122,7 @@ export function collectFiniteMetrics(
   let coreFailed = false;
   for (const [id, raw] of Object.entries(source)) {
     if (isFiniteNumber(raw)) {
-      out[id] = round2(raw);
+      out[id] = raw;
     } else if (raw !== undefined) {
       errors.push({
         metric_id: id,
@@ -545,7 +542,7 @@ async function _runDimensionalSimulation(
   const variables: Record<string, number> = {};
   for (const input of model.inputs) {
     const v = scenarioResult.totals[input.id] ?? input.base;
-    if (isFiniteNumber(v)) variables[input.id] = round2(v);
+    if (isFiniteNumber(v)) variables[input.id] = v;
   }
 
   const timeDimId = def.time_dimension_id;
@@ -560,7 +557,7 @@ async function _runDimensionalSimulation(
       const periodPl: Record<string, number> = {};
       for (const id of model.outputIds) {
         const v = scenarioResult.valueAt(id, { [timeDimId!]: leaf.id });
-        if (isFiniteNumber(v)) periodPl[id] = round2(v);
+        if (isFiniteNumber(v)) periodPl[id] = v;
       }
       periods.push({
         period: leaf.name,
@@ -585,7 +582,7 @@ async function _runDimensionalSimulation(
           : dim.members.filter((m) => m.isLeaf);
       for (const m of level1) {
         const v = scenarioResult.valueAt(metricId, { [dim.id]: m.id });
-        if (isFiniteNumber(v)) slice[m.id] = round2(v);
+        if (isFiniteNumber(v)) slice[m.id] = v;
       }
       if (Object.keys(slice).length > 0) breakdowns[metricId][dim.id] = slice;
     }
@@ -702,7 +699,7 @@ async function _runXlsxSimulation(
   const variables: Record<string, number> = {};
   for (const input of runtime.inputs) {
     const v = scenarioOut[input.id] ?? input.base;
-    if (isFiniteNumber(v)) variables[input.id] = round2(v);
+    if (isFiniteNumber(v)) variables[input.id] = v;
     else {
       formulaErrors.push({
         metric_id: input.id,
@@ -727,6 +724,7 @@ async function _runXlsxSimulation(
   }
 
   let periods: PeriodResult[] = [{ period: "FY", pl, variables }];
+  let basePeriods: PeriodResult[] | undefined;
   if (evaluatePeriods) {
     try {
       const periodSlices = evaluatePeriods(absolute);
@@ -738,7 +736,9 @@ async function _runXlsxSimulation(
           formulaErrors.push(...pe);
           return { period: s.period, pl: periodPl, variables: { ...periodPl } };
         });
-        // Ratio-aware aggregate (margins/rates never summed across periods)
+        // Ratio-aware aggregate (margins/rates never summed across periods).
+        // When multi-period, also aggregate base from evaluatePeriods({}) so
+        // base_pl and scenario aggregate share the same column granularity.
         if (periods.length > 1) {
           const { aggregate: agg, warnings: aggWarnings } = aggregateXlsxPeriodPl(
             periods,
@@ -746,6 +746,23 @@ async function _runXlsxSimulation(
           );
           notices.push(...aggWarnings);
           Object.assign(pl, agg);
+
+          const basePeriodSlices = evaluatePeriods({});
+          if (basePeriodSlices.length > 1) {
+            basePeriods = basePeriodSlices.map((s) => {
+              const periodPl: Record<string, number> = {};
+              const pe: FormulaErrorMetric[] = [];
+              collectFiniteMetrics(s.values, periodPl, pe);
+              formulaErrors.push(...pe);
+              return { period: s.period, pl: periodPl, variables: { ...periodPl } };
+            });
+            const { aggregate: baseAgg, warnings: baseAggWarnings } = aggregateXlsxPeriodPl(
+              basePeriods,
+              runtime.outputIds,
+            );
+            notices.push(...baseAggWarnings);
+            Object.assign(basePl, baseAgg);
+          }
         }
       }
     } catch (e) {
@@ -758,6 +775,7 @@ async function _runXlsxSimulation(
       aggregate: pl,
       base_pl: basePl,
       periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
+      ...(basePeriods ? { base_periods: basePeriods.map((p) => ({ period: p.period, pl: p.pl })) } : {}),
       simulation_mode: "xlsx_cell_graph",
       formula_error_metrics: formulaErrors,
       notices,
@@ -777,6 +795,7 @@ async function _runXlsxSimulation(
     aggregate: pl,
     base_pl: basePl,
     periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
+    ...(basePeriods ? { base_periods: basePeriods.map((p) => ({ period: p.period, pl: p.pl })) } : {}),
     granularity: "quarterly",
     period_count: periods.length,
     simulation_mode: "xlsx_cell_graph",
@@ -837,7 +856,7 @@ async function _runFormulaSimulation(
     const periodPl: Record<string, number> = {};
     for (const id of plMetricIds) {
       const v = scenarioCtx[id];
-      if (isFiniteNumber(v)) periodPl[id] = round2(v);
+      if (isFiniteNumber(v)) periodPl[id] = v;
       else if (id in scenarioCtx) {
         formulaErrors.push({ metric_id: id, raw_value: v, reason: "non_finite" });
       }
@@ -856,7 +875,7 @@ async function _runFormulaSimulation(
   const basePl: Record<string, number> = {};
   for (const id of plMetricIds) {
     const v = baseCtx[id];
-    if (isFiniteNumber(v)) basePl[id] = round2(v);
+    if (isFiniteNumber(v)) basePl[id] = v;
   }
   const singlePeriodPl: Record<string, number> = periods[0]?.pl ?? {};
   const warnings = absurdityWarnings(basePl, singlePeriodPl, overrides);

@@ -6,6 +6,7 @@ import {
   clearTokens,
   getAccessToken,
   hydrateSessionFromCookie,
+  initUserContext,
 } from "./api";
 
 describe("apiFetch", () => {
@@ -128,5 +129,18 @@ describe("apiFetch", () => {
     const ok = await hydrateSessionFromCookie();
     expect(ok).toBe(true);
     expect(getAccessToken()).toBe("hydrated-access");
+  });
+
+  it("initUserContext hydrates before redirecting", async () => {
+    vi.mocked(fetch).mockResolvedValueOnce(
+      new Response(JSON.stringify({ access_token: "boot-access" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      })
+    );
+
+    await initUserContext();
+    expect(getAccessToken()).toBe("boot-access");
+    expect(window.location.href).toBe("http://localhost/app");
   });
 });

@@ -101,6 +101,23 @@ test("excelExtractor: preserves formulas in sparse artifact and quoted sheet nam
   assert.ok(refs.some((r) => r.includes("Assumptions!A2")));
 });
 
+test("excelExtractor: marks volatile functions and dependents", async () => {
+  const wb = new ExcelJS.Workbook();
+  const s = wb.addWorksheet("Vol");
+  s.getCell("A1").value = { formula: "RAND()", result: 0.42 };
+  s.getCell("A2").value = { formula: "A1*100", result: 42 };
+  s.getCell("A3").value = 10;
+
+  const artifact = await extractWorkbookArtifact(Buffer.from(await wb.xlsx.writeBuffer()));
+  assert.ok(artifact.warnings.some((w) => w.code === "volatile_function"));
+  assert.ok(artifact.graph.extractionDate);
+
+  const a1 = artifact.snapshot!.sheets["Vol"].cells.find((c) => c.r === 0 && c.c === 0);
+  const a2 = artifact.snapshot!.sheets["Vol"].cells.find((c) => c.r === 1 && c.c === 0);
+  assert.ok(a1?.volatile, "RAND cell marked volatile");
+  assert.ok(a2?.volatile, "dependent of RAND marked volatile");
+});
+
 test("classifyWorkbookContent: formulas → spreadsheet_model; flat dump → tabular_data", async () => {
   const modelWb = new ExcelJS.Workbook();
   const a = modelWb.addWorksheet("Assumptions");
@@ -138,6 +155,38 @@ test("denomination: Crore and Lac aliases", () => {
   assert.strictEqual(d.unit, "Crore");
 });
 
+test("excelExtractor: Crore banner keeps candidate values as literal cell values", async () => {
+  const wb = new ExcelJS.Workbook();
+  const assumptions = wb.addWorksheet("Assumptions");
+  assumptions.getCell("A1").value = "All figures in INR Crore";
+  assumptions.getCell("A2").value = "Cement sales volume";
+  assumptions.getCell("B2").value = 14;
+  assumptions.getCell("A3").value = "Fuel & power";
+  assumptions.getCell("B3").value = 980;
+
+  const pnl = wb.addWorksheet("P&L");
+  pnl.getCell("A1").value = "Line item";
+  pnl.getCell("B1").value = "FY25 (₹ Cr)";
+  pnl.getCell("C1").value = "FY24 (₹ Cr)";
+  pnl.getCell("A2").value = "EBITDA";
+  pnl.getCell("B2").value = 2741;
+  pnl.getCell("C2").value = 2500;
+
+  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+  const graph = await extractWorkbookGraph(buffer);
+
+  assert.strictEqual(graph.unit, "Crore");
+  const volume = (graph.inputCandidates || []).find((c) => c.cell === "B2");
+  const fuel = (graph.inputCandidates || []).find((c) => c.cell === "B3");
+  assert.ok(volume, "volume candidate");
+  assert.ok(fuel, "fuel candidate");
+  assert.strictEqual(volume!.value, 14, "volume stays native (not ×10)");
+  assert.strictEqual(fuel!.value, 980, "fuel stays native (not ×10)");
+
+  assert.strictEqual(graph.timeAxis?.kind, "year_comparison");
+  assert.ok(/fy25/i.test(graph.timeAxis?.primaryColumn || ""));
+});
+
 test("csvIngestor: typed data-only artifact with no formulas", () => {
   const csv = Buffer.from(
     "Name,Amount\n\"Acme, Inc.\",1000\nBeta,2000\nAll figures in INR Crores\n",
@@ -150,6 +199,41 @@ test("csvIngestor: typed data-only artifact with no formulas", () => {
   assert.ok(artifact.rowCount >= 2);
   assert.strictEqual(artifact.unit, "Crore");
   assert.ok(artifact.warnings.some((w) => w.code === "csv_data_only"));
+});
+
+test("densifySnapshot: keeps wide sparse sheets jagged", () => {
+  const dense = densifySnapshot({
+    format: "sparse_v1",
+    sheetOrder: ["Wide"],
+    sheets: {
+      Wide: {
+        rows: 3,
+        cols: 16_384,
+        cells: [
+          { r: 0, c: 0, v: "label" },
+          { r: 1, c: 9_999, v: 42 },
+        ],
+      },
+    },
+    cellCount: 2,
+    formulaCount: 0,
+  });
+  assert.strictEqual(dense.Wide.length, 3);
+  assert.strictEqual(dense.Wide[0].length, 1);
+  assert.strictEqual(dense.Wide[1].length, 10_000);
+  assert.strictEqual(dense.Wide[2].length, 0);
+  assert.strictEqual(dense.Wide[1][9_999], 42);
+});
+
+test("excelExtractor: aggregates functions absent from HyperFormula registry", async () => {
+  const wb = new ExcelJS.Workbook();
+  const sheet = wb.addWorksheet("Model");
+  sheet.getCell("A1").value = { formula: "TOTALLYUNKNOWN(1)", result: 1 };
+  sheet.getCell("A2").value = { formula: "TOTALLYUNKNOWN(2)", result: 2 };
+  const artifact = await extractWorkbookArtifact(Buffer.from(await wb.xlsx.writeBuffer()));
+  const warning = artifact.warnings.find((item) => item.code === "unsupported_function");
+  assert.ok(warning);
+  assert.match(warning!.message, /TOTALLYUNKNOWN.*2 occurrences/);
 });
 
 test("scenarioContextService: additive touched levers with lock/reset", async () => {

@@ -55,6 +55,8 @@ services:
       OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-}
       OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-}
       OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-}
+      CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:-}
+      DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-standard}
     depends_on:
       postgres:
         condition: service_healthy
@@ -73,6 +75,65 @@ services:
       retries: 10
       start_period: 30s
 
+  worker:
+    build:
+      context: ./backend
+    command: ["node", "dist/worker.js"]
+    restart: unless-stopped
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/scenario_modeling
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in the environment or a .env file}
+      HYPERFORMULA_LICENSE_KEY: ${HYPERFORMULA_LICENSE_KEY:?Set HYPERFORMULA_LICENSE_KEY in the environment or a .env file}
+      METRICS_TOKEN: ${METRICS_TOKEN:?Set METRICS_TOKEN in the environment or a .env file}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in the environment or a .env file}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://frontend:3000}
+      CLAMAV_HOST: clamav
+      CLAMAV_PORT: 3310
+      CLAMAV_REQUIRED: ${CLAMAV_REQUIRED:-false}
+      OBJECT_STORAGE_ENDPOINT: ${OBJECT_STORAGE_ENDPOINT:-}
+      OBJECT_STORAGE_BUCKET: ${OBJECT_STORAGE_BUCKET:-}
+      OBJECT_STORAGE_ACCESS_KEY: ${OBJECT_STORAGE_ACCESS_KEY:-}
+      OBJECT_STORAGE_SECRET_KEY: ${OBJECT_STORAGE_SECRET_KEY:-}
+      CREDENTIALS_ENCRYPTION_KEY: ${CREDENTIALS_ENCRYPTION_KEY:-}
+      DEPLOYMENT_PROFILE: ${DEPLOYMENT_PROFILE:-standard}
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+      backend:
+        condition: service_healthy
+      clamav:
+        condition: service_started
+
+  clamav:
+    image: clamav/clamav:stable
+    expose:
+      - "3310"
+    volumes:
+      - clamavdata:/var/lib/clamav
+
+  backup:
+    build:
+      context: ./ops/backup
+    profiles: ["backup"]
+    restart: unless-stopped
+    environment:
+      DATABASE_URL: postgresql://postgres:postgres@postgres:5432/scenario_modeling
+      BACKUP_BUCKET: ${BACKUP_BUCKET:-}
+      BACKUP_PREFIX: ${BACKUP_PREFIX:-scenario-modeling/postgres}
+      BACKUP_RETENTION_DAYS: ${BACKUP_RETENTION_DAYS:-30}
+      BACKUP_KMS_KEY_ID: ${BACKUP_KMS_KEY_ID:-}
+      OBJECT_STORAGE_ENDPOINT: ${OBJECT_STORAGE_ENDPOINT:-}
+      AWS_ACCESS_KEY_ID: ${OBJECT_STORAGE_ACCESS_KEY:-}
+      AWS_SECRET_ACCESS_KEY: ${OBJECT_STORAGE_SECRET_KEY:-}
+      AWS_DEFAULT_REGION: ${OBJECT_STORAGE_REGION:-ap-south-1}
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   frontend:
     build:
       context: ./frontend
@@ -83,6 +144,7 @@ services:
     environment:
       PORT: 3000
       HOSTNAME: 0.0.0.0
+      BOARD_PACK_API_URL: http://backend:4000
       NEXT_PUBLIC_SENTRY_DSN: ${NEXT_PUBLIC_SENTRY_DSN:-}
     depends_on:
       backend:
@@ -90,3 +152,4 @@ services:
 
 volumes:
   pgdata: {}
+  clamavdata: {}

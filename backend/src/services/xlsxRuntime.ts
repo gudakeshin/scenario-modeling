@@ -8,6 +8,12 @@
 
 import { HyperFormula, DetailedCellError } from "hyperformula";
 import { config } from "../config.js";
+import { LruCache } from "../utils/lruCache.js";
+import {
+  xlsxRuntimeCacheAccess,
+  xlsxRuntimeCacheEntries,
+  xlsxRuntimeProcessHeapBytes,
+} from "../metrics.js";
 import type { WorkbookGraph } from "./excelExtractor.js";
 import type { EvaluableModel, ModelInput, PeriodSlice } from "./expression.js";
 import {
@@ -57,6 +63,7 @@ export interface XlsxModelSchemaLike {
 
 export type RuntimeFailureReason =
   | "missing_snapshot"
+  | "model_too_large"
   | "hyperformula_build"
   | "no_lever_bindings"
   | "no_output_bindings"
@@ -72,7 +79,42 @@ export interface RuntimeBuildResult {
   boundOutputs: string[];
   unboundLevers: string[];
   unboundOutputs: string[];
+  /** Per-lever directional probe + label-anchor check. */
+  bindingEvidence?: Record<string, LeverBindingEvidence>;
 }
+
+export interface LeverBindingEvidence {
+  sheet: string;
+  cell: string;
+  rowLabel: string;
+  base: number;
+  unit?: string;
+  affectedOutputs: Array<{ id: string; label: string; direction: "up" | "down" | "flat"; delta: number }>;
+  labelMatchScore: number;
+  needsReview: boolean;
+  reviewReason?: string;
+}
+
+/** Token Jaccard similarity for lever label vs extractor row label. */
+export function labelSimilarity(a: string, b: string): number {
+  const tok = (s: string) =>
+    new Set(
+      s
+        .toLowerCase()
+        .replace(/[^a-z0-9]+/g, " ")
+        .trim()
+        .split(/\s+/)
+        .filter((t) => t.length > 1),
+    );
+  const A = tok(a);
+  const B = tok(b);
+  if (A.size === 0 || B.size === 0) return 0;
+  let inter = 0;
+  for (const t of A) if (B.has(t)) inter++;
+  return inter / (A.size + B.size - inter);
+}
+
+const LABEL_MATCH_THRESHOLD = 0.25;
 
 function toId(label: string): string {
   return label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -96,6 +138,95 @@ function isCellError(v: unknown): v is DetailedCellError {
 
 function cellErrorMessage(v: DetailedCellError | { type?: string; message?: string }): string {
   return `${(v as DetailedCellError).type || "ERROR"}: ${(v as DetailedCellError).message || "cell error"}`;
+}
+
+/** Excel built-in defined names that HyperFormula rejects / are not useful. */
+const XLNM_BUILTIN = /^_xlnm\./i;
+
+export interface HfNamedExpression {
+  name: string;
+  expression: string;
+  /** Sheet name for sheet-scoped names; omitted = workbook scope. */
+  scope?: string;
+}
+
+/**
+ * Transform ExcelJS defined-name `refersTo` into HyperFormula namedExpressions.
+ * Skips multi-area refs, `_xlnm.*` builtins, and HF-rejected identifiers.
+ */
+export function toHyperFormulaNamedExpressions(
+  namedRanges: Array<{ name: string; refersTo: string }> | undefined,
+  sheetNames: string[],
+): { expressions: HfNamedExpression[]; warnings: string[] } {
+  const warnings: string[] = [];
+  const expressions: HfNamedExpression[] = [];
+  if (!namedRanges?.length) return { expressions, warnings };
+
+  const sheetSet = new Set(sheetNames.map((s) => s.toLowerCase()));
+
+  for (const nr of namedRanges) {
+    const rawName = (nr.name || "").trim();
+    if (!rawName) continue;
+    if (XLNM_BUILTIN.test(rawName)) {
+      warnings.push(`Skipped built-in named range '${rawName}'`);
+      continue;
+    }
+
+    let scope: string | undefined;
+    let name = rawName;
+    // Sheet-scoped names often appear as "Sheet1!LocalName"
+    const scopeMatch = rawName.match(/^(.+)!(.+)$/);
+    if (scopeMatch && sheetSet.has(scopeMatch[1].replace(/^'|'$/g, "").toLowerCase())) {
+      scope = scopeMatch[1].replace(/^'|'$/g, "");
+      name = scopeMatch[2];
+    }
+
+    // HyperFormula identifiers: letter/underscore start, alnum/underscore/.
+    if (!/^[A-Za-z_][A-Za-z0-9._]*$/.test(name)) {
+      warnings.push(`Skipped named range '${rawName}': identifier not accepted by HyperFormula`);
+      continue;
+    }
+
+    let refersTo = (nr.refersTo || "").trim();
+    if (!refersTo || refersTo.toUpperCase().includes("#REF")) {
+      warnings.push(`Skipped named range '${rawName}': empty or #REF! reference`);
+      continue;
+    }
+    // Multi-area (comma-separated ranges outside of function args) — skip
+    if (/,/.test(refersTo.replace(/"[^"]*"/g, ""))) {
+      warnings.push(`Skipped named range '${rawName}': multi-area references are not supported`);
+      continue;
+    }
+
+    if (!refersTo.startsWith("=")) refersTo = `=${refersTo}`;
+
+    expressions.push(scope ? { name, expression: refersTo, scope } : { name, expression: refersTo });
+  }
+
+  return { expressions, warnings };
+}
+
+const FY_HEADER_RE = /\bfy[-\s]?\d{2,4}\b/i;
+const MONTH_HEADER_RE = /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*[-\s']?\d{0,4}\b/i;
+const QUARTER_HEADER_RE = /\bq[1-4](?:[-\s]?fy?\s?\d{0,4})?\b/i;
+
+/**
+ * Re-derive year_comparison for stale persisted graphs that lack `kind`.
+ * FY-only axes (no month/quarter headers) are year comparisons, not forecast periods.
+ */
+function resolveTimeAxisKind(
+  timeAxis: NonNullable<WorkbookGraph["timeAxis"]>,
+): { kind: "periods" | "year_comparison"; primaryColumn?: string } {
+  if (timeAxis.kind === "year_comparison" || timeAxis.kind === "periods") {
+    return { kind: timeAxis.kind, primaryColumn: timeAxis.primaryColumn };
+  }
+  const cols = timeAxis.columns || [];
+  const hasMonthOrQuarter = cols.some((h) => MONTH_HEADER_RE.test(h) || QUARTER_HEADER_RE.test(h));
+  const fyCols = cols.filter((h) => FY_HEADER_RE.test(h));
+  if (!hasMonthOrQuarter && fyCols.length >= 1) {
+    return { kind: "year_comparison", primaryColumn: timeAxis.primaryColumn || fyCols[0] };
+  }
+  return { kind: "periods", primaryColumn: timeAxis.primaryColumn };
 }
 
 /**
@@ -128,6 +259,21 @@ function resolvePeriodColumns(
         headerToCol.set(text, c);
       }
     }
+  }
+
+  const { kind, primaryColumn } = resolveTimeAxisKind(timeAxis);
+
+  // Year-comparison (FY25 vs FY24): only the primary/current column is a period.
+  // ≤1 column ⇒ supportsPeriods false ⇒ no cross-year aggregation.
+  if (kind === "year_comparison") {
+    const primary = primaryColumn || timeAxis.columns[0];
+    const col = headerToCol.get(primary);
+    if (col != null) return [{ period: primary, col }];
+    for (const period of timeAxis.columns) {
+      const c = headerToCol.get(period);
+      if (c != null) return [{ period, col: c }];
+    }
+    return [];
   }
 
   const periods: PeriodColumn[] = [];
@@ -193,6 +339,25 @@ export class XlsxModelRuntime implements EvaluableModel {
 
     let working = graph;
     if (sparseSnapshot) {
+      const estimatedCells = Object.values(sparseSnapshot.sheets).reduce(
+        (sum, sheet) => sum + sheet.rows * sheet.cols,
+        0,
+      );
+      if (estimatedCells > config.XLSX_RUNTIME_MAX_CELLS) {
+        return {
+          runtime: null,
+          ok: false,
+          reason: "model_too_large",
+          errors: [
+            `Model grid is too large for the interactive engine (${estimatedCells.toLocaleString("en-IN")} estimated cells; limit ${config.XLSX_RUNTIME_MAX_CELLS.toLocaleString("en-IN")}).`,
+          ],
+          warnings,
+          boundLevers: [],
+          boundOutputs: [],
+          unboundLevers: (schema.scenarioLevers || []).map((lever) => toId(lever.id)),
+          unboundOutputs: (schema.outputMetrics || []).map((metric) => toId(metric.id)),
+        };
+      }
       working = graphWithSnapshot(graph, sparseSnapshot);
     } else if (!graph.cellSnapshot || Object.keys(graph.cellSnapshot).length === 0) {
       return {
@@ -211,6 +376,13 @@ export class XlsxModelRuntime implements EvaluableModel {
     }
 
     const snapshot = working.cellSnapshot!;
+    const sheetNames = Object.keys(snapshot);
+    const { expressions: namedExprs, warnings: namedWarnings } = toHyperFormulaNamedExpressions(
+      working.namedRanges,
+      sheetNames,
+    );
+    warnings.push(...namedWarnings);
+
     let hf: HyperFormula;
     try {
       hf = HyperFormula.buildFromSheets(snapshot as Record<string, (string | number | null)[][]>, {
@@ -232,9 +404,28 @@ export class XlsxModelRuntime implements EvaluableModel {
     }
 
     const sheetIdByName = new Map<string, number>();
-    for (const name of Object.keys(snapshot)) {
+    for (const name of sheetNames) {
       const id = hf.getSheetId(name);
       if (id != null) sheetIdByName.set(name, id);
+    }
+
+    for (const e of namedExprs) {
+      try {
+        if (e.scope) {
+          const sid = sheetIdByName.get(e.scope);
+          if (sid == null) {
+            warnings.push(`Skipped sheet-scoped name '${e.name}': sheet '${e.scope}' not found`);
+            continue;
+          }
+          hf.addNamedExpression(e.name, e.expression, sid);
+        } else {
+          hf.addNamedExpression(e.name, e.expression);
+        }
+      } catch (err) {
+        warnings.push(
+          `Skipped named range '${e.name}': HyperFormula rejected it (${(err as Error).message})`,
+        );
+      }
     }
 
     const candidateById = new Map(
@@ -262,10 +453,15 @@ export class XlsxModelRuntime implements EvaluableModel {
         errors.push(`Lever '${id}' cell ${sheet}!${cell} could not be resolved`);
         continue;
       }
+      // Prefer the live cell value so percent-override math stays unit-consistent
+      // even when persisted model_schema still carries ×10 canonicalized bases.
+      const cellVal = hf.getCellValue({ sheet: sheetId, row: pos.row, col: pos.col });
+      const baseFromCell =
+        typeof cellVal === "number" && Number.isFinite(cellVal) ? cellVal : null;
       levers.push({
         id,
         label: lever.label || lever.id,
-        base: Number(lever.scenarios?.base ?? cand?.value ?? 0),
+        base: baseFromCell ?? Number(lever.scenarios?.base ?? cand?.value ?? 0),
         sheetId,
         row: pos.row,
         col: pos.col,
@@ -278,7 +474,9 @@ export class XlsxModelRuntime implements EvaluableModel {
     const unboundOutputs: string[] = [];
     for (const metric of schema.outputMetrics || []) {
       const id = toId(metric.id);
-      const cand = outputCandidateById.get(id);
+      // Outputs that only appear as input candidates (e.g. revenue_cr on Assumptions)
+      // must still bind — otherwise base_pl drops them as zeros.
+      const cand = outputCandidateById.get(id) ?? candidateById.get(id);
       const sheet = metric.sheet || cand?.sheet;
       let cell = metric.cell || cand?.cell;
       // Fallback: sheet + row → first numeric candidate cell on that row
@@ -351,6 +549,20 @@ export class XlsxModelRuntime implements EvaluableModel {
     if (runtime.lastEvaluationErrors.length > 0) {
       warnings.push(...runtime.lastEvaluationErrors);
     }
+
+    const labelById = new Map<string, string>();
+    for (const c of graph.inputCandidates || []) {
+      labelById.set(toId(c.id || c.label || ""), c.label);
+    }
+    const bindingEvidence = runtime.probeBindings(labelById);
+    for (const [id, ev] of Object.entries(bindingEvidence)) {
+      if (ev.needsReview) {
+        warnings.push(
+          `Lever '${id}' needs review: ${ev.reviewReason || "binding evidence weak"} ` +
+            `(${ev.sheet}!${ev.cell}, label="${ev.rowLabel}")`,
+        );
+      }
+    }
     void baseline;
 
     return {
@@ -362,6 +574,7 @@ export class XlsxModelRuntime implements EvaluableModel {
       boundOutputs: outputs.map((o) => o.id),
       unboundLevers,
       unboundOutputs,
+      bindingEvidence,
     };
   }
 
@@ -377,6 +590,67 @@ export class XlsxModelRuntime implements EvaluableModel {
   /** Expose stored time axis for diagnostics / multi-period consumers. */
   get timeAxisRef(): WorkbookGraph["timeAxis"] | null {
     return this.timeAxis;
+  }
+
+  /**
+   * Directional probe: perturb each lever +1%, record which outputs move.
+   * Label-anchor: fuzzy-match lever label vs extractor row label.
+   */
+  probeBindings(rowLabelByLeverId?: Map<string, string>): Record<string, LeverBindingEvidence> {
+    const evidence: Record<string, LeverBindingEvidence> = {};
+    const baseOut = this.evaluate({});
+
+    for (const lever of this.levers.values()) {
+      const rowLabel = rowLabelByLeverId?.get(lever.id) || lever.label;
+      const probeVal = lever.base * 1.01;
+      const probed = this.evaluate({ [lever.id]: probeVal });
+      const affectedOutputs: LeverBindingEvidence["affectedOutputs"] = [];
+
+      for (const out of this.outputs) {
+        const b = baseOut[out.id];
+        const p = probed[out.id];
+        if (!Number.isFinite(b) || !Number.isFinite(p)) continue;
+        const delta = p - b;
+        const eps = Math.max(1e-9, Math.abs(b) * 1e-9);
+        const direction: "up" | "down" | "flat" =
+          Math.abs(delta) <= eps ? "flat" : delta > 0 ? "up" : "down";
+        if (direction !== "flat") {
+          affectedOutputs.push({ id: out.id, label: out.label, direction, delta });
+        }
+      }
+
+      const labelMatchScore = labelSimilarity(lever.label, rowLabel);
+      let needsReview = false;
+      let reviewReason: string | undefined;
+
+      if (affectedOutputs.length === 0) {
+        needsReview = true;
+        reviewReason = "perturbation moved no outputs";
+      } else if (
+        /cost|fuel|expense|opex|cogs/i.test(lever.label) &&
+        affectedOutputs.every((o) => /revenue|sales|top.?line/i.test(o.id + o.label)) &&
+        !affectedOutputs.some((o) => /cost|ebitda|margin|profit|income|cogs|opex/i.test(o.id + o.label))
+      ) {
+        needsReview = true;
+        reviewReason = "cost-like lever only moved revenue-like outputs";
+      } else if (labelMatchScore < LABEL_MATCH_THRESHOLD && lever.label !== rowLabel) {
+        needsReview = true;
+        reviewReason = `label mismatch (score ${labelMatchScore.toFixed(2)})`;
+      }
+
+      evidence[lever.id] = {
+        sheet: lever.sheet,
+        cell: lever.cell,
+        rowLabel,
+        base: lever.base,
+        affectedOutputs,
+        labelMatchScore,
+        needsReview,
+        ...(reviewReason ? { reviewReason } : {}),
+      };
+    }
+
+    return evidence;
   }
 
   evaluate(absoluteOverrides: Record<string, number>): Record<string, number> {
@@ -511,8 +785,16 @@ export class XlsxModelRuntime implements EvaluableModel {
   }
 }
 
-const CACHE_MAX = 10;
-const runtimeCache = new Map<string, XlsxModelRuntime | null>();
+const runtimeCache = new LruCache<string, XlsxModelRuntime | null>({
+  maxEntries: config.XLSX_RUNTIME_CACHE_MAX_ENTRIES,
+  ttlMs: config.XLSX_RUNTIME_CACHE_TTL_MS,
+});
+
+function cacheRuntime(key: string, runtime: XlsxModelRuntime | null): void {
+  runtimeCache.set(key, runtime);
+  xlsxRuntimeCacheEntries.set(runtimeCache.size);
+  xlsxRuntimeProcessHeapBytes.set(process.memoryUsage().heapUsed);
+}
 
 export function getXlsxRuntime(
   cacheKey: string,
@@ -520,13 +802,16 @@ export function getXlsxRuntime(
   schema: XlsxModelSchemaLike,
   sparseSnapshot?: SparseWorkbookSnapshot | null,
 ): XlsxModelRuntime | null {
-  if (runtimeCache.has(cacheKey)) return runtimeCache.get(cacheKey) ?? null;
-  const runtime = XlsxModelRuntime.fromWorkbook(graph, schema, sparseSnapshot);
-  if (runtimeCache.size >= CACHE_MAX) {
-    const oldest = runtimeCache.keys().next().value;
-    if (oldest !== undefined) runtimeCache.delete(oldest);
+  const cached = runtimeCache.get(cacheKey);
+  if (cached !== undefined) {
+    xlsxRuntimeCacheAccess.inc({ result: "hit" });
+    xlsxRuntimeCacheEntries.set(runtimeCache.size);
+    xlsxRuntimeProcessHeapBytes.set(process.memoryUsage().heapUsed);
+    return cached;
   }
-  runtimeCache.set(cacheKey, runtime);
+  xlsxRuntimeCacheAccess.inc({ result: "miss" });
+  const runtime = XlsxModelRuntime.fromWorkbook(graph, schema, sparseSnapshot);
+  cacheRuntime(cacheKey, runtime);
   return runtime;
 }
 
@@ -537,16 +822,14 @@ export function buildXlsxRuntime(
   sparseSnapshot?: SparseWorkbookSnapshot | null,
 ): RuntimeBuildResult {
   const result = XlsxModelRuntime.build(graph, schema, sparseSnapshot);
-  if (runtimeCache.size >= CACHE_MAX) {
-    const oldest = runtimeCache.keys().next().value;
-    if (oldest !== undefined) runtimeCache.delete(oldest);
-  }
-  runtimeCache.set(cacheKey, result.runtime);
+  cacheRuntime(cacheKey, result.runtime);
   return result;
 }
 
 export function clearXlsxRuntimeCache(): void {
   runtimeCache.clear();
+  xlsxRuntimeCacheEntries.set(0);
+  xlsxRuntimeProcessHeapBytes.set(process.memoryUsage().heapUsed);
 }
 
 /** Helper for tests / reprocess densifying stored sparse snapshots. */

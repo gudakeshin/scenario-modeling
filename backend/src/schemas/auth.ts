@@ -73,9 +73,14 @@ export const updateParameterSchema = z
     scenario_value: z.coerce.number().finite().optional(),
     status: z.enum(["pending", "accepted", "rejected", "modified"]).optional(),
     override_reason: z.string().max(1000).optional(),
+    owner_user_id: z.string().uuid().nullable().optional(),
+    source_citation: z.string().max(2000).nullable().optional(),
+    rationale: z.string().max(4000).nullable().optional(),
+    effective_from: z.string().date().nullable().optional(),
+    review_status: z.enum(["draft", "reviewed", "approved", "rejected"]).optional(),
   })
-  .refine((b) => b.scenario_value !== undefined || b.status !== undefined, {
-    message: "Provide scenario_value and/or status",
+  .refine((b) => Object.values(b).some((value) => value !== undefined), {
+    message: "Provide at least one parameter field",
   });
 
 export const lockLeverSchema = z.object({

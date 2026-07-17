@@ -48,12 +48,12 @@ const E2E_FORMULA = {
   time_horizon: { start: "2024-01", end: "2024-12", granularity: "monthly" as const },
 };
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
+function round6(n: number): number {
+  return Math.round(n * 1e6) / 1e6;
 }
 
 function roundMap(m: Record<string, number>): Record<string, number> {
-  return Object.fromEntries(Object.entries(m).map(([k, v]) => [k, round2(v)]));
+  return Object.fromEntries(Object.entries(m).map(([k, v]) => [k, round6(v)]));
 }
 
 test("golden base-case P&L matches CompiledModel evaluation", () => {
@@ -68,6 +68,6 @@ test("golden base-case P&L matches CompiledModel evaluation", () => {
     assert.strictEqual(scen[k], v, `scenario ${k}`);
   }
   for (const [k, v] of Object.entries(golden.deltas_revenue_plus_8pct)) {
-    assert.strictEqual(round2(scen[k]! - base[k]!), v, `delta ${k}`);
+    assert.strictEqual(round6(scen[k]! - base[k]!), v, `delta ${k}`);
   }
 });

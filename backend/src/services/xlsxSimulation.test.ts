@@ -328,6 +328,7 @@ test("xlsx: quarterly evaluatePeriods matches Excel cached Q1–Q4 results", asy
     (graph.timeAxis!.columns || []).some((c) => /Q1/i.test(c)),
     `expected Q1 in time axis, got ${graph.timeAxis!.columns.join(",")}`,
   );
+  assert.notStrictEqual(graph.timeAxis!.kind, "year_comparison", "quarterly must stay multi-period");
 
   const build = XlsxModelRuntime.build(graph, QUARTERLY_SCHEMA);
   assert.ok(build.ok && build.runtime, build.errors.join("; "));
@@ -350,6 +351,99 @@ test("xlsx: quarterly evaluatePeriods matches Excel cached Q1–Q4 results", asy
   const up = build.runtime!.evaluatePeriods({ revenue_base: 2000 });
   assert.ok(Math.abs(up[0].values.revenue - 2000) < 1e-6);
   assert.ok(Math.abs(up[3].values.revenue - 2300) < 1e-6);
+});
+
+test("xlsx: lever base self-heals from cell when schema scenarios.base is ×10 stale", async () => {
+  const buffer = await buildFixtureWorkbook();
+  const graph = await extractWorkbookGraph(buffer);
+  // Deliberately stale ×10 base (canonicalization bug residue) — cell is still 1000
+  const schema = {
+    scenarioLevers: [
+      { id: "revenue_base", label: "Revenue Base", sheet: "Assumptions", cell: "B1", scenarios: { base: 10_000 } },
+      { id: "cost_ratio", label: "Cost Ratio", sheet: "Assumptions", cell: "B2", scenarios: { base: 0.6 } },
+    ],
+    outputMetrics: [
+      { id: "revenue", label: "Revenue", sheet: "P&L Summary", cell: "B1", row: 1 },
+      { id: "gross_profit", label: "Gross Profit", sheet: "P&L Summary", cell: "B3", row: 3 },
+    ],
+  };
+  const build = XlsxModelRuntime.build(graph, schema);
+  assert.ok(build.ok && build.runtime, build.errors.join("; "));
+  const revInput = build.runtime!.inputs.find((i) => i.id === "revenue_base");
+  assert.ok(revInput, "revenue_base input");
+  assert.strictEqual(revInput!.base, 1000, "lever base must equal live cell, not stale ×10 schema base");
+});
+
+test("xlsx: output binding falls back to input candidates", async () => {
+  const wb = new ExcelJS.Workbook();
+  const assumptions = wb.addWorksheet("Assumptions");
+  assumptions.getCell("A1").value = "Revenue (₹ Cr)";
+  assumptions.getCell("B1").value = 7252;
+  assumptions.getCell("A2").value = "Volume";
+  assumptions.getCell("B2").value = 14;
+  const pnl = wb.addWorksheet("P&L");
+  pnl.getCell("A1").value = "EBITDA";
+  pnl.getCell("B1").value = 2741;
+  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+  const graph = await extractWorkbookGraph(buffer);
+
+  // revenue_cr exists only as input candidate; request it as an output metric
+  const schema = {
+    scenarioLevers: [
+      { id: "volume", label: "Volume", sheet: "Assumptions", cell: "B2", scenarios: { base: 14 } },
+    ],
+    outputMetrics: [
+      { id: "ebitda", label: "EBITDA", sheet: "P&L", cell: "B1", row: 1 },
+      { id: "revenue_cr", label: "Revenue", sheet: "", row: 0 },
+    ],
+  };
+  // Ensure input candidate id matches
+  const revCand = (graph.inputCandidates || []).find((c) => /revenue/i.test(c.id) || /revenue/i.test(c.label));
+  assert.ok(revCand, "revenue input candidate");
+  schema.outputMetrics[1].id = revCand!.id;
+
+  const build = XlsxModelRuntime.build(graph, schema);
+  assert.ok(build.ok && build.runtime, build.errors.join("; "));
+  assert.ok(build.boundOutputs.includes(revCand!.id), `boundOutputs should include ${revCand!.id}`);
+  const base = build.runtime!.evaluate({});
+  assert.ok(
+    Number.isFinite(base[revCand!.id]) && Math.abs(base[revCand!.id] - 7252) < 0.5,
+    `${revCand!.id} should bind from input candidate, got ${base[revCand!.id]}`,
+  );
+});
+
+test("xlsx: year-comparison FY25/FY24 yields a single period slice", async () => {
+  const wb = new ExcelJS.Workbook();
+  const assumptions = wb.addWorksheet("Assumptions");
+  assumptions.getCell("A1").value = "Volume";
+  assumptions.getCell("B1").value = 14;
+  const pnl = wb.addWorksheet("P&L");
+  pnl.getCell("A1").value = "Line";
+  pnl.getCell("B1").value = "FY25 (₹ Cr)";
+  pnl.getCell("C1").value = "FY24 (₹ Cr)";
+  pnl.getCell("A2").value = "Revenue";
+  pnl.getCell("B2").value = { formula: "Assumptions!B1*518", result: 7252 };
+  pnl.getCell("C2").value = 7075;
+
+  const buffer = Buffer.from(await wb.xlsx.writeBuffer());
+  const graph = await extractWorkbookGraph(buffer);
+  assert.strictEqual(graph.timeAxis?.kind, "year_comparison");
+
+  const schema = {
+    scenarioLevers: [
+      { id: "volume", label: "Volume", sheet: "Assumptions", cell: "B1", scenarios: { base: 14 } },
+    ],
+    outputMetrics: [
+      { id: "revenue", label: "Revenue", sheet: "P&L", cell: "B2", row: 2 },
+    ],
+  };
+  const build = XlsxModelRuntime.build(graph, schema);
+  assert.ok(build.ok && build.runtime, build.errors.join("; "));
+  assert.ok(!build.runtime!.supportsPeriods, "year_comparison ⇒ supportsPeriods false");
+  const slices = build.runtime!.evaluatePeriods({});
+  assert.strictEqual(slices.length, 1, `expected 1 slice, got ${slices.map((s) => s.period).join(",")}`);
+  assert.ok(/fy25/i.test(slices[0].period));
+  assert.ok(Math.abs(slices[0].values.revenue - 7252) < 0.5);
 });
 
 test("xlsx: multi-period aggregate is ratio-aware (margin not summed)", async () => {

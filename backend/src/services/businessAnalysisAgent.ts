@@ -234,6 +234,7 @@ async function loadAnalysisContext(
 
   // Use single-period P&L for analysis (avoids comparing 8-quarter aggregate against 1-quarter base)
   const periods = rawPl.periods ?? [];
+  const basePeriods = Array.isArray(rawPl.base_periods) ? rawPl.base_periods : [];
   const pl: Record<string, number> = periods.length > 0
     ? periods[0].pl
     : (rawPl.aggregate ?? rawPl);
@@ -259,7 +260,21 @@ async function loadAnalysisContext(
   const { getModelDefinition: getModel } = await import("../models/registry.js");
   const { resolveBasePl } = await import("./basePl.js");
   const model = await getModel(modelHash);
-  const base_pl = await resolveBasePl(rawPl, model, scenarioId);
+  // When analysis uses periods[0].pl as scenario, prefer matching base_periods[0].pl
+  // so base and scenario share the same period granularity (multi-period models).
+  let base_pl: Record<string, number>;
+  const basePeriod0 = basePeriods[0]?.pl;
+  if (periods.length > 0 && basePeriod0 && typeof basePeriod0 === "object") {
+    base_pl = {};
+    for (const [k, v] of Object.entries(basePeriod0 as Record<string, unknown>)) {
+      if (typeof v === "number" && Number.isFinite(v)) base_pl[k] = Math.round(v * 100) / 100;
+    }
+    if (Object.keys(base_pl).length === 0) {
+      base_pl = await resolveBasePl(rawPl, model, scenarioId);
+    }
+  } else {
+    base_pl = await resolveBasePl(rawPl, model, scenarioId);
+  }
 
   const currency_symbol = await getCurrencyFromContext(scenarioId);
   const company = await getCompanyContextForScenario(scenarioId);

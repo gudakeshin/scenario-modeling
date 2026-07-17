@@ -296,6 +296,23 @@ export interface StoredParameter {
   member_catalog?: MemberCatalog;
   confidence_score: number;
   status: string;
+  needs_review?: boolean;
+  binding_evidence?: {
+    sheet: string;
+    cell: string;
+    rowLabel: string;
+    base: number;
+    unit?: string;
+    affectedOutputs: Array<{ id: string; label: string; direction: string; delta: number }>;
+    labelMatchScore: number;
+    needsReview: boolean;
+    reviewReason?: string;
+  } | null;
+  owner_user_id?: string | null;
+  source_citation?: string | null;
+  rationale?: string | null;
+  effective_from?: string | null;
+  review_status?: "draft" | "reviewed" | "approved" | "rejected";
 }
 
 export interface ScenarioRef {
@@ -436,7 +453,15 @@ export async function getScenarioOutputs(
 export async function updateParameter(
   scenarioId: string,
   paramId: string,
-  updates: { scenario_value?: number; status?: string }
+  updates: {
+    scenario_value?: number;
+    status?: string;
+    owner_user_id?: string | null;
+    source_citation?: string | null;
+    rationale?: string | null;
+    effective_from?: string | null;
+    review_status?: "draft" | "reviewed" | "approved" | "rejected";
+  }
 ): Promise<StoredParameter> {
   const res = await apiFetch(`${API_BASE}/api/v1/scenarios/${scenarioId}/parameters/${paramId}`, {
     method: "PUT",
@@ -802,9 +827,11 @@ export async function logout(): Promise<void> {
   }
 }
 
-/** @deprecated use isAuthenticated — kept for ChatWindow boot */
+/** Bootstrap auth for app shell — hydrate from cookie before redirecting. */
 export async function initUserContext(): Promise<void> {
-  if (!getAccessToken()) redirectToLogin();
+  if (getAccessToken()) return;
+  const ok = await hydrateSessionFromCookie();
+  if (!ok) redirectToLogin();
 }
 
 function authHeaders(extra?: Record<string, string>): Record<string, string> {
@@ -824,6 +851,13 @@ export interface Workspace {
   is_default: boolean;
   document_count?: number;
   scenario_count?: number;
+  sensitivity?: "public" | "confidential" | "upsi";
+  nature_of_upsi?: string | null;
+  organization_id?: string | null;
+  trading_window_status?: "open" | "closed" | null;
+  trading_window_from?: string | null;
+  trading_window_until?: string | null;
+  trading_window_note?: string | null;
   created_at: string;
 }
 
@@ -947,12 +981,20 @@ export function getPptxExportUrl(scenarioId: string): string {
   return `${API_BASE}/api/v1/scenarios/${scenarioId}/export/pptx`;
 }
 
+export function getPdfExportUrl(scenarioId: string): string {
+  return `${API_BASE}/api/v1/scenarios/${scenarioId}/export/pdf`;
+}
+
 /**
  * Download a file via fetch (sends auth headers), then trigger browser download.
  * Works for Excel, CSV, and PPTX exports that require Bearer header.
  */
-export async function downloadWithAuth(url: string, filename: string): Promise<void> {
-  const res = await apiFetch(url, { headers: authHeaders() });
+export async function downloadWithAuth(
+  url: string,
+  filename: string,
+  method: "GET" | "POST" = "GET",
+): Promise<void> {
+  const res = await apiFetch(url, { method, headers: authHeaders() });
   if (!res.ok) {
     const err = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
     throw new Error((err as { error?: string }).error || `Download failed: ${res.status}`);
@@ -1001,6 +1043,10 @@ export interface FanChartBand {
 export interface MonteCarloResult {
   iterations: number;
   requested_iterations: number;
+  completed: number;
+  truncated: boolean;
+  degraded: boolean;
+  completion_ratio: number;
   seed: number;
   metrics: Record<string, PercentileResult>;
   distributions: Record<string, number[]>;
@@ -1527,6 +1573,8 @@ export interface DocumentRecord {
   file_size_bytes: number;
   chunk_count: number;
   status: string;
+  progress?: number;
+  processing_error?: string | null;
   created_at: string;
 }
 
@@ -1560,11 +1608,17 @@ export async function uploadDocument(file: File): Promise<DocumentRecord> {
   return res.json();
 }
 
-export async function listDocuments(): Promise<DocumentRecord[]> {
-  const res = await apiFetch(`${API_BASE}/api/v1/documents`);
+export async function listDocumentsPage(
+  limit = 50,
+  offset = 0,
+): Promise<{ documents: DocumentRecord[]; total: number; limit: number; offset: number }> {
+  const res = await apiFetch(`${API_BASE}/api/v1/documents?limit=${limit}&offset=${offset}`);
   if (!res.ok) throw new Error("Failed to list documents");
-  const data = await res.json();
-  return data.documents;
+  return res.json();
+}
+
+export async function listDocuments(limit = 50, offset = 0): Promise<DocumentRecord[]> {
+  return (await listDocumentsPage(limit, offset)).documents;
 }
 
 export async function queryDocument(

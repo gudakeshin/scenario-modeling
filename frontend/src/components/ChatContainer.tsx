@@ -12,6 +12,7 @@ import { useUiStore } from "@/stores/uiStore";
 import { useChatStore } from "@/stores/chatStore";
 import { strings } from "@/lib/strings";
 import { getAgentStatus, type AgentStatus } from "@/lib/api";
+import { TradingWindowBanner } from "./TradingWindowBanner";
 
 export function ChatContainer() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -140,6 +141,7 @@ export function ChatContainer() {
             <RoleSwitcher />
           </div>
         </div>
+        <TradingWindowBanner />
 
         <main id="main-content" className="flex flex-col flex-1 min-h-0 min-w-0 overflow-hidden">
           {/* Onboarding banner */}

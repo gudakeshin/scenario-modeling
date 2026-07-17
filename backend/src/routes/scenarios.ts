@@ -688,17 +688,53 @@ scenariosRouter.get("/:id/parameters", async (req, res) => {
     await assertCanReadScenario(req.user!.userId, req.user!.role, req.params.id);
     const r = await pool.query(
       `SELECT parameter_id, extracted_name, mapped_variable_id, base_value, scenario_value,
-              delta_type, member_scope, confidence_score, status
+              delta_type, member_scope, confidence_score, status, binding_evidence, needs_review,
+              owner_user_id, source_citation, rationale, effective_from, review_status
        FROM scenario_parameters WHERE scenario_id = $1 ORDER BY created_at`,
       [req.params.id]
     );
     // node-pg returns NUMERIC as string; coerce so clients always get numbers.
-    const parameters = r.rows.map((row) => ({
+    let parameters = r.rows.map((row) => ({
       ...row,
       base_value: row.base_value == null ? null : Number(row.base_value),
       scenario_value: row.scenario_value == null ? null : Number(row.scenario_value),
       confidence_score: row.confidence_score == null ? null : Number(row.confidence_score),
+      needs_review: Boolean(row.needs_review),
     }));
+
+    // Enrich missing binding evidence from the live XLSX runtime when available.
+    const missing = parameters.filter((p) => !p.binding_evidence);
+    if (missing.length > 0) {
+      try {
+        const { getEvaluableModelForScenario } = await import("../services/modelResolver.js");
+        const resolved = await getEvaluableModelForScenario(req.params.id);
+        const runtime = resolved.model as {
+          probeBindings?: (labels?: Map<string, string>) => Record<string, unknown>;
+        };
+        if (typeof runtime.probeBindings === "function") {
+          const evidence = runtime.probeBindings();
+          parameters = parameters.map((p) => {
+            const ev = evidence[p.mapped_variable_id] as Record<string, unknown> | undefined;
+            if (!ev || p.binding_evidence) return p;
+            void pool.query(
+              `UPDATE scenario_parameters
+               SET binding_evidence = $1, needs_review = $2
+               WHERE parameter_id = $3`,
+              [JSON.stringify(ev), Boolean(ev.needsReview), p.parameter_id],
+            );
+            return {
+              ...p,
+              binding_evidence: ev,
+              needs_review: Boolean(ev.needsReview) || p.needs_review,
+              status: ev.needsReview && p.status === "pending" ? "needs_review" : p.status,
+            };
+          });
+        }
+      } catch {
+        // Model may be formula_dag / unavailable — leave evidence empty.
+      }
+    }
+
     return res.json({ parameters });
   } catch (e) {
     const status = authzError(e);
@@ -821,7 +857,16 @@ scenariosRouter.put("/:id/parameters/:paramId", requireRole("analyst"), validate
   try {
     const userId = req.user!.userId;
     await assertCanWriteScenario(userId, req.user!.role, req.params.id);
-    const { scenario_value, status, override_reason } = req.body;
+    const {
+      scenario_value,
+      status,
+      override_reason,
+      owner_user_id,
+      source_citation,
+      rationale,
+      effective_from,
+      review_status,
+    } = req.body;
 
     // Record override history if value is changing
     if (scenario_value !== undefined) {
@@ -854,9 +899,25 @@ scenariosRouter.put("/:id/parameters/:paramId", requireRole("analyst"), validate
       updates.push(`status = $${i++}`);
       values.push(status);
     }
+    for (const [column, value] of [
+      ["owner_user_id", owner_user_id],
+      ["source_citation", source_citation],
+      ["rationale", rationale],
+      ["effective_from", effective_from],
+      ["review_status", review_status],
+    ] as const) {
+      if (value !== undefined) {
+        updates.push(`${column} = $${i++}`);
+        values.push(value);
+      }
+    }
     values.push(req.params.id, req.params.paramId);
     const r = await pool.query(
-      `UPDATE scenario_parameters SET ${updates.join(", ")} WHERE scenario_id = $${i++} AND parameter_id = $${i} RETURNING parameter_id, extracted_name, mapped_variable_id, scenario_value, status, is_override, override_reason`,
+      `UPDATE scenario_parameters SET ${updates.join(", ")}
+       WHERE scenario_id = $${i++} AND parameter_id = $${i}
+       RETURNING parameter_id, extracted_name, mapped_variable_id, scenario_value,
+                 status, is_override, override_reason, owner_user_id, source_citation,
+                 rationale, effective_from, review_status`,
       values
     );
     if (r.rows.length === 0) return res.status(404).json({ error: "Parameter not found" });
@@ -869,7 +930,17 @@ scenariosRouter.put("/:id/parameters/:paramId", requireRole("analyst"), validate
         source: "manual_override",
       }]);
     }
-    await logAudit(req.params.id, "parameter_updated", { parameter_id: req.params.paramId, new_value: scenario_value, status }, userId);
+    await logAudit(req.params.id, "parameter_updated", {
+      parameter_id: req.params.paramId,
+      new_value: scenario_value,
+      status,
+      review_status,
+      assumptions_metadata_updated:
+        owner_user_id !== undefined ||
+        source_citation !== undefined ||
+        rationale !== undefined ||
+        effective_from !== undefined,
+    }, userId);
     return res.json(r.rows[0]);
   } catch (e) {
     const status = authzError(e);
@@ -907,6 +978,34 @@ scenariosRouter.post("/:id/approve", requireRole("approver"), async (req, res) =
     try {
       await client.query("BEGIN");
 
+      const scenarioRow = await client.query(
+        "SELECT creator_id, status FROM scenarios WHERE scenario_id = $1 FOR UPDATE",
+        [sid],
+      );
+      if (scenarioRow.rows.length === 0) {
+        await client.query("ROLLBACK");
+        return res.status(404).json({ error: "Scenario not found" });
+      }
+
+      if (
+        config.ENFORCE_MAKER_CHECKER &&
+        scenarioRow.rows[0].creator_id === userId
+      ) {
+        await logAudit(
+          sid,
+          "self_approval_blocked",
+          { attempted_by: userId },
+          userId,
+          undefined,
+          undefined,
+          client,
+        );
+        await client.query("COMMIT");
+        return res.status(403).json({
+          error: "Maker-checker: the scenario creator cannot approve it",
+        });
+      }
+
       const params = await client.query(
         "SELECT status FROM scenario_parameters WHERE scenario_id = $1",
         [sid],
@@ -930,11 +1029,7 @@ scenariosRouter.post("/:id/approve", requireRole("approver"), async (req, res) =
       );
 
       if (updated.rows.length === 0) {
-        const current = await client.query(
-          "SELECT status FROM scenarios WHERE scenario_id = $1",
-          [sid],
-        );
-        if (current.rows[0]?.status === "approved") {
+        if (scenarioRow.rows[0]?.status === "approved") {
           await client.query("COMMIT");
           return res.json({ scenario_id: sid, status: "approved", idempotent: true });
         }
@@ -1032,8 +1127,10 @@ scenariosRouter.post("/:id/run", requireRole("analyst"), async (req, res) => {
         ...(output.notices?.length ? { notices: output.notices } : {}),
         ...(output.formula_error_metrics?.length ? { formula_error_metrics: output.formula_error_metrics } : {}),
       };
-      await persistClient.query(
-        `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
+      const runInsert = await persistClient.query<{ output_id: string }>(
+        `INSERT INTO scenario_outputs (scenario_id, output_type, output_data)
+         VALUES ($1, 'pl', $2)
+         RETURNING output_id`,
         [sid, JSON.stringify(outputData)],
       );
       await persistClient.query(
@@ -1041,13 +1138,25 @@ scenariosRouter.post("/:id/run", requireRole("analyst"), async (req, res) => {
         [sid],
       );
       const { createScenarioVersion } = await import("../services/scenarioVersionService.js");
-      await createScenarioVersion(
+      const version = await createScenarioVersion(
         sid,
         {
           label: `run_${new Date().toISOString()}`,
           outputs: output.pl,
           userId,
           workspaceId: scopeOf(req).workspaceId,
+        },
+        persistClient,
+      );
+      const { createRunManifest } = await import("../services/runManifestService.js");
+      const manifest = await createRunManifest(
+        {
+          runId: runInsert.rows[0].output_id,
+          scenarioId: sid,
+          scenarioVersionId: version.version_id,
+          workspaceId: scopeOf(req).workspaceId,
+          createdBy: userId,
+          resolvedVariables: output.variables,
         },
         persistClient,
       );
@@ -1061,6 +1170,12 @@ scenariosRouter.post("/:id/run", requireRole("analyst"), async (req, res) => {
         persistClient,
       );
       await persistClient.query("COMMIT");
+      return res.json({
+        scenario_id: sid,
+        run_id: runInsert.rows[0].output_id,
+        manifest_hash: manifest.row_hash,
+        ...output,
+      });
     } catch (verErr) {
       await persistClient.query("ROLLBACK");
       logger.warn({ detail: (verErr as Error).message }, "[Versions] persist failed");
@@ -1069,7 +1184,7 @@ scenariosRouter.post("/:id/run", requireRole("analyst"), async (req, res) => {
       persistClient.release();
     }
 
-    return res.json({ scenario_id: sid, ...output });
+    throw new Error("Simulation persistence completed without response");
   } catch (e) {
     if (priorStatus === "approved" || priorStatus === "completed") {
       await pool

@@ -1,0 +1,2 @@
+# Nightly at 02:15 UTC. Output is collected by the container runtime.
+15 2 * * * /usr/local/bin/backup-postgres

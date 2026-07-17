@@ -45,6 +45,21 @@ const envSchema = z.object({
     .string()
     .optional()
     .transform((v) => (v && v.trim() ? v.trim() : undefined)),
+  INGESTION_ASYNC_ENABLED: z
+    .enum(["true", "false", "1", "0"])
+    .optional()
+    .transform((v) => (v == null ? undefined : v === "true" || v === "1")),
+  INGESTION_JOB_TIMEOUT_MS: z.coerce.number().int().positive().default(300_000),
+  DOCUMENT_UPLOAD_MAX_MB: z.coerce.number().int().positive().default(50),
+  XLSX_RUNTIME_MAX_CELLS: z.coerce.number().int().positive().default(5_000_000),
+  XLSX_RUNTIME_CACHE_MAX_ENTRIES: z.coerce.number().int().positive().default(10),
+  XLSX_RUNTIME_CACHE_TTL_MS: z.coerce.number().int().positive().default(1_800_000),
+  CLAMAV_HOST: z.string().optional(),
+  CLAMAV_PORT: z.coerce.number().int().positive().default(3310),
+  CLAMAV_REQUIRED: z
+    .enum(["true", "false", "1", "0"])
+    .optional()
+    .transform((v) => v === "true" || v === "1"),
   /** S3-compatible object storage for workbook bytes (optional). */
   OBJECT_STORAGE_ENDPOINT: z.string().url().optional(),
   OBJECT_STORAGE_BUCKET: z.string().optional(),
@@ -99,6 +114,8 @@ const envSchema = z.object({
   FIDELITY_READY_THRESHOLD: z.coerce.number().min(0).max(1).default(0.95),
   MC_DEFAULT_PERCENT_SPREAD_PP: z.coerce.number().positive().default(5),
   MC_DEFAULT_RELATIVE_STDDEV: z.coerce.number().positive().default(0.1),
+  /** Synchronous Monte Carlo wall-clock budget before honest truncation. */
+  MC_TIME_BUDGET_MS: z.coerce.number().int().positive().default(30_000),
   AGENT_MAX_STEPS: z.coerce.number().int().positive().default(8),
   AGENT_TIMEOUT_MS: z.coerce.number().int().positive().default(120_000),
   GOAL_SEEK_MAX_ITERATIONS: z.coerce.number().int().positive().default(40),
@@ -118,6 +135,17 @@ const envSchema = z.object({
    * - enterprise: showcase + Redis/OIDC/object-store oriented defaults
    */
   DEPLOYMENT_PROFILE: z.enum(["standard", "showcase", "enterprise"]).default("standard"),
+  /**
+   * When true, scenario creator cannot approve their own scenario (maker-checker).
+   * Hard-required under DEPLOYMENT_PROFILE=enterprise (see loadConfig).
+   */
+  ENFORCE_MAKER_CHECKER: z
+    .string()
+    .optional()
+    .transform((v) => {
+      if (v == null || v === "") return true;
+      return v === "1" || v.toLowerCase() === "true";
+    }),
   /** HyperFormula license key — gpl-v3 allowed in dev/test only. */
   HYPERFORMULA_LICENSE_KEY: z.string().min(1).default("gpl-v3"),
   /** Bearer token required to scrape /metrics in production. */
@@ -193,6 +221,22 @@ function loadConfig(): AppConfig {
     console.error(
       "SENTRY_DSN is required when DEPLOYMENT_PROFILE=enterprise (Sentry is the alerting " +
         "path for this deployment — see docs/runbooks/incident.md)",
+    );
+    process.exit(1);
+  }
+  if (env.DEPLOYMENT_PROFILE === "enterprise" && env.ENFORCE_MAKER_CHECKER === false) {
+    console.error(
+      "ENFORCE_MAKER_CHECKER cannot be disabled when DEPLOYMENT_PROFILE=enterprise",
+    );
+    process.exit(1);
+  }
+  if (
+    env.DEPLOYMENT_PROFILE === "enterprise" &&
+    (!env.CREDENTIALS_ENCRYPTION_KEY ||
+      !/^[0-9a-fA-F]{64}$/.test(env.CREDENTIALS_ENCRYPTION_KEY))
+  ) {
+    console.error(
+      "CREDENTIALS_ENCRYPTION_KEY (64 hex characters) is required for enterprise document encryption",
     );
     process.exit(1);
   }

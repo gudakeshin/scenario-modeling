@@ -1,8 +1,9 @@
-import { createHash, randomUUID } from "node:crypto";
+import { randomUUID } from "node:crypto";
 import type { PoolClient } from "pg";
 import { pool } from "../db/index.js";
 import type { Role } from "../auth/provider.js";
 import { getRequestContext } from "../requestContext.js";
+import { computeChainHash, stableStringify } from "../utils/hashChain.js";
 
 export interface AuditEntry {
   audit_id: string;
@@ -33,18 +34,6 @@ export interface AuditChainVerifyResult {
   reason?: string;
 }
 
-function stableStringify(value: unknown): string {
-  if (value === null || typeof value !== "object") {
-    return JSON.stringify(value);
-  }
-  if (Array.isArray(value)) {
-    return `[${value.map(stableStringify).join(",")}]`;
-  }
-  const obj = value as Record<string, unknown>;
-  const keys = Object.keys(obj).sort();
-  return `{${keys.map((k) => `${JSON.stringify(k)}:${stableStringify(obj[k])}`).join(",")}}`;
-}
-
 /** Canonical payload hashed into the chain (order-stable, no whitespace variance). */
 export function canonicalAuditPayload(fields: {
   audit_id: string;
@@ -73,7 +62,7 @@ export function canonicalAuditPayload(fields: {
 }
 
 export function computeRowHash(prevHash: string, canonicalPayload: string): string {
-  return createHash("sha256").update(`${prevHash}${canonicalPayload}`, "utf8").digest("hex");
+  return computeChainHash(prevHash, canonicalPayload);
 }
 
 export async function logAudit(

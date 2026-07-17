@@ -22,11 +22,19 @@ const rawAgent = request(app);
 // request this suite makes, so the 70+ existing call sites don't need to
 // change individually.
 let authToken = "";
+let approverToken = "";
 let e2eWorkspaceId = "";
 let e2eUserId = "";
 
-function withAuth<T extends { set: (field: string, val: string) => T }>(req: T): T {
-  let next = authToken ? req.set("Authorization", `Bearer ${authToken}`) : req;
+function withAuth<T extends { set: (field: string, val: string) => T }>(
+  req: T,
+  route?: unknown,
+): T {
+  const token =
+    typeof route === "string" && route.endsWith("/approve") && approverToken
+      ? approverToken
+      : authToken;
+  let next = token ? req.set("Authorization", `Bearer ${token}`) : req;
   if (e2eWorkspaceId) next = next.set("X-Workspace-Id", e2eWorkspaceId);
   return next;
 }
@@ -35,7 +43,10 @@ const agent = new Proxy(rawAgent, {
   get(target, prop, receiver) {
     if (prop === "get" || prop === "post" || prop === "put" || prop === "delete" || prop === "patch") {
       return (...args: unknown[]) =>
-        withAuth((target as unknown as Record<string, (...a: unknown[]) => { set: (f: string, v: string) => unknown }>)[prop as string](...args) as never);
+        withAuth(
+          (target as unknown as Record<string, (...a: unknown[]) => { set: (f: string, v: string) => unknown }>)[prop as string](...args) as never,
+          args[0],
+        );
     }
     return Reflect.get(target, prop, receiver);
   },
@@ -65,6 +76,29 @@ before(async () => {
   }
   authToken = res.body.access_token;
   e2eUserId = res.body.user.user_id;
+
+  const approverEmail = `e2e-approver-${Date.now().toString(36)}@test.local`;
+  const approverPassword = "e2e-approver-password";
+  const createdApprover = await rawAgent
+    .post("/api/v1/auth/register")
+    .set("Authorization", `Bearer ${authToken}`)
+    .send({
+      email: approverEmail,
+      password: approverPassword,
+      name: "E2E Independent Approver",
+      role: "admin",
+    });
+  if (createdApprover.status !== 201) {
+    throw new Error(`e2e setup: failed to create independent approver: ${JSON.stringify(createdApprover.body)}`);
+  }
+  const approverLogin = await rawAgent.post("/api/v1/auth/login").send({
+    email: approverEmail,
+    password: approverPassword,
+  });
+  if (approverLogin.status !== 200) {
+    throw new Error(`e2e setup: independent approver login failed: ${JSON.stringify(approverLogin.body)}`);
+  }
+  approverToken = approverLogin.body.access_token;
 
   // Isolate from default-workspace XLSX / external models so formula-DAG e2e stays deterministic.
   const ws = await rawAgent
@@ -1035,8 +1069,10 @@ test("E2E: XLSX upload stores structural metadata", async () => {
     .expect(201);
 
   const docs = await agent.get("/api/v1/documents").expect(200);
-  const xlsxDoc = docs.body.documents.find((d: { original_filename: string }) => d.original_filename === "structural_model.xlsx");
-  assert.ok(xlsxDoc, "uploaded XLSX should exist");
+  const xlsxListItem = docs.body.documents.find((d: { original_filename: string }) => d.original_filename === "structural_model.xlsx");
+  assert.ok(xlsxListItem, "uploaded XLSX should exist");
+  const detail = await agent.get(`/api/v1/documents/${xlsxListItem.document_id}`).expect(200);
+  const xlsxDoc = detail.body;
   assert.strictEqual(xlsxDoc.document_kind, "spreadsheet_model");
   assert.ok(xlsxDoc.workbook_graph, "XLSX should persist workbook_graph");
   assert.ok(xlsxDoc.workbook_snapshot, "XLSX should persist sparse workbook_snapshot");
@@ -1053,8 +1089,10 @@ test("E2E: CSV upload is tabular_data without formulas", async () => {
     .expect(201);
 
   const docs = await agent.get("/api/v1/documents").expect(200);
-  const csvDoc = docs.body.documents.find((d: { original_filename: string }) => d.original_filename === "pnl_lacs.csv");
-  assert.ok(csvDoc, "uploaded CSV should exist");
+  const csvListItem = docs.body.documents.find((d: { original_filename: string }) => d.original_filename === "pnl_lacs.csv");
+  assert.ok(csvListItem, "uploaded CSV should exist");
+  const detail = await agent.get(`/api/v1/documents/${csvListItem.document_id}`).expect(200);
+  const csvDoc = detail.body;
   assert.strictEqual(csvDoc.document_kind, "tabular_data");
   assert.ok(csvDoc.tabular_artifact, "CSV should persist tabular_artifact");
   assert.strictEqual(csvDoc.tabular_artifact.dataOnly, true);

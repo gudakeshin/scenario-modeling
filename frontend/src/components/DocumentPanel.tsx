@@ -42,24 +42,29 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
 
-  // Load documents on mount
-  useEffect(() => {
-    loadDocuments();
-  }, []);
-
   // Scroll to bottom on new messages
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages]);
 
-  const loadDocuments = async () => {
+  const loadDocuments = useCallback(async () => {
     try {
       const docs = await listDocuments();
       setDocuments(docs);
     } catch {
       // Silently fail if API not ready
     }
-  };
+  }, []);
+
+  // Load documents on mount and poll while queued/processing.
+  useEffect(() => {
+    void loadDocuments();
+  }, [loadDocuments]);
+  useEffect(() => {
+    if (!documents.some((doc) => doc.status === "queued" || doc.status === "processing")) return;
+    const timer = window.setInterval(() => void loadDocuments(), 2_000);
+    return () => window.clearInterval(timer);
+  }, [documents, loadDocuments]);
 
   const handleUpload = async (files: FileList | File[]) => {
     const list = Array.from(files);
@@ -94,7 +99,9 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
           role: "assistant",
           content:
             okCount === 1
-              ? `Document **"${lastDoc.name}"** uploaded and processed successfully! It has been split into ${lastDoc.chunk_count} searchable chunks (keyword search by default; hybrid vector search when embeddings are configured). You can now ask questions about it.`
+              ? lastDoc.status === "queued"
+                ? `Document **"${lastDoc.name}"** was queued for ingestion. Progress will update automatically.`
+                : `Document **"${lastDoc.name}"** uploaded and processed successfully! It has been split into ${lastDoc.chunk_count} searchable chunks (keyword search by default; hybrid vector search when embeddings are configured). You can now ask questions about it.`
               : `Uploaded **${okCount}** documents successfully. You can now ask questions about them.`,
           timestamp: new Date(),
         },
@@ -123,7 +130,6 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
     if (e.dataTransfer.files.length > 0) {
       void handleUpload(e.dataTransfer.files);
     }
-  // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   const handleDelete = async (docId: string) => {
@@ -217,7 +223,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
           ref={fileInputRef}
           type="file"
           multiple
-          accept=".pdf,.txt,.md,.csv,.docx,.xlsx"
+          accept=".pdf,.txt,.md,.csv,.docx,.xlsx,.xlsm"
           onChange={handleFileSelect}
           className="hidden"
         />
@@ -237,7 +243,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
             <p className="text-sm text-[var(--text-secondary)]">
               Drop files here or <span className="text-accent font-medium">browse</span>
             </p>
-            <p className="text-xs text-[var(--text-faint)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX — max 20MB each · multiple files supported</p>
+            <p className="text-xs text-[var(--text-faint)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX, XLSM — max 50MB each · multiple files supported</p>
           </div>
         )}
       </div>

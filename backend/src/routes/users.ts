@@ -6,6 +6,7 @@ import { shareSchema, updateRoleSchema } from "../schemas/auth.js";
 import { logAudit } from "../services/auditService.js";
 import { assertCanWriteScenario } from "../services/authzService.js";
 import { logger } from "../logger.js";
+import { z } from "zod";
 
 export const usersRouter = Router();
 
@@ -23,7 +24,7 @@ usersRouter.get("/roles", (_req, res) => {
 usersRouter.get("/", requireRole("admin"), async (_req, res) => {
   try {
     const result = await pool.query(
-      "SELECT user_id, email, name, role, department, created_at, is_active FROM users ORDER BY created_at DESC"
+      "SELECT user_id, email, name, role, department, created_at, is_active, is_designated_person FROM users ORDER BY created_at DESC"
     );
     return res.json(result.rows);
   } catch (e) {
@@ -36,7 +37,7 @@ usersRouter.get("/me", async (req, res) => {
   try {
     const u = req.user!;
     const r = await pool.query(
-      "SELECT user_id, email, name, role, department, created_at FROM users WHERE user_id = $1",
+      "SELECT user_id, email, name, role, department, created_at, is_designated_person FROM users WHERE user_id = $1",
       [u.userId]
     );
     if (r.rows.length === 0) return res.status(404).json({ error: "User not found" });
@@ -71,6 +72,26 @@ usersRouter.put(
       return res.status(500).json({ error: "Failed to update role" });
     }
   }
+);
+
+usersRouter.patch(
+  "/:id/designated-person",
+  requireRole("admin"),
+  validateBody(z.object({ is_designated_person: z.boolean() })),
+  async (req, res) => {
+    try {
+      const result = await pool.query(
+        `UPDATE users SET is_designated_person = $2 WHERE user_id = $1
+         RETURNING user_id, email, name, role, is_designated_person`,
+        [req.params.id, req.body.is_designated_person],
+      );
+      if (!result.rows[0]) return res.status(404).json({ error: "User not found" });
+      return res.json(result.rows[0]);
+    } catch (e) {
+      logger.error({ err: e }, "Failed to update designated-person status");
+      return res.status(500).json({ error: "Failed to update designated-person status" });
+    }
+  },
 );
 
 usersRouter.post("/share", requireRole("analyst"), validateBody(shareSchema), async (req, res) => {

@@ -2,7 +2,13 @@
 
 import { useState } from "react";
 import { toast } from "sonner";
-import { getExcelExportUrl, getCsvExportUrl, getPptxExportUrl, downloadWithAuth } from "@/lib/api";
+import {
+  getExcelExportUrl,
+  getCsvExportUrl,
+  getPptxExportUrl,
+  getPdfExportUrl,
+  downloadWithAuth,
+} from "@/lib/api";
 
 interface ExportControlsProps {
   scenarioId: string;
@@ -11,13 +17,22 @@ interface ExportControlsProps {
 export function ExportControls({ scenarioId }: ExportControlsProps) {
   const [downloading, setDownloading] = useState<string | null>(null);
 
-  const handleExport = async (format: "excel" | "csv" | "pptx") => {
+  const handleExport = async (format: "excel" | "csv" | "pptx" | "pdf") => {
     setDownloading(format);
     try {
-      const urlMap = { excel: getExcelExportUrl, csv: getCsvExportUrl, pptx: getPptxExportUrl };
-      const extMap = { excel: "xlsx", csv: "csv", pptx: "pptx" };
+      const urlMap = {
+        excel: getExcelExportUrl,
+        csv: getCsvExportUrl,
+        pptx: getPptxExportUrl,
+        pdf: getPdfExportUrl,
+      };
+      const extMap = { excel: "xlsx", csv: "csv", pptx: "pptx", pdf: "pdf" };
       const url = urlMap[format](scenarioId);
-      await downloadWithAuth(url, `scenario_${scenarioId.slice(0, 8)}.${extMap[format]}`);
+      await downloadWithAuth(
+        url,
+        `scenario_${scenarioId.slice(0, 8)}.${extMap[format]}`,
+        format === "pdf" ? "POST" : "GET",
+      );
     } catch (e) {
       toast.error("Export failed", { description: (e as Error).message });
     }
@@ -47,6 +62,12 @@ export function ExportControls({ scenarioId }: ExportControlsProps) {
           <path strokeLinecap="round" strokeLinejoin="round" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
         </svg>
         {downloading === "pptx" ? "..." : "PPTX"}
+      </button>
+      <button type="button" onClick={() => handleExport("pdf")} disabled={!!downloading} className={btnClass}>
+        <svg xmlns="http://www.w3.org/2000/svg" className="h-3.5 w-3.5" fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+          <path strokeLinecap="round" strokeLinejoin="round" d="M7 21h10a2 2 0 002-2V9.414a1 1 0 00-.293-.707l-5.414-5.414A1 1 0 0012.586 3H7a2 2 0 00-2 2v14a2 2 0 002 2z" />
+        </svg>
+        {downloading === "pdf" ? "..." : "PDF"}
       </button>
     </div>
   );

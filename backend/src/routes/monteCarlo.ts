@@ -62,6 +62,7 @@ analysisRouter.post("/:id/monte-carlo", requireRole("analyst"), validateBody(mon
 
     const result = await runMonteCarlo({
       scenario_id: scenarioId,
+      created_by: req.user!.userId,
       iterations,
       distributions,
       correlations,

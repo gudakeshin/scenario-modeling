@@ -4,7 +4,9 @@
 
 import { Router } from "express";
 import multer from "multer";
-import { processDocument, listDocuments, getDocument, deleteDocument, appendDocumentConversationMessage, listDocumentConversationMessages, getDocumentSignedUrl, getDocumentOriginalBytes } from "../services/documentService.js";
+import { tmpdir } from "node:os";
+import { readFile, unlink } from "node:fs/promises";
+import { processDocument, createQueuedDocument, listDocuments, getDocument, deleteDocument, appendDocumentConversationMessage, listDocumentConversationMessages, getDocumentSignedUrl, getDocumentOriginalBytes } from "../services/documentService.js";
 import { queryDocument } from "../services/ragService.js";
 import { isLlamaParseConfigured, testLlamaParseConnection } from "../services/llamaParseService.js";
 import { requireRole } from "../middleware/rbac.js";
@@ -12,6 +14,12 @@ import { assertCanReadDocument } from "../services/authzService.js";
 import { scopeOf } from "../middleware/workspace.js";
 import { logger } from "../logger.js";
 import { isEmbeddingEnabled } from "../services/embeddingService.js";
+import { config } from "../config.js";
+import {
+  enqueueDocumentIngestion,
+  isAsyncIngestionEnabled,
+} from "../queue/ingestionQueue.js";
+import { scanBuffer } from "../services/virusScanService.js";
 
 export const documentsRouter = Router();
 
@@ -19,24 +27,33 @@ function authzError(e: unknown) {
   return (e as { status?: number }).status;
 }
 
-// Multer config: store in memory, max 20MB
+// Disk-backed upload avoids retaining the entire request body in the API heap.
 const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 20 * 1024 * 1024 }, // 20 MB
+  storage: multer.diskStorage({
+    destination: (_req, _file, cb) => cb(null, tmpdir()),
+    filename: (_req, file, cb) =>
+      cb(null, `scenario-model-${Date.now()}-${Math.random().toString(36).slice(2)}-${file.originalname.replace(/[^a-zA-Z0-9._-]/g, "_")}`),
+  }),
+  limits: { fileSize: config.DOCUMENT_UPLOAD_MAX_MB * 1024 * 1024 },
   fileFilter: (_req, file, cb) => {
+    if (/\.(xls|xlsb)$/i.test(file.originalname)) {
+      cb(new Error("Legacy .xls/.xlsb is not supported. Please save as .xlsx and re-upload."));
+      return;
+    }
     const allowed = [
       "application/pdf",
       "text/plain",
       "text/markdown",
       "text/csv",
       "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+      "application/vnd.ms-excel.sheet.macroEnabled.12",
       "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
     ];
-    const extAllowed = /\.(pdf|txt|md|csv|docx|xlsx)$/i;
+    const extAllowed = /\.(pdf|txt|md|csv|docx|xlsx|xlsm)$/i;
     if (allowed.includes(file.mimetype) || extAllowed.test(file.originalname)) {
       cb(null, true);
     } else {
-      cb(new Error(`Unsupported file type: ${file.mimetype}. Allowed: PDF, TXT, MD, CSV, XLSX`));
+      cb(new Error(`Unsupported file type: ${file.mimetype}. Allowed: PDF, TXT, MD, CSV, DOCX, XLSX, XLSM`));
     }
   },
 });
@@ -57,29 +74,67 @@ documentsRouter.post("/upload", requireRole("analyst"), (req, res, next) => {
     }
 
     const scope = scopeOf(req);
+    const file = req.file;
+    const buffer = await readFile(file.path);
+    const fileType = file.mimetype || file.originalname.split(".").pop() || "unknown";
+
+    // Scan before any Postgres/S3 persistence so infected bytes never land.
+    const scan = await scanBuffer(buffer);
+    if (scan.status === "infected") {
+      return res.status(422).json({
+        error: "Upload rejected because malware was detected",
+        signature: scan.signature,
+      });
+    }
+
+    if (isAsyncIngestionEnabled()) {
+      const doc = await createQueuedDocument(
+        buffer,
+        file.originalname,
+        fileType,
+        scope.userId,
+        scope.workspaceId,
+      );
+      await enqueueDocumentIngestion(doc.document_id);
+      return res.status(202).json({
+        ...doc,
+        context_hint: "Document queued for ingestion. Progress updates automatically.",
+      });
+    }
 
     const doc = await processDocument(
-      req.file.buffer,
-      req.file.originalname,
-      req.file.mimetype || req.file.originalname.split(".").pop() || "unknown",
+      buffer,
+      file.originalname,
+      fileType,
       scope.userId,
-      scope.workspaceId
+      scope.workspaceId,
     );
-
-    return res.status(201).json({ ...doc, context_hint: "Document uploaded. Click 'Build Context' to analyze all documents and create/update your company model." });
+    return res.status(201).json({
+      ...doc,
+      context_hint: "Document uploaded. Click 'Build Context' to analyze all documents and create/update your company model.",
+    });
   } catch (e) {
     logger.error({ err: e }, "Document upload failed:");
     const msg = (e as Error).message;
     if (msg.includes("Unsupported file type")) return res.status(400).json({ error: msg });
     return res.status(500).json({ error: "Document processing failed: " + msg });
+  } finally {
+    if (req.file?.path) await unlink(req.file.path).catch(() => undefined);
   }
 });
 
 // ── List documents ──
 documentsRouter.get("/", async (req, res) => {
   try {
-    const docs = await listDocuments(req.user!.userId, req.user!.role, req.workspace!.workspaceId);
-    return res.json({ documents: docs });
+    const limit = Number(req.query.limit ?? 50);
+    const offset = Number(req.query.offset ?? 0);
+    const result = await listDocuments(
+      req.user!.userId,
+      req.user!.role,
+      req.workspace!.workspaceId,
+      { limit, offset },
+    );
+    return res.json(result);
   } catch (e) {
     logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to list documents" });
@@ -122,7 +177,7 @@ documentsRouter.get("/:id/signed-url", async (req, res) => {
     const url = await getDocumentSignedUrl(req.params.id);
     if (!url) {
       return res.status(404).json({
-        error: "Signed URL unavailable — original is stored in Postgres or object storage is unset",
+        error: "Signed URL unavailable — use /original for encrypted or Postgres-backed documents",
         code: "NO_OBJECT_STORAGE",
       });
     }

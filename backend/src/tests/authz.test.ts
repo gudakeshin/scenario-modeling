@@ -241,6 +241,33 @@ test("run endpoint returns 409 when simulation already in progress", async () =>
   assert.match(String(res.body?.error || ""), /already in progress/i);
 });
 
+test("maker-checker: creator cannot self-approve", async () => {
+  const admin = await loginSeedAdmin();
+  const email = `approver-self-${suffix}@test.local`;
+  const pass = "approver-pass-123";
+  const creator = await adminCreateUser(admin.access_token, email, pass, "approver", "Self Approver");
+  const session = await login(email, pass);
+
+  const scenario = await pool.query(
+    `INSERT INTO scenarios (nl_input, name, status, creator_id, model_version_hash)
+     VALUES ('self approve test', 'self-approve', 'pending_approval', $1, 'v0')
+     RETURNING scenario_id`,
+    [creator.user_id],
+  );
+  const scenarioId = scenario.rows[0].scenario_id as string;
+  await pool.query(
+    `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, confidence_score, status)
+     VALUES ($1, 'Revenue', 'revenue', 1.1, 0.9, 'accepted')`,
+    [scenarioId],
+  );
+
+  const res = await agent
+    .post(`/api/v1/scenarios/${scenarioId}/approve`)
+    .set("Authorization", `Bearer ${session.access_token}`)
+    .expect(403);
+  assert.match(String(res.body?.error || ""), /maker-checker/i);
+});
+
 test("cleanup pool", async () => {
   await pool.end();
 });

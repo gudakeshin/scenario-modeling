@@ -16,6 +16,7 @@ const agent = request(app);
 const suffix = Date.now().toString(36);
 let token = "";
 let userId = "";
+let makerUserId = "";
 let workspaceId = "";
 let connectionId = "";
 let snapshotId = "";
@@ -36,6 +37,13 @@ before(async () => {
   token = login.body.access_token;
   const user = await pool.query("SELECT user_id FROM users WHERE email = $1", ["dev@example.com"]);
   userId = user.rows[0].user_id;
+  const maker = await pool.query(
+    `INSERT INTO users (email, name, role)
+     VALUES ($1, 'Dimensional Pipeline Maker', 'analyst')
+     RETURNING user_id`,
+    [`dimensional-maker-${suffix}@test.local`],
+  );
+  makerUserId = maker.rows[0].user_id;
   const workspace = await authed(agent.post("/api/v1/workspaces")).send({
     name: `dimensional-pipeline-${suffix}`,
   });
@@ -95,7 +103,7 @@ test("mock import activates dimensional model and scoped scenario runs", async (
     [
       `EMEA revenue uplift ${suffix}`,
       "Increase EMEA revenue by 10%",
-      userId,
+      makerUserId,
       workspaceId,
       modelId,
     ],

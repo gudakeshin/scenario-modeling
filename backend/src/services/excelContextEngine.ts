@@ -170,6 +170,15 @@ function normalizeModelSchema(schema: ModelSchema, docName: string, graph: Workb
   for (const c of graph.outputCandidates || []) {
     fallbackBaseValues[toId(c.id || c.label || "metric")] = safeNumber(c.value, 0);
   }
+  // Metrics that only exist as input candidates (revenue_cr, sales_volume_mt, …)
+  // must still seed baseValues so the catalog path has no zeros.
+  for (const c of graph.inputCandidates || []) {
+    const id = toId(c.id || c.label || "input");
+    const v = safeNumber(c.value, 0);
+    if (Math.abs(fallbackBaseValues[id] ?? 0) === 0 && Math.abs(v) > 0) {
+      fallbackBaseValues[id] = v;
+    }
+  }
   const parsedBaseValues = schema.baseValues || {};
   const normalizedBaseValues: Record<string, number> = { ...fallbackBaseValues };
   for (const [k, v] of Object.entries(parsedBaseValues)) {
@@ -178,6 +187,8 @@ function normalizeModelSchema(schema: ModelSchema, docName: string, graph: Workb
       normalizedBaseValues[k] = parsed;
     } else if (outputCandidates.has(k)) {
       normalizedBaseValues[k] = safeNumber(outputCandidates.get(k)?.value, 0);
+    } else if (inputCandidates.has(k)) {
+      normalizedBaseValues[k] = safeNumber(inputCandidates.get(k)?.value, 0);
     } else {
       normalizedBaseValues[k] = parsed;
     }
@@ -259,6 +270,16 @@ function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelS
       schema.outputMetrics.push(metric);
       outputById.set(cid, metric);
     }
+    const existingVal = safeNumber(schema.baseValues[cid], 0);
+    if (Math.abs(existingVal) === 0 && Math.abs(cVal) > 0) {
+      schema.baseValues[cid] = cVal;
+    }
+  }
+
+  // Fill missing/zero baseValues from input candidates (catalog + previously-zero ids).
+  for (const c of graph.inputCandidates || []) {
+    const cid = toId(c.id || c.label || "input");
+    const cVal = safeNumber(c.value, 0);
     const existingVal = safeNumber(schema.baseValues[cid], 0);
     if (Math.abs(existingVal) === 0 && Math.abs(cVal) > 0) {
       schema.baseValues[cid] = cVal;
@@ -361,9 +382,11 @@ Repair requirements:
   return normalizeModelSchema(repaired, docName, graph);
 }
 
-function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema {
+/** Production catalog fallback when no LLM key / LLM fails — exported for acceptance tests. */
+export function buildFallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema {
   const timeCols = graph.timeAxis?.columns || [];
-  const periods = timeCols.length > 0 ? timeCols.length : 4;
+  const isYearComparison = graph.timeAxis?.kind === "year_comparison";
+  const periods = isYearComparison ? 1 : (timeCols.length > 0 ? timeCols.length : 4);
   const granularity = timeCols.some((c) => /q[1-4]/i.test(c)) ? "quarterly" : "monthly";
   const summarySheet = Object.entries(graph.sheets).find(([, s]) => s.role === "summary")?.[0] || Object.keys(graph.sheets)[0] || "Sheet1";
 
@@ -414,6 +437,13 @@ function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema
   for (const c of graph.outputCandidates || []) {
     baseValues[toId(c.id || c.label)] = safeNumber(c.value, 0);
   }
+  for (const c of graph.inputCandidates || []) {
+    const id = toId(c.id || c.label);
+    const v = safeNumber(c.value, 0);
+    if (Math.abs(baseValues[id] ?? 0) === 0 && Math.abs(v) > 0) {
+      baseValues[id] = v;
+    }
+  }
 
   return {
     company: docName,
@@ -426,6 +456,11 @@ function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema
     timeDimension: { granularity, periods, columns: timeCols },
     baseValues,
   };
+}
+
+/** @deprecated Use buildFallbackModelSchema */
+function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema {
+  return buildFallbackModelSchema(graph, docName);
 }
 
 function toModelDefinition(schema: ModelSchema): ModelDefinition {
@@ -488,7 +523,7 @@ Rules:
 - scenarioLevers must use ids in snake_case and include sheet + cell when known from inputCandidates.
 - outputMetrics should include sheet, row, and cell from outputCandidates when available.
 - Use numeric defaults for base/bull/bear.
-- Preserve document denomination (Crore/Lakh/Million) — do not convert values.
+- baseValues and scenarios.base MUST equal the workbook cell values exactly (document-native denomination). Do not rescale Crore→Million or otherwise convert units — denomination is metadata for display only.
 - Keep arrays concise and deterministic.`;
 
   const parsed = await callClaudeStructured({

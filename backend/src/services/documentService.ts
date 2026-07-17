@@ -31,6 +31,7 @@ import {
   shouldUseLlamaParse,
 } from "./llamaParseService.js";
 import { logger } from "../logger.js";
+import { encryptDocumentBytes } from "./documentCrypto.js";
 
 const CSV_TYPES = new Set(["text/csv", "csv", "application/csv"]);
 
@@ -124,7 +125,16 @@ const DOCUMENT_COLUMNS =
   "document_id, name, original_filename, file_type, document_kind, validation_status, " +
   "file_size_bytes, chunk_count, status, model_schema, workbook_graph, workbook_snapshot, " +
   "tabular_artifact, ingestion_report, artifact_version, qdrant_collection, " +
-  "storage_key, storage_backend, " +
+  "storage_key, storage_backend, encryption_version, progress, processing_error, queued_at, " +
+  "processing_started_at, processing_completed_at, " +
+  "created_by, workspace_id, created_at, updated_at";
+
+/** List projection omits large workbook/tabular JSON blobs. */
+const DOCUMENT_LIST_COLUMNS =
+  "document_id, name, original_filename, file_type, document_kind, validation_status, " +
+  "file_size_bytes, chunk_count, status, ingestion_report, artifact_version, " +
+  "storage_key, storage_backend, encryption_version, progress, processing_error, queued_at, " +
+  "processing_started_at, processing_completed_at, " +
   "created_by, workspace_id, created_at, updated_at";
 
 export interface DocumentRecord {
@@ -146,19 +156,112 @@ export interface DocumentRecord {
   model_schema?: Record<string, unknown> | null;
   storage_key?: string | null;
   storage_backend?: string | null;
+  encryption_version?: string | null;
   workspace_id?: string;
+  progress?: number;
+  processing_error?: string | null;
+  queued_at?: string | null;
+  processing_started_at?: string | null;
+  processing_completed_at?: string | null;
 }
 
 function isXlsxFile(fileType: string, filename: string): boolean {
   return (
     fileType === "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" ||
+    fileType === "application/vnd.ms-excel.sheet.macroEnabled.12" ||
     fileType === "xlsx" ||
-    /\.xlsx$/i.test(filename)
+    fileType === "xlsm" ||
+    /\.xls[mx]$/i.test(filename)
   );
 }
 
 function isCsvFile(fileType: string, filename: string): boolean {
   return CSV_TYPES.has(fileType) || /\.csv$/i.test(filename);
+}
+
+export async function createQueuedDocument(
+  buffer: Buffer,
+  originalFilename: string,
+  fileType: string,
+  userId: string,
+  workspaceId: string,
+): Promise<DocumentRecord> {
+  const docId = randomUUID();
+  const docName = originalFilename.replace(/\.[^.]+$/, "");
+  const normalizedFileType = (fileType || "unknown").slice(0, 255);
+  const xlsx = isXlsxFile(fileType, originalFilename);
+  const csv = isCsvFile(fileType, originalFilename);
+  const documentKind = xlsx ? "spreadsheet_model" : csv ? "tabular_data" : "document_text";
+  const encrypted = encryptDocumentBytes(docId, buffer);
+  await pool.query(
+    `INSERT INTO documents (
+       document_id, name, original_filename, file_type, file_size_bytes, status,
+       created_by, workspace_id, document_kind, validation_status, file_bytes,
+       artifact_version, progress, queued_at, encryption_version
+     ) VALUES ($1,$2,$3,$4,$5,'queued',$6,$7,$8,'processing',$9,$10,0,NOW(),$11)`,
+    [
+      docId,
+      docName,
+      originalFilename,
+      normalizedFileType,
+      buffer.length,
+      userId,
+      workspaceId,
+      documentKind,
+      encrypted.bytes,
+      ARTIFACT_VERSION,
+      encrypted.version,
+    ],
+  );
+
+  try {
+    const { storeWorkbookBytes } = await import("./objectStorage.js");
+    const stored = await storeWorkbookBytes(
+      workspaceId,
+      docId,
+      encrypted.bytes,
+      "application/octet-stream",
+    );
+    if (stored) {
+      await pool.query(
+        `UPDATE documents SET storage_key = $2, storage_backend = $3 WHERE document_id = $1`,
+        [docId, stored.storage_key, stored.storage_backend],
+      );
+    }
+  } catch (error) {
+    logger.warn({ err: error }, "[Documents] Queued object-storage write skipped");
+  }
+
+  const row = await pool.query(
+    `SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE document_id = $1`,
+    [docId],
+  );
+  return row.rows[0];
+}
+
+export async function processQueuedDocument(
+  documentId: string,
+  onProgress?: (progress: number, stage: string) => Promise<void> | void,
+): Promise<DocumentRecord> {
+  const row = await pool.query(
+    `SELECT document_id, original_filename, file_type, created_by, workspace_id,
+            storage_key, file_bytes, encryption_version
+     FROM documents WHERE document_id = $1`,
+    [documentId],
+  );
+  if (row.rows.length === 0) throw new Error("Queued document not found");
+  const doc = row.rows[0];
+  const { loadDocumentBytes } = await import("./objectStorage.js");
+  const bytes = await loadDocumentBytes(doc);
+  if (!bytes) throw new Error("Queued document original bytes not found");
+  return processDocument(
+    bytes,
+    doc.original_filename,
+    doc.file_type,
+    doc.created_by,
+    doc.workspace_id,
+    { documentId, onProgress },
+  );
 }
 
 /**
@@ -170,9 +273,13 @@ export async function processDocument(
   fileType: string,
   userId: string,
   workspaceId: string,
+  options: {
+    documentId?: string;
+    onProgress?: (progress: number, stage: string) => Promise<void> | void;
+  } = {},
 ): Promise<DocumentRecord> {
   const docName = originalFilename.replace(/\.[^.]+$/, "");
-  const docId = randomUUID();
+  const docId = options.documentId ?? randomUUID();
   const normalizedFileType = (fileType || "unknown").slice(0, 255);
   const xlsx = isXlsxFile(fileType, originalFilename);
   const csv = isCsvFile(fileType, originalFilename);
@@ -182,28 +289,51 @@ export async function processDocument(
     : csv
       ? "tabular_data"
       : "document_text";
+  const encrypted = options.documentId ? null : encryptDocumentBytes(docId, buffer);
 
-  await pool.query(
-    `INSERT INTO documents (
-       document_id, name, original_filename, file_type, file_size_bytes, status,
-       created_by, workspace_id, document_kind, validation_status, file_bytes, artifact_version
-     ) VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8, $9, $10, $11)`,
-    [
-      docId,
-      docName,
-      originalFilename,
-      normalizedFileType,
-      buffer.length,
-      userId,
-      workspaceId,
-      documentKind,
-      "processing",
-      buffer,
-      ARTIFACT_VERSION,
-    ],
-  );
+  if (options.documentId) {
+    await pool.query(
+      `UPDATE documents
+       SET status = 'processing', validation_status = 'processing',
+           progress = 5, processing_error = NULL, processing_started_at = NOW(),
+           updated_at = NOW()
+       WHERE document_id = $1`,
+      [docId],
+    );
+  } else {
+    await pool.query(
+      `INSERT INTO documents (
+         document_id, name, original_filename, file_type, file_size_bytes, status,
+         created_by, workspace_id, document_kind, validation_status, file_bytes,
+         artifact_version, progress, processing_started_at, encryption_version
+       ) VALUES ($1, $2, $3, $4, $5, 'processing', $6, $7, $8, $9, $10, $11, 5, NOW(), $12)`,
+      [
+        docId,
+        docName,
+        originalFilename,
+        normalizedFileType,
+        buffer.length,
+        userId,
+        workspaceId,
+        documentKind,
+        "processing",
+        encrypted!.bytes,
+        ARTIFACT_VERSION,
+        encrypted!.version,
+      ],
+    );
+  }
+
+  const reportProgress = async (progress: number, stage: string) => {
+    await pool.query(
+      `UPDATE documents SET progress = $2, updated_at = NOW() WHERE document_id = $1`,
+      [docId, progress],
+    );
+    await options.onProgress?.(progress, stage);
+  };
 
   try {
+    await reportProgress(10, "extracting");
     let workbookGraph: Record<string, unknown> | null = null;
     let workbookSnapshot: Record<string, unknown> | null = null;
     let tabularArtifact: TabularArtifact | null = null;
@@ -277,6 +407,8 @@ export async function processDocument(
       });
     }
 
+    await reportProgress(55, "chunking");
+
     if (!searchText.trim()) {
       await pool.query(
         `UPDATE documents
@@ -308,15 +440,23 @@ export async function processDocument(
       throw new Error("Document is empty after chunking");
     }
 
-    for (const chunk of chunks) {
+    for (let start = 0; start < chunks.length; start += 500) {
+      const batch = chunks.slice(start, start + 500);
+      const values: unknown[] = [];
+      const tuples = batch.map((chunk, index) => {
+        const offset = index * 3;
+        values.push(docId, chunk.index, chunk.text);
+        return `($${offset + 1}, $${offset + 2}, $${offset + 3})`;
+      });
       await pool.query(
         `INSERT INTO document_chunks (document_id, chunk_index, text)
-         VALUES ($1, $2, $3)
+         VALUES ${tuples.join(",")}
          ON CONFLICT (document_id, chunk_index) DO UPDATE SET text = EXCLUDED.text`,
-        [docId, chunk.index, chunk.text],
+        values,
       );
     }
 
+    await reportProgress(75, "embedding");
     // Optional embeddings for hybrid search
     try {
       const { isEmbeddingEnabled, embed } = await import("./embeddingService.js");
@@ -338,20 +478,28 @@ export async function processDocument(
       );
     }
 
-    // Optional object storage for original bytes (dual-write; BYTEA retained for fallback)
-    try {
-      const { storeWorkbookBytes } = await import("./objectStorage.js");
-      const stored = await storeWorkbookBytes(workspaceId, docId, buffer, normalizedFileType);
-      if (stored) {
-        await pool.query(
-          `UPDATE documents SET storage_key = $2, storage_backend = $3 WHERE document_id = $1`,
-          [docId, stored.storage_key, stored.storage_backend],
-        );
+    if (!options.documentId) {
+      // Optional object storage for original bytes (dual-write; BYTEA retained for fallback)
+      try {
+        const { storeWorkbookBytes } = await import("./objectStorage.js");
+          const stored = await storeWorkbookBytes(
+            workspaceId,
+            docId,
+            encrypted!.bytes,
+            "application/octet-stream",
+          );
+        if (stored) {
+          await pool.query(
+            `UPDATE documents SET storage_key = $2, storage_backend = $3 WHERE document_id = $1`,
+            [docId, stored.storage_key, stored.storage_backend],
+          );
+        }
+      } catch (e) {
+        logger.warn({ detail: (e as Error).message }, "[Documents] Object storage write skipped:");
       }
-    } catch (e) {
-      logger.warn({ detail: (e as Error).message }, "[Documents] Object storage write skipped:");
     }
 
+    await reportProgress(90, "finalizing");
     const validationStatus = documentKind === "spreadsheet_model" ? "needs_validation" : "ready";
 
     await pool.query(
@@ -366,6 +514,9 @@ export async function processDocument(
            artifact_version = $7,
            validation_status = $8,
            document_kind = $9,
+           progress = 100,
+           processing_error = NULL,
+           processing_completed_at = NOW(),
            updated_at = NOW()
        WHERE document_id = $10`,
       [
@@ -386,8 +537,11 @@ export async function processDocument(
     return r.rows[0];
   } catch (e) {
     await pool.query(
-      "UPDATE documents SET status = 'error', validation_status = 'error', updated_at = NOW() WHERE document_id = $1",
-      [docId],
+      `UPDATE documents
+       SET status = 'error', validation_status = 'error', progress = 100,
+           processing_error = $2, processing_completed_at = NOW(), updated_at = NOW()
+       WHERE document_id = $1`,
+      [docId, (e as Error).message],
     );
     throw e;
   }
@@ -598,14 +752,30 @@ export async function listDocuments(
   userId: string,
   role: Role,
   workspaceId: string,
-): Promise<DocumentRecord[]> {
+  opts: { limit?: number; offset?: number } = {},
+): Promise<{ documents: DocumentRecord[]; total: number; limit: number; offset: number }> {
   void userId;
   void role;
-  const r = await pool.query(
-    `SELECT ${DOCUMENT_COLUMNS} FROM documents WHERE workspace_id = $1 ORDER BY created_at DESC`,
+  const requestedLimit = Number.isFinite(opts.limit) ? Number(opts.limit) : 50;
+  const requestedOffset = Number.isFinite(opts.offset) ? Number(opts.offset) : 0;
+  const limit = Math.min(Math.max(Math.trunc(requestedLimit), 1), 200);
+  const offset = Math.max(Math.trunc(requestedOffset), 0);
+  const count = await pool.query(
+    `SELECT COUNT(*)::int AS total FROM documents WHERE workspace_id = $1`,
     [workspaceId],
   );
-  return r.rows;
+  const r = await pool.query(
+    `SELECT ${DOCUMENT_LIST_COLUMNS} FROM documents
+     WHERE workspace_id = $1 ORDER BY created_at DESC
+     LIMIT $2 OFFSET $3`,
+    [workspaceId, limit, offset],
+  );
+  return {
+    documents: r.rows,
+    total: Number(count.rows[0]?.total ?? 0),
+    limit,
+    offset,
+  };
 }
 
 export async function getDocument(documentId: string): Promise<DocumentRecord | null> {
@@ -622,7 +792,8 @@ export async function getDocumentOriginalBytes(
   documentId: string,
 ): Promise<{ bytes: Buffer; contentType: string; filename: string } | null> {
   const r = await pool.query(
-    `SELECT document_id, original_filename, file_type, storage_key, file_bytes
+    `SELECT document_id, original_filename, file_type, storage_key, file_bytes,
+            encryption_version
      FROM documents WHERE document_id = $1`,
     [documentId],
   );
@@ -644,9 +815,10 @@ export async function getDocumentSignedUrl(
   expiresInSec = 3600,
 ): Promise<string | null> {
   const r = await pool.query(
-    `SELECT storage_key FROM documents WHERE document_id = $1`,
+    `SELECT storage_key, encryption_version FROM documents WHERE document_id = $1`,
     [documentId],
   );
+  if (r.rows[0]?.encryption_version) return null;
   const key = r.rows[0]?.storage_key as string | undefined;
   if (!key) return null;
   const { getSignedUrl } = await import("./objectStorage.js");
@@ -654,5 +826,18 @@ export async function getDocumentSignedUrl(
 }
 
 export async function deleteDocument(documentId: string): Promise<void> {
+  const r = await pool.query(
+    `SELECT storage_key FROM documents WHERE document_id = $1`,
+    [documentId],
+  );
+  const storageKey = r.rows[0]?.storage_key as string | undefined;
   await pool.query("DELETE FROM documents WHERE document_id = $1", [documentId]);
+  if (storageKey) {
+    try {
+      const { deleteObject } = await import("./objectStorage.js");
+      await deleteObject(storageKey);
+    } catch (e) {
+      logger.warn({ detail: (e as Error).message, documentId }, "[Documents] Object storage delete skipped:");
+    }
+  }
 }

@@ -18,8 +18,8 @@ export interface AggregatePeriodPlResult {
   warnings: string[];
 }
 
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
+function isFiniteNumber(n: unknown): n is number {
+  return typeof n === "number" && Number.isFinite(n);
 }
 
 function varMeta(modelDef: ModelDefinition, id: string): ModelVariable | undefined {
@@ -148,7 +148,7 @@ export function aggregatePeriodPlDetailed(
       if (meta && meta.dependencies.length === 0) {
         const denom = inferRatioDenominator(modelDef, id);
         const { value, weighted } = weightedRatioAverage(periods, id, denom);
-        aggregate[id] = round2(value);
+        aggregate[id] = (value);
         if (!weighted && periods.length > 1) {
           warnings.push(
             `Ratio metric "${id}" aggregated with simple mean (no valid weight denominator)`,
@@ -156,12 +156,12 @@ export function aggregatePeriodPlDetailed(
         }
       } else {
         const v = recomputed[id];
-        if (v != null && Number.isFinite(v)) aggregate[id] = round2(v);
+        if (v != null && Number.isFinite(v)) aggregate[id] = (v);
       }
     } else {
       let total = 0;
       for (const p of periods) total += p.pl[id] || 0;
-      aggregate[id] = round2(total);
+      aggregate[id] = (total);
     }
   }
   return { aggregate, warnings };
@@ -193,7 +193,7 @@ export function aggregateXlsxPeriodPl(
     if (isRatioLike(mt) || (mt === "unknown" && isRatioLike(inferMetricTypeFromId(id)))) {
       const denom = hasRevenue ? "revenue" : undefined;
       const { value, weighted } = weightedRatioAverage(periods, id, denom);
-      aggregate[id] = round2(value);
+      aggregate[id] = (value);
       if (!weighted && periods.length > 1) {
         warnings.push(
           `Ratio metric "${id}" aggregated with simple mean (no valid weight denominator)`,
@@ -208,7 +208,7 @@ export function aggregateXlsxPeriodPl(
         total += v;
         n += 1;
       }
-      if (n > 0) aggregate[id] = round2(total);
+      if (n > 0) aggregate[id] = (total);
     }
   }
   return { aggregate, warnings };

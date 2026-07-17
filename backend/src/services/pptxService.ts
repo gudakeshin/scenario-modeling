@@ -6,6 +6,7 @@ type PptxTableCell = { text: string; options?: Record<string, unknown> };
 import { pool } from "../db/index.js";
 import { computeBaseCase, getModelDefinition, getPLMetrics } from "../models/registry.js";
 import { resolveBasePl } from "./basePl.js";
+import { fmtIndianCurrency } from "../utils/formatNumber.js";
 
 interface PeriodBreakdown {
   period: string;
@@ -43,8 +44,7 @@ function metricLabel(id: string): string {
 }
 
 function fmtNum(n: number, currency = "USD"): string {
-  const sym = currency === "INR" || currency === "Rs" ? "₹" : currency === "EUR" ? "€" : currency === "GBP" ? "£" : "$";
-  return sym + Math.abs(n).toLocaleString(undefined, { maximumFractionDigits: 0 });
+  return fmtIndianCurrency(n, currency === "Rs" ? "INR" : currency, { maximumFractionDigits: 0 });
 }
 
 function addSectionTitle(
@@ -151,7 +151,7 @@ export async function exportToPptx(scenarioId: string): Promise<Buffer> {
   const scenario = sRes.rows[0];
 
   const oRes = await pool.query(
-    "SELECT output_data, narrative_summary FROM scenario_outputs WHERE scenario_id = $1 AND output_type = 'pl' ORDER BY created_at DESC LIMIT 1",
+    "SELECT output_id, output_data, narrative_summary FROM scenario_outputs WHERE scenario_id = $1 AND output_type = 'pl' ORDER BY created_at DESC LIMIT 1",
     [scenarioId]
   );
   const rawOutput = oRes.rows[0]?.output_data ?? {};
@@ -160,10 +160,33 @@ export async function exportToPptx(scenarioId: string): Promise<Buffer> {
   const narrative = oRes.rows[0]?.narrative_summary ?? null;
 
   const pRes = await pool.query(
-    "SELECT extracted_name, scenario_value, status FROM scenario_parameters WHERE scenario_id = $1 ORDER BY created_at",
+    `SELECT sp.extracted_name, sp.mapped_variable_id, sp.scenario_value, sp.status,
+            sp.owner_user_id, u.name AS owner_name, sp.source_citation, sp.rationale,
+            sp.effective_from, sp.review_status, sp.confidence_score
+     FROM scenario_parameters sp
+     LEFT JOIN users u ON u.user_id = sp.owner_user_id
+     WHERE sp.scenario_id = $1 ORDER BY sp.created_at`,
     [scenarioId]
   );
   const params = pRes.rows;
+  const manifestRes = oRes.rows[0]?.output_id
+    ? await pool.query(
+        `SELECT manifest_id, row_hash, model_hash, scenario_version_id, created_at, engine, mc
+         FROM run_manifests WHERE run_id = $1`,
+        [oRes.rows[0].output_id],
+      )
+    : { rows: [] };
+  const manifest = manifestRes.rows[0] as
+    | {
+        manifest_id: string;
+        row_hash: string;
+        model_hash: string;
+        scenario_version_id: string;
+        created_at: string;
+        engine: Record<string, unknown>;
+        mc: Record<string, unknown> | null;
+      }
+    | undefined;
 
   const sModelRef = await pool.query("SELECT model_version_hash FROM scenarios WHERE scenario_id = $1", [scenarioId]);
   const modelHash = sModelRef.rows[0]?.model_version_hash;
@@ -395,6 +418,43 @@ export async function exportToPptx(scenarioId: string): Promise<Buffer> {
     });
   }
 
+  // ── Sign-off Assumptions Book ──
+  if (params.length > 0) {
+    const assumptionsSlide = pptx.addSlide();
+    addSectionTitle(assumptionsSlide, pptx, "Assumptions Book");
+    const rows: PptxTableRow[] = [[
+      { text: "Assumption", options: { bold: true, color: DELOITTE.white, fill: { color: DELOITTE.charcoal }, fontSize: 9 } },
+      { text: "Value", options: { bold: true, color: DELOITTE.white, fill: { color: DELOITTE.charcoal }, fontSize: 9 } },
+      { text: "Owner", options: { bold: true, color: DELOITTE.white, fill: { color: DELOITTE.charcoal }, fontSize: 9 } },
+      { text: "Source / Rationale", options: { bold: true, color: DELOITTE.white, fill: { color: DELOITTE.charcoal }, fontSize: 9 } },
+      { text: "Effective / Status", options: { bold: true, color: DELOITTE.white, fill: { color: DELOITTE.charcoal }, fontSize: 9 } },
+    ]];
+    for (const parameter of params.slice(0, 14)) {
+      rows.push([
+        { text: parameter.extracted_name, options: { fontSize: 8 } },
+        { text: String(parameter.scenario_value), options: { fontSize: 8, align: "right" } },
+        { text: parameter.owner_name || parameter.owner_user_id || "—", options: { fontSize: 8 } },
+        {
+          text: [parameter.source_citation, parameter.rationale].filter(Boolean).join(" · ") || "—",
+          options: { fontSize: 8 },
+        },
+        {
+          text: `${parameter.effective_from ? new Date(parameter.effective_from).toISOString().slice(0, 10) : "—"} · ${parameter.review_status || "draft"}`,
+          options: { fontSize: 8 },
+        },
+      ]);
+    }
+    assumptionsSlide.addTable(rows, {
+      x: 0.35, y: 1.05, w: 12.6,
+      border: { pt: 0.4, color: DELOITTE.grayLight },
+      colW: [2.6, 1.2, 2, 4.4, 2.4],
+      rowH: 0.34,
+    });
+    assumptionsSlide.addText(`Manifest: ${manifest?.row_hash || "legacy run"}`, {
+      x: 0.5, y: 6.9, w: 12, h: 0.25, fontSize: 7, color: DELOITTE.gray,
+    });
+  }
+
   // ── Fidelity status ──
   if (fidelity.validation_status || fidelity.score != null || fidelity.ready != null) {
     const fidSlide = pptx.addSlide();
@@ -556,6 +616,30 @@ export async function exportToPptx(scenarioId: string): Promise<Buffer> {
       color: DELOITTE.charcoal,
       lineSpacing: 20,
       valign: "top",
+    });
+  }
+
+  // ── Immutable Provenance ──
+  {
+    const provenanceSlide = pptx.addSlide();
+    addSectionTitle(provenanceSlide, pptx, "Immutable Run Provenance");
+    const rows: PptxTableRow[] = [
+      ["Manifest ID", manifest?.manifest_id || "Legacy run — unavailable"],
+      ["Manifest row hash", manifest?.row_hash || "—"],
+      ["Model hash", manifest?.model_hash || "—"],
+      ["Scenario version", manifest?.scenario_version_id || "—"],
+      ["Run timestamp", manifest?.created_at ? new Date(manifest.created_at).toISOString() : "—"],
+      ["Engine", manifest ? JSON.stringify(manifest.engine) : "—"],
+      ["Monte Carlo disclosure", manifest?.mc ? JSON.stringify(manifest.mc) : "Not applicable"],
+    ].map(([label, value]) => [
+      { text: label, options: { bold: true, fontSize: 9 } },
+      { text: value, options: { fontSize: 8 } },
+    ]);
+    provenanceSlide.addTable(rows, {
+      x: 0.5, y: 1.2, w: 12,
+      border: { pt: 0.5, color: DELOITTE.grayLight },
+      colW: [2.6, 9.4],
+      rowH: 0.48,
     });
   }
 

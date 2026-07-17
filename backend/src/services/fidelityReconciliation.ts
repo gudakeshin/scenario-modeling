@@ -184,6 +184,8 @@ export function reconcileFidelity(
       }
 
       if (cell.expected == null || !Number.isFinite(cell.expected)) continue;
+      // Skip volatile cells and dependents — Excel cached values are not stable.
+      if (cell.volatile) continue;
 
       compared++;
       const actual =

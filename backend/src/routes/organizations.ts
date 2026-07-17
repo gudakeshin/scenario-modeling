@@ -23,6 +23,7 @@ import {
   updateOrganization,
   type OrgRole,
 } from "../services/organizationService.js";
+import { pool } from "../db/index.js";
 
 export const organizationsRouter = Router();
 
@@ -60,6 +61,22 @@ const attachSchema = z.object({
   workspace_id: z.string().uuid(),
   organization_id: z.string().uuid().nullable(),
 });
+const tradingWindowSchema = z
+  .object({
+    status: z.enum(["open", "closed"]),
+    from: z.string().date().nullable().optional(),
+    until: z.string().date().nullable().optional(),
+    note: z.string().max(500).nullable().optional(),
+  })
+  .superRefine((value, ctx) => {
+    if (value.from && value.until && value.from > value.until) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ["until"],
+        message: "Trading-window end date must be on or after its start date",
+      });
+    }
+  });
 
 /** List orgs I belong to */
 organizationsRouter.get("/", async (req, res) => {
@@ -123,8 +140,36 @@ organizationsRouter.get("/:id", async (req, res) => {
 });
 
 organizationsRouter.patch(
+  "/:id/trading-window",
+  validateBody(tradingWindowSchema),
+  async (req, res) => {
+    try {
+      await assertOrgRole(req.user!.userId, req.params.id, ["owner", "admin"]);
+      const result = await pool.query(
+        `UPDATE organizations
+         SET trading_window_status = $2, trading_window_from = $3,
+             trading_window_until = $4, trading_window_note = $5, updated_at = NOW()
+         WHERE organization_id = $1
+         RETURNING organization_id, trading_window_status, trading_window_from,
+                   trading_window_until, trading_window_note`,
+        [
+          req.params.id,
+          req.body.status,
+          req.body.from ?? null,
+          req.body.until ?? null,
+          req.body.note ?? null,
+        ],
+      );
+      if (!result.rows[0]) return res.status(404).json({ error: "Organization not found" });
+      return res.json(result.rows[0]);
+    } catch (e) {
+      return handle(e, res, "Failed to update trading window");
+    }
+  },
+);
+
+organizationsRouter.patch(
   "/:id",
-  requireRole("admin"),
   validateBody(updateSchema),
   async (req, res) => {
     try {
@@ -137,7 +182,7 @@ organizationsRouter.patch(
   },
 );
 
-organizationsRouter.delete("/:id", requireRole("admin"), async (req, res) => {
+organizationsRouter.delete("/:id", async (req, res) => {
   try {
     await assertOrgRole(req.user!.userId, req.params.id, ["owner"]);
     await deleteOrganization(req.params.id);

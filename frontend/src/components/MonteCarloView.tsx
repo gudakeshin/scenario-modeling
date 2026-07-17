@@ -279,9 +279,15 @@ export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloVi
 
       {result && (
         <>
+          {result.degraded && (
+            <div className="mb-3 rounded-lg border border-[var(--danger)]/40 bg-[var(--danger-bg)] px-3 py-2 text-xs text-[var(--danger)]">
+              Degraded Monte Carlo result: only {(result.completion_ratio * 100).toFixed(1)}% of
+              requested draws completed. Percentiles are based on the achieved sample size.
+            </div>
+          )}
           <p className="text-xs text-[var(--text-faint)] mb-1">
-            {result.iterations.toLocaleString()} iterations completed
-            {result.iterations < result.requested_iterations ? ` (of ${result.requested_iterations.toLocaleString()} requested)` : ""}
+            {result.completed.toLocaleString("en-IN")} iterations completed
+            {result.truncated ? ` (of ${result.requested_iterations.toLocaleString("en-IN")} requested)` : ""}
             {" · "}seed {result.seed} — reproducible
           </p>
           {result.notices && result.notices.length > 0 && (

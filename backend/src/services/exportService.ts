@@ -30,11 +30,32 @@ interface ExportData {
   pl: Record<string, number>;
   periods: PeriodBreakdown[];
   granularity: string;
-  parameters: { extracted_name: string; mapped_variable_id: string; scenario_value: number; status: string }[];
+  parameters: {
+    extracted_name: string;
+    mapped_variable_id: string;
+    scenario_value: number;
+    status: string;
+    owner_user_id: string | null;
+    owner_name: string | null;
+    source_citation: string | null;
+    rationale: string | null;
+    effective_from: string | null;
+    review_status: string;
+    confidence_score: number | null;
+  }[];
   narrative: string | null;
   raw_output: Record<string, unknown>;
   denom: DenominationMeta;
   fidelity: FidelityMeta;
+  manifest: {
+    manifest_id: string;
+    row_hash: string;
+    model_hash: string;
+    scenario_version_id: string;
+    created_at: string;
+    engine: Record<string, unknown>;
+    mc: Record<string, unknown> | null;
+  } | null;
 }
 
 async function loadDenominationAndFidelity(scenarioId: string): Promise<{
@@ -105,7 +126,7 @@ async function loadExportData(scenarioId: string): Promise<ExportData> {
   const row = sRes.rows[0];
 
   const oRes = await pool.query(
-    "SELECT output_data, narrative_summary FROM scenario_outputs WHERE scenario_id = $1 AND output_type = 'pl' ORDER BY created_at DESC LIMIT 1",
+    "SELECT output_id, output_data, narrative_summary FROM scenario_outputs WHERE scenario_id = $1 AND output_type = 'pl' ORDER BY created_at DESC LIMIT 1",
     [scenarioId]
   );
   const rawOutput = oRes.rows[0]?.output_data ?? {};
@@ -115,9 +136,22 @@ async function loadExportData(scenarioId: string): Promise<ExportData> {
   const narrative = oRes.rows[0]?.narrative_summary ?? null;
 
   const pRes = await pool.query(
-    "SELECT extracted_name, mapped_variable_id, scenario_value, status FROM scenario_parameters WHERE scenario_id = $1 ORDER BY created_at",
+    `SELECT sp.extracted_name, sp.mapped_variable_id, sp.scenario_value, sp.status,
+            sp.owner_user_id, u.name AS owner_name, sp.source_citation, sp.rationale,
+            sp.effective_from, sp.review_status, sp.confidence_score
+     FROM scenario_parameters sp
+     LEFT JOIN users u ON u.user_id = sp.owner_user_id
+     WHERE sp.scenario_id = $1
+     ORDER BY sp.created_at`,
     [scenarioId]
   );
+  const manifestRes = oRes.rows[0]?.output_id
+    ? await pool.query(
+        `SELECT manifest_id, row_hash, model_hash, scenario_version_id, created_at, engine, mc
+         FROM run_manifests WHERE run_id = $1`,
+        [oRes.rows[0].output_id],
+      )
+    : { rows: [] };
 
   const { denom, fidelity } = await loadDenominationAndFidelity(scenarioId);
 
@@ -133,6 +167,7 @@ async function loadExportData(scenarioId: string): Promise<ExportData> {
     raw_output: rawOutput,
     denom,
     fidelity,
+    manifest: manifestRes.rows[0] ?? null,
   };
 }
 
@@ -257,6 +292,43 @@ export async function exportToExcel(scenarioId: string): Promise<Buffer> {
   paramHeaderRow.font = headerFont;
   paramHeaderRow.fill = headerFill;
 
+  // ── Assumptions Book Sheet ──
+  const assumptionsSheet = wb.addWorksheet("Assumptions Book");
+  assumptionsSheet.columns = [
+    { header: "Assumption", key: "name", width: 28 },
+    { header: "Model Variable", key: "variable", width: 24 },
+    { header: "Value (raw precision)", key: "value", width: 20 },
+    { header: "Owner", key: "owner", width: 22 },
+    { header: "Source / Citation", key: "source", width: 35 },
+    { header: "Rationale", key: "rationale", width: 45 },
+    { header: "Effective Date", key: "effective", width: 16 },
+    { header: "Review Status", key: "review", width: 16 },
+    { header: "Confidence", key: "confidence", width: 14 },
+  ];
+  for (const parameter of data.parameters) {
+    assumptionsSheet.addRow({
+      name: parameter.extracted_name,
+      variable: parameter.mapped_variable_id,
+      value: Number(parameter.scenario_value),
+      owner: parameter.owner_name || parameter.owner_user_id || "",
+      source: parameter.source_citation || "",
+      rationale: parameter.rationale || "",
+      effective: parameter.effective_from
+        ? new Date(parameter.effective_from).toISOString().slice(0, 10)
+        : "",
+      review: parameter.review_status,
+      confidence:
+        parameter.confidence_score == null ? "" : Number(parameter.confidence_score),
+    });
+  }
+  assumptionsSheet.getRow(1).font = headerFont;
+  assumptionsSheet.getRow(1).fill = headerFill;
+  assumptionsSheet.addRow([]);
+  assumptionsSheet.addRow([
+    "Manifest hash",
+    data.manifest?.row_hash || "Manifest unavailable (legacy run)",
+  ]);
+
   // ── Sources / Fidelity Sheet ──
   const hasFidelity =
     data.fidelity.validation_status != null ||
@@ -294,6 +366,25 @@ export async function exportToExcel(scenarioId: string): Promise<Buffer> {
     }
   }
 
+  // ── Immutable Provenance Sheet ──
+  const provenanceSheet = wb.addWorksheet("Provenance");
+  provenanceSheet.getColumn("A").width = 28;
+  provenanceSheet.getColumn("B").width = 75;
+  const provenanceTitle = provenanceSheet.addRow(["Immutable Run Provenance"]);
+  provenanceTitle.font = { bold: true, size: 14 };
+  provenanceTitle.fill = accentFill;
+  provenanceSheet.addRow([]);
+  provenanceSheet.addRow(["Manifest ID", data.manifest?.manifest_id || ""]);
+  provenanceSheet.addRow(["Manifest row hash", data.manifest?.row_hash || "Legacy run — unavailable"]);
+  provenanceSheet.addRow(["Model hash", data.manifest?.model_hash || ""]);
+  provenanceSheet.addRow(["Scenario version", data.manifest?.scenario_version_id || ""]);
+  provenanceSheet.addRow(["Run timestamp", data.manifest?.created_at || ""]);
+  provenanceSheet.addRow(["Engine", data.manifest ? JSON.stringify(data.manifest.engine) : ""]);
+  provenanceSheet.addRow([
+    "Monte Carlo disclosure",
+    data.manifest?.mc ? JSON.stringify(data.manifest.mc) : "Not applicable to deterministic run",
+  ]);
+
   // ── Summary Sheet ──
   const summarySheet = wb.addWorksheet("Summary");
   summarySheet.getColumn("A").width = 20;
@@ -326,6 +417,7 @@ export async function exportToCsv(scenarioId: string): Promise<string> {
 
   const sections: string[] = [];
 
+  sections.push("=== Raw numeric precision; formatting is applied only in presentation exports ===");
   sections.push(`=== Denomination: ${data.denom.currency} ${data.denom.currency_unit} ===`);
   sections.push("=== P&L Summary (Total) ===");
   sections.push("Metric,Base Total,Scenario Total,Delta,Delta %,Currency,Unit");
@@ -358,6 +450,30 @@ export async function exportToCsv(scenarioId: string): Promise<string> {
       );
     }
   }
+
+  sections.push("");
+  sections.push("=== Assumptions Book ===");
+  sections.push("Assumption,Model Variable,Value,Owner,Source,Rationale,Effective Date,Review Status,Confidence");
+  const csv = (value: unknown) => `"${String(value ?? "").replace(/"/g, '""')}"`;
+  for (const parameter of data.parameters) {
+    sections.push([
+      csv(parameter.extracted_name),
+      csv(parameter.mapped_variable_id),
+      Number(parameter.scenario_value),
+      csv(parameter.owner_name || parameter.owner_user_id),
+      csv(parameter.source_citation),
+      csv(parameter.rationale),
+      csv(parameter.effective_from ? new Date(parameter.effective_from).toISOString().slice(0, 10) : ""),
+      csv(parameter.review_status),
+      parameter.confidence_score ?? "",
+    ].join(","));
+  }
+  sections.push("");
+  sections.push("=== Provenance ===");
+  sections.push(`Manifest Hash,${csv(data.manifest?.row_hash || "legacy run")}`);
+  sections.push(`Model Hash,${csv(data.manifest?.model_hash || "")}`);
+  sections.push(`Scenario Version,${csv(data.manifest?.scenario_version_id || "")}`);
+  sections.push(`Run Timestamp,${csv(data.manifest?.created_at || "")}`);
 
   return sections.join("\n");
 }

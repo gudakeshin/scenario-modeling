@@ -99,6 +99,12 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
 
   useEffect(() => { loadDocuments(); loadContext(); loadModel(); }, [loadDocuments, loadContext, loadModel]);
 
+  useEffect(() => {
+    if (!documents.some((doc) => doc.status === "queued" || doc.status === "processing")) return;
+    const timer = window.setInterval(() => void loadDocuments(), 2_000);
+    return () => window.clearInterval(timer);
+  }, [documents, loadDocuments]);
+
   const handleUpload = async (files: FileList | File[]) => {
     const list = Array.from(files);
     if (list.length === 0) return;
@@ -351,7 +357,7 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
               ref={fileRef}
               type="file"
               multiple
-              accept=".pdf,.txt,.md,.csv,.docx,.xlsx"
+              accept=".pdf,.txt,.md,.csv,.docx,.xlsx,.xlsm"
               className="hidden"
               onChange={(e) => {
                 if (e.target.files?.length) void handleUpload(e.target.files);
@@ -366,7 +372,7 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
             <button type="button" onClick={() => fileRef.current?.click()} disabled={uploading} className="text-accent text-sm font-medium hover:underline">
               Select Files
             </button>
-            <p className="text-xs text-[var(--text-muted)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX — max 20MB each · multiple files supported</p>
+            <p className="text-xs text-[var(--text-muted)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX, XLSM — max 50MB each · multiple files supported</p>
           </div>
 
           {uploadError && (
@@ -406,8 +412,14 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                     <p className="text-sm font-medium text-[var(--text-primary)] truncate">{doc.original_filename}</p>
                     <p className="text-xs text-[var(--text-muted)]">
                       {kindLabel(doc.document_kind)} &middot; {(doc.file_size_bytes / 1024).toFixed(0)} KB &middot; {doc.chunk_count} chunks &middot;{" "}
-                      <span className={doc.status === "ready" ? "text-[var(--success)]" : "text-[var(--warning)]"}>{doc.status}</span>
+                      <span className={doc.status === "ready" ? "text-[var(--success)]" : doc.status === "error" || doc.status === "rejected" ? "text-[var(--danger)]" : "text-[var(--warning)]"}>
+                        {doc.status}
+                        {(doc.status === "queued" || doc.status === "processing") && ` ${doc.progress ?? 0}%`}
+                      </span>
                     </p>
+                    {doc.processing_error && (
+                      <p className="mt-1 text-[11px] text-[var(--danger)]">{doc.processing_error}</p>
+                    )}
                     {ingestionSummary(doc) && (
                       <p className="text-[11px] text-[var(--text-secondary)] mt-0.5 truncate">{ingestionSummary(doc)}</p>
                     )}

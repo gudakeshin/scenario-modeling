@@ -13,6 +13,7 @@ import { CompiledModel, type EvaluableModel, type TypedOverride, type DeltaType 
 import { getXlsxRuntime, type XlsxModelSchemaLike } from "./xlsxRuntime.js";
 import type { WorkbookGraph } from "./excelExtractor.js";
 import { DimensionalModel, factsToLeafMap } from "./dimensionalModel.js";
+import { sha256, stableStringify } from "../utils/hashChain.js";
 import {
   isDimensionalModelDefinition,
   type DimensionalModelDefinition,
@@ -183,7 +184,7 @@ export async function getEvaluableModelForScenario(scenarioId: string): Promise<
     }
     const runtime = doc.workbook_graph
       ? getXlsxRuntime(
-          `${doc.document_id}:${doc.updated_at}`,
+          `${doc.document_id}:${sha256(stableStringify(doc.workbook_snapshot ?? doc.workbook_graph))}`,
           doc.workbook_graph,
           doc.model_schema,
           doc.workbook_snapshot,

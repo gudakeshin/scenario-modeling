@@ -3,6 +3,16 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { getPortfolioDashboard, type PortfolioDashboard } from "@/lib/api";
+import { fmtCurrency } from "@/lib/metrics";
+import { TradingWindowBanner } from "@/components/TradingWindowBanner";
+
+function fmtKpi(value: number | string | null | undefined): string {
+  if (value == null) return "—";
+  if (typeof value === "number") return fmtCurrency(value);
+  const n = Number(value);
+  if (Number.isFinite(n)) return fmtCurrency(n);
+  return String(value);
+}
 
 export default function DashboardPage() {
   const [data, setData] = useState<PortfolioDashboard | null>(null);
@@ -27,8 +37,9 @@ export default function DashboardPage() {
   }, []);
 
   return (
-    <main className="min-h-screen bg-[var(--page-bg)] text-[var(--text-primary)] p-6 md:p-10">
-      <div className="max-w-6xl mx-auto space-y-6">
+    <main className="min-h-screen bg-[var(--page-bg)] text-[var(--text-primary)]">
+      <TradingWindowBanner />
+      <div className="max-w-6xl mx-auto space-y-6 p-6 md:p-10">
         <div className="flex items-center justify-between gap-4">
           <div>
             <h1 className="text-2xl font-semibold tracking-tight">Portfolio Dashboard</h1>
@@ -63,7 +74,7 @@ export default function DashboardPage() {
                     {k.label}
                   </div>
                   <div className="text-xl font-semibold mt-1">
-                    {k.value == null ? "—" : String(k.value)}
+                    {fmtKpi(k.value)}
                   </div>
                 </div>
               ))}
@@ -80,7 +91,7 @@ export default function DashboardPage() {
                     <li key={r.scenario_id} className="flex justify-between gap-2">
                       <span className="truncate">{r.name || r.scenario_id.slice(0, 8)}</span>
                       <span className="text-[var(--text-muted)] tabular-nums">
-                        NI {r.net_income ?? "—"}
+                        NI {r.net_income == null ? "—" : fmtCurrency(Number(r.net_income))}
                       </span>
                     </li>
                   ))}
@@ -117,8 +128,8 @@ export default function DashboardPage() {
                     <tr key={s.scenario_id} className="border-b border-[var(--border)]/60">
                       <td className="py-2 pr-2">{s.name || s.scenario_id.slice(0, 8)}</td>
                       <td className="py-2 pr-2 capitalize">{s.status}</td>
-                      <td className="py-2 pr-2 tabular-nums">{s.revenue ?? "—"}</td>
-                      <td className="py-2 pr-2 tabular-nums">{s.net_income ?? "—"}</td>
+                      <td className="py-2 pr-2 tabular-nums">{s.revenue == null ? "—" : fmtCurrency(Number(s.revenue))}</td>
+                      <td className="py-2 pr-2 tabular-nums">{s.net_income == null ? "—" : fmtCurrency(Number(s.net_income))}</td>
                       <td className="py-2 text-[var(--text-muted)]">
                         {new Date(s.updated_at).toLocaleString()}
                       </td>

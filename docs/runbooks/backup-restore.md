@@ -99,75 +99,35 @@ cat ./backups/scenario_modeling_<timestamp>.dump | docker compose exec -T postgr
   pg_restore -U postgres -d scenario_modeling
 ```
 
-## 2. Scheduling backups
+## 2. Automated nightly backups
 
-There is no backup automation in this repo yet. Use either a cron job or a
-systemd timer on the host running docker-compose. Both examples call a small
-wrapper script — create `./scripts/backup-postgres.sh`:
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-cd "$(dirname "$0")/.."
-mkdir -p ./backups
-STAMP=$(date +%Y%m%dT%H%M%S)
-docker compose exec -T postgres pg_dump -U postgres -d scenario_modeling -Fc \
-  > "./backups/scenario_modeling_${STAMP}.dump"
-# Retention: keep the last 14 daily backups (see retention guidance below)
-find ./backups -name 'scenario_modeling_*.dump' -mtime +14 -delete
-```
+The optional Compose `backup` profile builds `ops/backup/` and runs `pg_dump`
+nightly at 02:15 UTC. It uploads custom-format dumps to private object storage
+with SSE-KMS when `BACKUP_KMS_KEY_ID` is set (otherwise SSE-S3) and removes
+objects older than `BACKUP_RETENTION_DAYS` (default 30).
 
 ```bash
-chmod +x ./scripts/backup-postgres.sh
+export BACKUP_BUCKET=<private-backup-bucket>
+export OBJECT_STORAGE_ACCESS_KEY=<secret-manager-reference>
+export OBJECT_STORAGE_SECRET_KEY=<secret-manager-reference>
+export OBJECT_STORAGE_REGION=ap-south-1
+export BACKUP_KMS_KEY_ID=<kms-key-arn>
+docker compose --profile backup up -d backup
 ```
 
-### Cron example (daily at 02:15)
-
-```cron
-15 2 * * * /path/to/repo/scripts/backup-postgres.sh >> /var/log/scenario-modeling-backup.log 2>&1
-```
-
-### systemd timer example
-
-`/etc/systemd/system/scenario-modeling-backup.service`:
-
-```ini
-[Unit]
-Description=Scenario Modeling Postgres backup
-
-[Service]
-Type=oneshot
-WorkingDirectory=/path/to/repo
-ExecStart=/path/to/repo/scripts/backup-postgres.sh
-User=deploy
-```
-
-`/etc/systemd/system/scenario-modeling-backup.timer`:
-
-```ini
-[Unit]
-Description=Daily Scenario Modeling Postgres backup
-
-[Timer]
-OnCalendar=*-*-* 02:15:00
-Persistent=true
-
-[Install]
-WantedBy=timers.target
-```
+Run a restore verification against the newest backup:
 
 ```bash
-sudo systemctl enable --now scenario-modeling-backup.timer
+docker compose --profile backup run --rm backup /usr/local/bin/restore-verify
 ```
 
-Ship backups off the host after they land — rsync/rclone to a separate
-machine or a cloud bucket. A backup that lives only on the same disk as the
-database it backs up does not protect against host/disk failure.
+For production, use managed PostgreSQL in `ap-south-1` with native PITR and
+automated restore testing. The sidecar is a logical-backup safety net, not a
+substitute for WAL-based point-in-time recovery.
 
 ## 3. Retention guidance
 
-- Daily backups, retained **14 days** locally (see the `find -mtime +14
-  -delete` in the script above) — adjust to your recovery-point requirements.
+- Daily backups, retained **30 days** by default.
 - Keep at least **4 weekly** snapshots and **3 monthly** snapshots off-host
   (e.g. in object storage) for longer-horizon recovery and audit purposes.
   A simple approach: copy the Sunday daily backup into a `weekly/` prefix and

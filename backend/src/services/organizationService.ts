@@ -10,6 +10,10 @@ export interface Organization {
   organization_id: string;
   name: string;
   slug: string | null;
+  trading_window_status: "open" | "closed";
+  trading_window_from: string | null;
+  trading_window_until: string | null;
+  trading_window_note: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -75,7 +79,9 @@ export async function createOrganization(
     await client.query("BEGIN");
     const org = await client.query(
       `INSERT INTO organizations (name, slug) VALUES ($1, $2)
-       RETURNING organization_id, name, slug, created_at, updated_at`,
+       RETURNING organization_id, name, slug, trading_window_status,
+                 trading_window_from, trading_window_until, trading_window_note,
+                 created_at, updated_at`,
       [trimmed, orgSlug],
     );
     await client.query(
@@ -100,7 +106,9 @@ export async function listOrganizationsForUser(userId: string): Promise<
   Array<Organization & { org_role: OrgRole }>
 > {
   const r = await pool.query(
-    `SELECT o.organization_id, o.name, o.slug, o.created_at, o.updated_at, m.org_role
+    `SELECT o.organization_id, o.name, o.slug, o.trading_window_status,
+            o.trading_window_from, o.trading_window_until, o.trading_window_note,
+            o.created_at, o.updated_at, m.org_role
      FROM organizations o
      JOIN organization_members m ON m.organization_id = o.organization_id
      WHERE m.user_id = $1
@@ -112,7 +120,9 @@ export async function listOrganizationsForUser(userId: string): Promise<
 
 export async function getOrganization(orgId: string): Promise<Organization | null> {
   const r = await pool.query(
-    `SELECT organization_id, name, slug, created_at, updated_at
+    `SELECT organization_id, name, slug, trading_window_status,
+            trading_window_from, trading_window_until, trading_window_note,
+            created_at, updated_at
      FROM organizations WHERE organization_id = $1`,
     [orgId],
   );
@@ -141,7 +151,9 @@ export async function updateOrganization(
     const r = await pool.query(
       `UPDATE organizations SET ${fields.join(", ")}
        WHERE organization_id = $1
-       RETURNING organization_id, name, slug, created_at, updated_at`,
+       RETURNING organization_id, name, slug, trading_window_status,
+                 trading_window_from, trading_window_until, trading_window_note,
+                 created_at, updated_at`,
       params,
     );
     if (!r.rows[0]) throw httpError("Organization not found", 404);

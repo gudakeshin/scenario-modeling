@@ -2,22 +2,19 @@ import type { NextRequest } from "next/server";
 import { NextResponse } from "next/server";
 
 const SESSION_HINT = "sm_session";
-
 const PUBLIC_PATHS = new Set(["/login"]);
 
-export function middleware(request: NextRequest) {
+export function proxy(request: NextRequest) {
   const { pathname } = request.nextUrl;
   if (
     pathname.startsWith("/_next") ||
     pathname.startsWith("/api") ||
+    pathname.startsWith("/print/board-pack/") ||
     pathname.includes(".")
   ) {
     return NextResponse.next();
   }
-
-  if (PUBLIC_PATHS.has(pathname)) {
-    return NextResponse.next();
-  }
+  if (PUBLIC_PATHS.has(pathname)) return NextResponse.next();
 
   const hasSession = request.cookies.get(SESSION_HINT)?.value === "1";
   if (!hasSession) {
@@ -25,7 +22,6 @@ export function middleware(request: NextRequest) {
     login.searchParams.set("next", pathname);
     return NextResponse.redirect(login);
   }
-
   return NextResponse.next();
 }
 

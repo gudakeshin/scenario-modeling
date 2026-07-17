@@ -19,7 +19,14 @@ export type IngestionWarningCode =
   | "missing_formula_result"
   | "sparse_snapshot"
   | "csv_data_only"
-  | "parse_fallback";
+  | "parse_fallback"
+  | "volatile_function"
+  | "named_range_skipped"
+  | "unsupported_function"
+  | "structured_reference"
+  | "array_formula"
+  | "pivot_static"
+  | "macro_not_executed";
 
 export interface IngestionWarning {
   code: IngestionWarningCode;
@@ -32,6 +39,7 @@ export interface IngestionWarning {
 /**
  * Sparse cell: `v` is the HyperFormula input (formula string or literal).
  * `expected` is Excel's cached formula result for fidelity reconciliation.
+ * `volatile` marks RAND/NOW/TODAY (and dependents) — excluded from fidelity checks.
  */
 export interface SparseCell {
   r: number;
@@ -40,6 +48,7 @@ export interface SparseCell {
   expected?: number;
   source_unit?: string;
   source_currency?: string;
+  volatile?: boolean;
 }
 
 /** Sparse cell grid: only non-empty cells stored; densified for HyperFormula. */
@@ -128,7 +137,11 @@ export interface IngestionReport {
   classification_evidence?: ClassificationEvidence;
 }
 
-/** Expand sparse snapshot to dense grids for HyperFormula.buildFromSheets. */
+/**
+ * Expand sparse snapshot into jagged rows for HyperFormula.buildFromSheets.
+ * Rows are retained for address stability, but columns are only allocated up
+ * to the last populated cell in each row—never padded to sheet.cols.
+ */
 export function densifySnapshot(
   sparse: SparseWorkbookSnapshot,
 ): Record<string, (string | number | null)[][]> {
@@ -136,10 +149,10 @@ export function densifySnapshot(
   for (const name of sparse.sheetOrder) {
     const sheet = sparse.sheets[name];
     if (!sheet) continue;
-    const grid: (string | number | null)[][] = [];
-    for (let r = 0; r < sheet.rows; r++) {
-      grid.push(new Array(sheet.cols).fill(null));
-    }
+    const grid: (string | number | null)[][] = Array.from(
+      { length: sheet.rows },
+      () => [],
+    );
     for (const cell of sheet.cells) {
       while (grid.length <= cell.r) grid.push([]);
       const row = grid[cell.r];

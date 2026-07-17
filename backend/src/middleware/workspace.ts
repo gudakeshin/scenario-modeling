@@ -1,6 +1,7 @@
 import type { Request, Response, NextFunction } from "express";
 import { pool } from "../db/index.js";
 import { ensureDefaultWorkspace } from "../services/workspaceService.js";
+import { assertUpsIWorkspaceMembership } from "../services/upsiGovernanceService.js";
 
 /** Per-request scope: the authenticated user plus their selected workspace. */
 export interface Scope {
@@ -11,6 +12,7 @@ export interface Scope {
 export interface RequestWorkspace {
   workspaceId: string;
   isDefault: boolean;
+  sensitivity?: "public" | "confidential" | "upsi";
 }
 
 declare global {
@@ -29,6 +31,47 @@ export function scopeOf(req: Request): Scope {
   return { userId: req.user!.userId, workspaceId: req.workspace!.workspaceId };
 }
 
+async function authorizeWorkspaceAccess(
+  userId: string,
+  role: string,
+  workspaceId: string,
+): Promise<{
+  workspaceId: string;
+  isDefault: boolean;
+  sensitivity: "public" | "confidential" | "upsi";
+} | null> {
+  const r = await pool.query(
+    `SELECT workspace_id, is_default, owner_id, organization_id, sensitivity
+     FROM workspaces
+     WHERE workspace_id = $1 AND status = 'active'`,
+    [workspaceId],
+  );
+  if (!r.rows[0]) return null;
+  const ws = r.rows[0];
+  let allowed = ws.owner_id === userId || role === "admin";
+  if (ws.sensitivity === "upsi") {
+    // No admin/role fallthrough for UPSI — explicit membership only.
+    const membership = await pool.query(
+      `SELECT 1 FROM workspace_memberships WHERE workspace_id = $1 AND user_id = $2`,
+      [ws.workspace_id, userId],
+    );
+    allowed = !!membership.rows[0];
+  } else if (!allowed && ws.organization_id) {
+    const mem = await pool.query(
+      `SELECT 1 FROM organization_members WHERE organization_id = $1 AND user_id = $2`,
+      [ws.organization_id, userId],
+    );
+    allowed = !!mem.rows[0];
+  }
+  if (!allowed) return null;
+  await assertUpsIWorkspaceMembership(userId, ws.workspace_id);
+  return {
+    workspaceId: ws.workspace_id,
+    isDefault: ws.is_default,
+    sensitivity: ws.sensitivity,
+  };
+}
+
 /**
  * Resolve the active workspace for the request from the X-Workspace-Id header.
  * Requires `authenticate` to have run first (req.user set).
@@ -37,7 +80,7 @@ export function scopeOf(req: Request): Scope {
  * - Invalid UUID: 400.
  * - Workspace missing/deleted: 403.
  * - Access: owner, OR org member when workspace.organization_id is set.
- *   Workspaces without organization_id remain owner-only (unchanged).
+ *   UPSI workspaces additionally require explicit workspace membership.
  */
 export async function resolveWorkspace(req: Request, res: Response, next: NextFunction) {
   try {
@@ -52,36 +95,42 @@ export async function resolveWorkspace(req: Request, res: Response, next: NextFu
     const isOrgMgmt =
       req.path === "/organizations" || req.path.startsWith("/organizations/");
     const raw = (req.headers["x-workspace-id"] as string | undefined)?.trim();
-    if (raw && !isWorkspaceMgmt && !isOrgMgmt) {
-      if (!UUID_RE.test(raw)) {
-        return res.status(400).json({ error: "Invalid workspace id" });
-      }
-      const r = await pool.query(
-        `SELECT workspace_id, is_default, owner_id, organization_id FROM workspaces
-         WHERE workspace_id = $1 AND status = 'active'`,
-        [raw],
-      );
-      if (!r.rows[0]) {
-        return res.status(403).json({ error: "Workspace not found", code: "WORKSPACE_NOT_FOUND" });
-      }
-      const ws = r.rows[0];
-      let allowed = ws.owner_id === user.userId || user.role === "admin";
-      if (!allowed && ws.organization_id) {
-        const mem = await pool.query(
-          `SELECT 1 FROM organization_members WHERE organization_id = $1 AND user_id = $2`,
-          [ws.organization_id, user.userId],
-        );
-        allowed = !!mem.rows[0];
-      }
-      if (!allowed) {
-        return res.status(403).json({ error: "Workspace not found", code: "WORKSPACE_NOT_FOUND" });
-      }
-      req.workspace = { workspaceId: ws.workspace_id, isDefault: ws.is_default };
+
+    if (isWorkspaceMgmt || isOrgMgmt) {
+      req.workspace = {
+        workspaceId: await ensureDefaultWorkspace(user.userId),
+        isDefault: true,
+      };
       return next();
     }
-    req.workspace = { workspaceId: await ensureDefaultWorkspace(user.userId), isDefault: true };
+
+    const workspaceId = raw
+      ? raw
+      : await ensureDefaultWorkspace(user.userId);
+
+    if (raw && !UUID_RE.test(raw)) {
+      return res.status(400).json({ error: "Invalid workspace id" });
+    }
+
+    const authorized = await authorizeWorkspaceAccess(user.userId, user.role, workspaceId);
+    if (!authorized) {
+      return res.status(403).json({ error: "Workspace not found", code: "WORKSPACE_NOT_FOUND" });
+    }
+
+    req.workspace = {
+      workspaceId: authorized.workspaceId,
+      isDefault: authorized.isDefault,
+      sensitivity: authorized.sensitivity,
+    };
     return next();
   } catch (e) {
+    const status = (e as { status?: number }).status;
+    if (status) {
+      return res.status(status).json({
+        error: (e as Error).message || "Failed to resolve workspace",
+        code: (e as { code?: string }).code,
+      });
+    }
     return res.status(500).json({ error: (e as Error).message || "Failed to resolve workspace" });
   }
 }
