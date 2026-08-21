@@ -60,6 +60,25 @@ export interface FollowUpQuestion {
  * gate (confidence + evidence), promote open questions, and ensure recommended
  * values are selectable when allow_custom is false.
  */
+/**
+ * Deterministic id for a question the model did not name.
+ *
+ * A random id (`q_uaqcth`) changes on every round, so the same question asked
+ * twice looks like two different questions: it cannot be deduplicated against
+ * the answer history and the audit trail reads as noise. Deriving the id from
+ * the text makes a repeat identifiable as a repeat.
+ */
+export function questionSlug(question: string): string {
+  const words = question
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim()
+    .split(/\s+/)
+    .filter((w) => w.length > 2)
+    .slice(0, 6);
+  return words.length > 0 ? `q_${words.join("_")}` : "q_unnamed";
+}
+
 export function normalizeFollowUpQuestions(raw: unknown): FollowUpQuestion[] {
   if (!Array.isArray(raw) || raw.length === 0) return [];
 
@@ -75,7 +94,7 @@ export function normalizeFollowUpQuestions(raw: unknown): FollowUpQuestion[] {
     if (!parsed.success) continue;
 
     const q = parsed.data;
-    const id = q.id?.trim() || `q_${Math.random().toString(36).slice(2, 8)}`;
+    const id = q.id?.trim() || questionSlug(q.question);
     let options = Array.isArray(q.options) ? [...q.options] : [];
     let questionType = q.question_type;
     let recommendation: FollowUpRecommendation | undefined;
@@ -127,6 +146,7 @@ export function normalizeFollowUpQuestions(raw: unknown): FollowUpQuestion[] {
       questionType = "choice";
     }
 
+    if (out.some((existing) => existing.id === id)) continue;
     out.push({
       id,
       question: q.question,

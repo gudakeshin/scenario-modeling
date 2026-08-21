@@ -7,6 +7,7 @@ import assert from "node:assert/strict";
 import request from "supertest";
 import { app } from "../index.js";
 import { pool } from "../db/index.js";
+import { config } from "../config.js";
 
 const agent = request(app);
 const suffix = Date.now().toString(36);
@@ -241,7 +242,14 @@ test("run endpoint returns 409 when simulation already in progress", async () =>
   assert.match(String(res.body?.error || ""), /already in progress/i);
 });
 
-test("maker-checker: creator cannot self-approve", async () => {
+test("maker-checker: creator cannot self-approve", async (t) => {
+  // Maker-checker is only on by default under DEPLOYMENT_PROFILE=enterprise, so
+  // pin it explicitly — this test is about the control, not about the default.
+  const previous = config.ENFORCE_MAKER_CHECKER;
+  config.ENFORCE_MAKER_CHECKER = true;
+  t.after(() => {
+    config.ENFORCE_MAKER_CHECKER = previous;
+  });
   const admin = await loginSeedAdmin();
   const email = `approver-self-${suffix}@test.local`;
   const pass = "approver-pass-123";

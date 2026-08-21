@@ -9,6 +9,8 @@ interface ConfirmDialogProps {
   confirmLabel?: string;
   cancelLabel?: string;
   danger?: boolean;
+  /** Disables both buttons and shows a working label while the action runs. */
+  pending?: boolean;
   onConfirm: () => void;
   onCancel: () => void;
 }
@@ -20,6 +22,7 @@ export function ConfirmDialog({
   confirmLabel = "Confirm",
   cancelLabel = "Cancel",
   danger = false,
+  pending = false,
   onConfirm,
   onCancel,
 }: ConfirmDialogProps) {
@@ -31,17 +34,17 @@ export function ConfirmDialog({
     if (!open) return;
     confirmRef.current?.focus();
     const onKey = (e: KeyboardEvent) => {
-      if (e.key === "Escape") onCancel();
+      if (e.key === "Escape" && !pending) onCancel();
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
-  }, [open, onCancel]);
+  }, [open, onCancel, pending]);
 
   if (!open) return null;
 
   return (
     <div className="fixed inset-0 z-[60] flex items-center justify-center p-4">
-      <div className="absolute inset-0 bg-black/30" onClick={onCancel} aria-hidden="true" />
+      <div className="absolute inset-0 bg-black/30" onClick={pending ? undefined : onCancel} aria-hidden="true" />
       <div
         role="alertdialog"
         aria-modal="true"
@@ -59,7 +62,8 @@ export function ConfirmDialog({
           <button
             type="button"
             onClick={onCancel}
-            className="rounded-xl border border-[var(--border)] px-3 py-1.5 text-sm text-[var(--text-secondary)] hover:bg-[var(--panel-bg)]"
+            disabled={pending}
+            className="rounded-xl border border-[var(--border)] px-3 py-1.5 text-sm text-[var(--text-secondary)] hover:bg-[var(--panel-bg)] disabled:opacity-40"
           >
             {cancelLabel}
           </button>
@@ -67,13 +71,15 @@ export function ConfirmDialog({
             ref={confirmRef}
             type="button"
             onClick={onConfirm}
-            className={`rounded-xl px-3 py-1.5 text-sm font-medium ${
+            disabled={pending}
+            aria-busy={pending}
+            className={`rounded-xl px-3 py-1.5 text-sm font-medium disabled:opacity-60 ${
               danger
                 ? "bg-[var(--danger)] text-white hover:opacity-90"
                 : "bg-accent text-[var(--on-accent)] hover:bg-accent-hover"
             }`}
           >
-            {confirmLabel}
+            {pending ? "Working…" : confirmLabel}
           </button>
         </div>
       </div>

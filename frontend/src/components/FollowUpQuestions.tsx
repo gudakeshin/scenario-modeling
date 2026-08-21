@@ -7,6 +7,10 @@ interface FollowUpQuestionsProps {
   questions: FollowUpQuestion[];
   onSubmit: (answers: FollowUpAnswer[]) => void;
   isLoading?: boolean;
+  /** Dismiss the panel entirely. */
+  onClose?: () => void;
+  /** Collapse back to the chip strip. */
+  onMinimize?: () => void;
 }
 
 function isOpenQuestion(q: FollowUpQuestion): boolean {
@@ -42,7 +46,7 @@ function evidenceKindLabel(kind: string): string {
  * Interactive follow-up questions panel.
  * Pre-selects LLM recommendations when present; user confirms, overrides, or comments.
  */
-export function FollowUpQuestions({ questions, onSubmit, isLoading }: FollowUpQuestionsProps) {
+export function FollowUpQuestions({ questions, onSubmit, isLoading, onClose, onMinimize }: FollowUpQuestionsProps) {
   const [answers, setAnswers] = useState<Record<string, string>>(() => buildInitialAnswers(questions));
   const [customInputs, setCustomInputs] = useState<Record<string, string>>({});
   const [showCustom, setShowCustom] = useState<Record<string, boolean>>({});
@@ -178,16 +182,44 @@ export function FollowUpQuestions({ questions, onSubmit, isLoading }: FollowUpQu
             </svg>
             <h3 className="text-sm font-semibold text-accent truncate">Help me refine this scenario</h3>
           </div>
-          {recommendedCount >= 2 && (
-            <button
-              type="button"
-              onClick={acceptAllRecommendations}
-              disabled={isLoading}
-              className="shrink-0 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1 text-[11px] font-medium text-accent hover:bg-accent/20 transition-all disabled:opacity-40"
-            >
-              Accept all recommendations
-            </button>
-          )}
+          <div className="flex items-center gap-1.5 shrink-0">
+            {recommendedCount >= 2 && (
+              <button
+                type="button"
+                onClick={acceptAllRecommendations}
+                disabled={isLoading}
+                className="shrink-0 rounded-lg border border-accent/40 bg-accent/10 px-2.5 py-1 text-[11px] font-medium text-accent hover:bg-accent/20 transition-all disabled:opacity-40"
+              >
+                Accept all recommendations
+              </button>
+            )}
+            {onMinimize && (
+              <button
+                type="button"
+                onClick={onMinimize}
+                aria-label="Minimize Refine Scenario"
+                title="Minimize"
+                className="w-6 h-6 rounded-md flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--text-primary)] hover:bg-[var(--panel-bg)] transition-colors"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                  <line x1="5" y1="12" x2="19" y2="12" />
+                </svg>
+              </button>
+            )}
+            {onClose && (
+              <button
+                type="button"
+                onClick={onClose}
+                aria-label="Close Refine Scenario"
+                title="Close"
+                className="w-6 h-6 rounded-md flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--danger-bg)] transition-colors"
+              >
+                <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden="true">
+                  <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
+                </svg>
+              </button>
+            )}
+          </div>
         </div>
         <p className="text-xs text-[var(--text-secondary)] mt-1">
           {recommendedCount > 0

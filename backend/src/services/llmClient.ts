@@ -283,6 +283,12 @@ export async function callClaudeStructured<T>(opts: {
       succeeded: true,
     });
 
+    if (response.stop_reason === "max_tokens") {
+      throw new LlmSchemaError(
+        `Structured output truncated at max_tokens=${opts.maxTokens ?? 2000} for tool '${opts.toolName}' — raise maxTokens for this call`,
+      );
+    }
+
     const toolUse = response.content.find((b): b is Anthropic.ToolUseBlock => b.type === "tool_use");
     if (!toolUse) throw new LlmSchemaError("Model did not return a tool_use block");
 

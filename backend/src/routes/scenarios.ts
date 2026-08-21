@@ -66,6 +66,13 @@ import { getAgentReadiness } from "../services/scenarioReasoningAgent.js";
 
 export const scenariosRouter = Router();
 
+/**
+ * Clarification rounds allowed before the scenario runs on stated assumptions.
+ * Unbounded refinement is how a session ends with no result at all: each round
+ * re-parses and can re-map parameters, so more rounds is not more accuracy.
+ */
+const MAX_REFINEMENT_ROUNDS = Number(process.env.MAX_REFINEMENT_ROUNDS) || 2;
+
 const povSliceSchema = z.object({
   pov: z.record(z.string().min(1)),
   metrics: z.array(z.string().min(1)).optional(),
@@ -468,6 +475,19 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
       .join("\n");
     const enrichedInput = `${originalInput}\n\nAdditional context from user:\n${answerContext}`;
 
+    // Refinement must converge. Each round previously re-parsed the whole
+    // enriched input from scratch, so answers accumulated parameters instead of
+    // sharpening them — one scenario went 1 → 3 → 3 → 6 parameters across three
+    // rounds, the last five of them mis-mapped. After the cap we run with the
+    // answers we have and state the assumptions rather than asking again.
+    const roundsRes = await pool.query(
+      `SELECT COUNT(*)::int AS rounds FROM audit_trail
+       WHERE scenario_id = $1 AND action_type = 'refined'`,
+      [sid],
+    );
+    const priorRounds = Number(roundsRes.rows[0]?.rounds ?? 0);
+    const roundsExhausted = priorRounds + 1 >= MAX_REFINEMENT_ROUNDS;
+
     // Re-parse with the enriched input
     await hydrateScenarioContext(sid);
     const parseResult = await parseScenario(enrichedInput, {
@@ -479,10 +499,27 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
     // Also reset status to 'draft' since parameters are being replaced
     await pool.query("UPDATE scenarios SET nl_input = $1, status = 'draft' WHERE scenario_id = $2", [enrichedInput, sid]);
 
-    // Clear ALL existing parameters (pending + accepted) and replace with refined set
-    await pool.query("DELETE FROM scenario_parameters WHERE scenario_id = $1 AND status IN ('pending', 'accepted')", [sid]);
+    // Refinement sharpens the existing parameter set rather than replacing it.
+    // Deleting and re-inserting every round discarded the user's own accept /
+    // modify decisions and let each re-parse introduce fresh mappings — which is
+    // how a scenario went 1 → 3 → 3 → 6 parameters, the last five of them wrong.
+    const existingRes = await pool.query<{
+      parameter_id: string;
+      mapped_variable_id: string;
+      scenario_value: string;
+      delta_type: string;
+      status: string;
+    }>(
+      `SELECT parameter_id, mapped_variable_id, scenario_value, delta_type, status
+       FROM scenario_parameters WHERE scenario_id = $1`,
+      [sid],
+    );
+    const existingByVariable = new Map(
+      existingRes.rows.map((row) => [row.mapped_variable_id, row]),
+    );
 
     const paramsWithMapping: { name: string; mapped_variable_id: string; scenario_value: number; confidence: number }[] = [];
+    const seenVariableIds = new Set<string>();
     for (const p of parseResult.parameters) {
       let variableId: string | null = null;
       if (p.suggested_variable_id) variableId = p.suggested_variable_id;
@@ -495,6 +532,34 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
 
       const { value: scenarioValue, delta_type: deltaType } = toTypedDelta(p);
       paramsWithMapping.push({ name: p.name, mapped_variable_id: variableId, scenario_value: scenarioValue, confidence: p.confidence });
+      seenVariableIds.add(variableId);
+
+      const existing = existingByVariable.get(variableId);
+      if (existing) {
+        // A decision the user already made survives an unchanged value; a
+        // changed value has to be looked at again.
+        const changed =
+          Number(existing.scenario_value) !== scenarioValue ||
+          existing.delta_type !== deltaType;
+        await pool.query(
+          `UPDATE scenario_parameters
+           SET extracted_name = $2, scenario_value = $3, delta_type = $4,
+               confidence_score = $5, member_scope = $6,
+               status = CASE WHEN $7 THEN 'pending' ELSE status END
+           WHERE parameter_id = $1`,
+          [
+            existing.parameter_id,
+            p.name,
+            scenarioValue,
+            deltaType,
+            p.confidence,
+            p.member_scope ? JSON.stringify(p.member_scope) : null,
+            changed,
+          ],
+        );
+        continue;
+      }
+
       await pool.query(
         `INSERT INTO scenario_parameters (scenario_id, extracted_name, mapped_variable_id, scenario_value, delta_type, confidence_score, status, member_scope)
          VALUES ($1, $2, $3, $4, $5, $6, 'pending', $7)`,
@@ -507,6 +572,18 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
           p.confidence,
           p.member_scope ? JSON.stringify(p.member_scope) : null,
         ]
+      );
+    }
+
+    // Drop parameters this round no longer proposes — but never one a human
+    // explicitly accepted or modified.
+    const stale = existingRes.rows.filter(
+      (row) => !seenVariableIds.has(row.mapped_variable_id) && row.status === "pending",
+    );
+    if (stale.length > 0) {
+      await pool.query(
+        `DELETE FROM scenario_parameters WHERE parameter_id = ANY($1::uuid[])`,
+        [stale.map((row) => row.parameter_id)],
       );
     }
     mergeTouchedLevers(
@@ -552,8 +629,21 @@ scenariosRouter.post("/:id/refine", requireRole("analyst"), validateBody(refineS
         ...p,
         mapped_variable_id: paramsWithMapping[i]?.mapped_variable_id,
       })),
-      follow_up_questions: parseResult.follow_up_questions ?? undefined,
-      clarification_needed: parseResult.clarification_needed,
+      follow_up_questions: roundsExhausted ? undefined : parseResult.follow_up_questions ?? undefined,
+      clarification_needed: roundsExhausted ? false : parseResult.clarification_needed,
+      ...(roundsExhausted && (parseResult.follow_up_questions?.length ?? 0) > 0
+        ? {
+            assumptions_applied: parseResult.follow_up_questions!.map(
+              (q) => q.recommendation?.value ?? q.question,
+            ),
+            notices: [
+              ...(parseResult.notices ?? []),
+              `Clarification limit reached after ${priorRounds + 1} rounds — running with the ` +
+                `system's recommended answers for anything still open. Review the parameters ` +
+                `before approving.`,
+            ],
+          }
+        : {}),
       search_context: parseResult.search_context ?? undefined,
       reflection: parseResult.reflection ?? undefined,
       notices: parseResult.notices ?? undefined,
@@ -733,6 +823,62 @@ scenariosRouter.get("/:id/parameters", async (req, res) => {
       } catch {
         // Model may be formula_dag / unavailable — leave evidence empty.
       }
+    }
+
+    // Attach any data-quality finding that lands on the cell this parameter
+    // drives, so the caveat is visible next to the mapping the AI proposed
+    // rather than only in a separate panel.
+    try {
+      const docRes = await pool.query<{ document_id: string }>(
+        `SELECT d.document_id
+         FROM documents d
+         JOIN scenarios s ON s.workspace_id = d.workspace_id
+         WHERE s.scenario_id = $1
+           AND d.document_kind = 'spreadsheet_model' AND d.status = 'ready'
+         ORDER BY d.created_at DESC LIMIT 1`,
+        [req.params.id],
+      );
+      const documentId = docRes.rows[0]?.document_id;
+      if (documentId) {
+        const { listFindings, findingCellKey } = await import("../services/dataQuality.js");
+        const findings = await listFindings(documentId);
+        if (findings.length > 0) {
+          const bindings = await pool.query<{
+            binding_slug: string;
+            sheet: string;
+            cell: string | null;
+            active_cell: string | null;
+          }>(
+            `SELECT binding_slug, sheet, cell, active_cell FROM model_bindings
+             WHERE document_id = $1 AND binding_kind = 'lever'`,
+            [documentId],
+          );
+          const cellsBySlug = new Map(
+            bindings.rows.map((b) => [
+              b.binding_slug,
+              [b.cell, b.active_cell]
+                .filter((c): c is string => Boolean(c))
+                .map((c) => findingCellKey(b.sheet, c)),
+            ]),
+          );
+          const findingsByCell = new Map<string, typeof findings>();
+          for (const f of findings) {
+            for (const cell of f.cells) {
+              const key = findingCellKey(f.sheet, cell);
+              const list = findingsByCell.get(key);
+              if (list) list.push(f);
+              else findingsByCell.set(key, [f]);
+            }
+          }
+          parameters = parameters.map((p) => {
+            const keys = cellsBySlug.get(p.mapped_variable_id) ?? [];
+            const matched = keys.flatMap((k) => findingsByCell.get(k) ?? []);
+            return matched.length > 0 ? { ...p, data_quality: matched } : p;
+          });
+        }
+      }
+    } catch (e) {
+      logger.warn({ err: e }, "[Parameters] data-quality annotation skipped");
     }
 
     return res.json({ parameters });
@@ -1002,7 +1148,10 @@ scenariosRouter.post("/:id/approve", requireRole("approver"), async (req, res) =
         );
         await client.query("COMMIT");
         return res.status(403).json({
-          error: "Maker-checker: the scenario creator cannot approve it",
+          error:
+            "Maker-checker is enabled: the scenario creator cannot approve their own scenario. " +
+            "Have a second approver review it, or set ENFORCE_MAKER_CHECKER=false " +
+            "(not permitted when DEPLOYMENT_PROFILE=enterprise).",
         });
       }
 
@@ -1014,10 +1163,40 @@ scenariosRouter.post("/:id/approve", requireRole("approver"), async (req, res) =
         await client.query("ROLLBACK");
         return res.status(400).json({ error: "No parameters to approve" });
       }
-      const hasAccepted = params.rows.some((p: { status: string }) => p.status === "accepted");
+      const hasAccepted = params.rows.some(
+        (p: { status: string }) => p.status === "accepted" || p.status === "modified",
+      );
       if (!hasAccepted) {
-        await client.query("ROLLBACK");
-        return res.status(400).json({ error: "At least one parameter must be accepted before approval" });
+        // Auto-accept parameters the binding probe raised no concern about, so a
+        // clean extraction does not require a manual tick on every row. Anything
+        // flagged needs_review still has to be looked at, which is the case worth
+        // stopping for.
+        const promoted = await client.query(
+          `UPDATE scenario_parameters
+           SET status = 'accepted'
+           WHERE scenario_id = $1 AND status = 'pending' AND needs_review = false
+           RETURNING parameter_id`,
+          [sid],
+        );
+        if (promoted.rows.length === 0) {
+          const flagged = params.rows.length;
+          await client.query("ROLLBACK");
+          return res.status(400).json({
+            error:
+              `No parameters are ready to approve. ${flagged} parameter(s) are pending review — ` +
+              `open Review Parameters, resolve the flagged bindings, and accept the ones you want to run.`,
+            needs_review: true,
+          });
+        }
+        await logAudit(
+          sid,
+          "parameters_auto_accepted",
+          { count: promoted.rows.length },
+          userId,
+          undefined,
+          undefined,
+          client,
+        );
       }
 
       const updated = await client.query(
@@ -1082,9 +1261,21 @@ scenariosRouter.post("/:id/run", requireRole("analyst"), async (req, res) => {
         return res.status(409).json({ error: "Simulation already in progress" });
       }
       if (priorStatus !== "approved" && priorStatus !== "completed") {
+        const pending = await lockClient.query(
+          `SELECT parameter_id, mapped_variable_id, status, needs_review
+           FROM scenario_parameters
+           WHERE scenario_id = $1 AND status NOT IN ('accepted', 'modified', 'rejected')`,
+          [sid],
+        );
         await lockClient.query("ROLLBACK");
         return res.status(400).json({
-          error: "Scenario must be approved before running. Accept parameters and click Approve first.",
+          error:
+            `Scenario is '${priorStatus}' and must be approved before running.` +
+            (pending.rows.length > 0
+              ? ` ${pending.rows.length} parameter(s) still need a decision.`
+              : " Click Approve to continue."),
+          status: priorStatus,
+          blocking_parameters: pending.rows,
         });
       }
 

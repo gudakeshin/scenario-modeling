@@ -204,3 +204,25 @@ html {
 .panel-gradient {
   background: linear-gradient(180deg, var(--panel-bg) 0%, var(--background) 100%);
 }
+
+/* Expanded analysis panel entrance */
+@keyframes modalIn {
+  from { opacity: 0; transform: scale(0.97) translateY(8px); }
+  to   { opacity: 1; transform: scale(1)    translateY(0); }
+}
+.analysis-modal-card {
+  animation: modalIn 150ms ease-out;
+}
+
+/* Respect the OS "reduce motion" setting: neutralise entrance animations,
+   spinners and bouncing dots rather than leaving them to loop. */
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+}

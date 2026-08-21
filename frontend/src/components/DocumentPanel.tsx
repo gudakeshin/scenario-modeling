@@ -12,6 +12,8 @@ import {
   type RAGSource,
 } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
+import { useConfirm } from "@/hooks/useConfirm";
+import { toast } from "sonner";
 import { MarkdownContent } from "./MarkdownContent";
 
 interface DocumentPanelProps {
@@ -38,6 +40,8 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   const [asking, setAsking] = useState(false);
   const [showSources, setShowSources] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const { confirm, confirmDialog } = useConfirm();
   const [conversationId, setConversationId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
@@ -51,8 +55,9 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
     try {
       const docs = await listDocuments();
       setDocuments(docs);
-    } catch {
-      // Silently fail if API not ready
+      setLoadError(null);
+    } catch (e) {
+      setLoadError((e as Error).message || "Could not load documents.");
     }
   }, []);
 
@@ -133,12 +138,21 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   }, []);
 
   const handleDelete = async (docId: string) => {
+    const name = documents.find((d) => d.document_id === docId)?.name ?? "this document";
+    const ok = await confirm({
+      title: "Delete document?",
+      description: `"${name}" will be removed from this workspace and can no longer be queried.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await deleteDocument(docId);
       setDocuments((prev) => prev.filter((d) => d.document_id !== docId));
       if (selectedDocId === docId) setSelectedDocId(null);
-    } catch {
-      // ignore
+      toast.success(`Deleted ${name}`);
+    } catch (e) {
+      toast.error("Delete failed", { description: (e as Error).message });
     }
   };
 
@@ -190,6 +204,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   const selectedDoc = documents.find((d) => d.document_id === selectedDocId);
 
   return (
+    <>
     <div className="p-5">
       <PanelHeader
         title="Talk to Documents"
@@ -217,7 +232,17 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
         onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={() => setDragOver(false)}
         onDrop={handleDrop}
-        onClick={() => fileInputRef.current?.click()}
+        onClick={() => { if (!uploading) fileInputRef.current?.click(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            if (!uploading) fileInputRef.current?.click();
+          }
+        }}
+        role="button"
+        tabIndex={uploading ? -1 : 0}
+        aria-disabled={uploading}
+        aria-label="Upload documents: drag and drop files here, or activate to browse"
       >
         <input
           ref={fileInputRef}
@@ -228,7 +253,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
           className="hidden"
         />
         {uploading ? (
-          <div className="flex items-center justify-center gap-2 text-sm text-accent">
+          <div className="flex items-center justify-center gap-2 text-sm text-accent" aria-live="polite" aria-atomic="true">
             <svg className="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
@@ -254,6 +279,19 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
       )}
 
       {/* ── Document List ── */}
+      {loadError && (
+        <div role="alert" className="mb-3 flex items-center justify-between gap-3 rounded-lg bg-[var(--danger-bg)] px-3 py-2 text-sm text-[var(--danger)]">
+          <span>{loadError}</span>
+          <button
+            type="button"
+            onClick={() => void loadDocuments()}
+            className="shrink-0 rounded-lg border border-[var(--danger)]/30 px-2.5 py-1 text-xs font-medium hover:bg-[var(--danger-bg)]"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {documents.length > 0 && (
         <div className="mb-4">
           <div className="flex items-center justify-between mb-2">
@@ -301,8 +339,9 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
                 <button
                   type="button"
                   onClick={(e) => { e.stopPropagation(); handleDelete(doc.document_id); }}
-                  className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--danger-bg)] transition-all"
+                  className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 w-6 h-6 rounded flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--danger-bg)] transition-all"
                   title="Delete document"
+                  aria-label={`Delete ${doc.name}`}
                 >
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
                     <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
@@ -439,5 +478,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
         </div>
       </div>
     </div>
+    {confirmDialog}
+    </>
   );
 }

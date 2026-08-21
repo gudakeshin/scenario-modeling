@@ -39,8 +39,8 @@ services:
       JWT_ISSUER: scenario-modeling
       JWT_AUDIENCE: scenario-modeling-api
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:3000}
-      # Required in production (fail-fast).
-      HYPERFORMULA_LICENSE_KEY: ${HYPERFORMULA_LICENSE_KEY:?Set HYPERFORMULA_LICENSE_KEY in the environment or a .env file}
+      # gpl-v3 is the valid key for this non-commercial product (ADR 0005).
+      HYPERFORMULA_LICENSE_KEY: ${HYPERFORMULA_LICENSE_KEY:-gpl-v3}
       METRICS_TOKEN: ${METRICS_TOKEN:?Set METRICS_TOKEN in the environment or a .env file}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in the environment or a .env file}
       ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-haiku-4-5-20251001}
@@ -85,7 +85,7 @@ services:
       DATABASE_URL: postgresql://postgres:postgres@postgres:5432/scenario_modeling
       REDIS_URL: ${REDIS_URL:-redis://redis:6379}
       JWT_SECRET: ${JWT_SECRET:?Set JWT_SECRET in the environment or a .env file}
-      HYPERFORMULA_LICENSE_KEY: ${HYPERFORMULA_LICENSE_KEY:?Set HYPERFORMULA_LICENSE_KEY in the environment or a .env file}
+      HYPERFORMULA_LICENSE_KEY: ${HYPERFORMULA_LICENSE_KEY:-gpl-v3}
       METRICS_TOKEN: ${METRICS_TOKEN:?Set METRICS_TOKEN in the environment or a .env file}
       ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:?Set ANTHROPIC_API_KEY in the environment or a .env file}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://frontend:3000}

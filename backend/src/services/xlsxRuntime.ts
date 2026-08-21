@@ -33,7 +33,20 @@ interface LeverBinding extends CellAddress {
   label: string;
   base: number;
   sheet: string;
+  /** The lever's own (Base) address — what the workbook calls this driver. */
   cell: string;
+  /** The address actually written; equals `cell` unless the block has an Active twin. */
+  writeCell: string;
+  /** Pre-qualification ids this lever also answers to. */
+  aliases?: string[];
+  /**
+   * True when {row,col} is the block's "Active" cell rather than its Base cell.
+   * Scenario-variant blocks compute Active = IF(toggle="Bull", …), and every
+   * downstream formula reads Active. Writing the Base cell only takes effect
+   * while the toggle happens to sit on Base — otherwise the override silently
+   * vanishes. Writing Active is correct under every toggle position.
+   */
+  writesActive: boolean;
 }
 
 interface OutputBinding extends CellAddress {
@@ -41,6 +54,12 @@ interface OutputBinding extends CellAddress {
   label: string;
   sheet: string;
   cell: string;
+  /**
+   * The workbook's own period-total cell for this row. Read for the headline
+   * P&L so the aggregate is the workbook's arithmetic rather than a re-sum of
+   * evaluated periods (and never a single period masquerading as the year).
+   */
+  aggregate?: CellAddress & { cell: string };
 }
 
 export interface XlsxModelSchemaLike {
@@ -49,6 +68,10 @@ export interface XlsxModelSchemaLike {
     label?: string;
     sheet?: string;
     cell?: string;
+    /** "Active" column twin driven by a scenario toggle. */
+    activeCell?: string;
+    /** Bare label id from before block qualification. */
+    aliasId?: string;
     scenarios?: { base?: number };
   }>;
   outputMetrics?: Array<{
@@ -57,6 +80,8 @@ export interface XlsxModelSchemaLike {
     sheet?: string;
     row?: number;
     cell?: string;
+    /** Workbook's own period-total cell for this row (e.g. P&L!O4). */
+    aggregateCell?: string;
   }>;
   baseValues?: Record<string, number>;
 }
@@ -67,6 +92,7 @@ export type RuntimeFailureReason =
   | "hyperformula_build"
   | "no_lever_bindings"
   | "no_output_bindings"
+  | "duplicate_lever_ids"
   | "evaluation_error";
 
 export interface RuntimeBuildResult {
@@ -115,6 +141,9 @@ export function labelSimilarity(a: string, b: string): number {
 }
 
 const LABEL_MATCH_THRESHOLD = 0.25;
+
+/** Overrides probed individually for "moved nothing" before we stop. */
+const MAX_INERT_PROBES = 25;
 
 function toId(label: string): string {
   return label.toLowerCase().replace(/[^a-z0-9]+/g, "_").replace(/^_+|_+$/g, "");
@@ -301,6 +330,14 @@ export class XlsxModelRuntime implements EvaluableModel {
 
   private hf: HyperFormula;
   private levers: Map<string, LeverBinding>;
+  /**
+   * Bare pre-qualification ids → lever id, for ids that map to exactly one
+   * lever. Scenarios saved before block qualification store the bare label
+   * ("material_cost_of_nsp"), and those should still resolve. Ambiguous ones
+   * ("bullet", claimed by both the volume and price blocks) are deliberately
+   * absent: guessing between two cells is how the original bug behaved.
+   */
+  private leverAliases: Map<string, string>;
   private outputs: OutputBinding[];
   private timeAxis: WorkbookGraph["timeAxis"] | null;
   private periodColumns: PeriodColumn[];
@@ -314,6 +351,22 @@ export class XlsxModelRuntime implements EvaluableModel {
   ) {
     this.hf = hf;
     this.levers = new Map(levers.map((l) => [l.id, l]));
+
+    const aliasCounts = new Map<string, string[]>();
+    for (const lever of levers) {
+      for (const alias of lever.aliases ?? []) {
+        const key = toId(alias);
+        if (!key || this.levers.has(key)) continue;
+        const seen = aliasCounts.get(key);
+        if (seen) seen.push(lever.id);
+        else aliasCounts.set(key, [lever.id]);
+      }
+    }
+    this.leverAliases = new Map(
+      [...aliasCounts.entries()]
+        .filter(([, ids]) => new Set(ids).size === 1)
+        .map(([alias, ids]) => [alias, ids[0]] as const),
+    );
     this.outputs = outputs;
     this.timeAxis = timeAxis;
     this.periodColumns = periodColumns;
@@ -428,15 +481,28 @@ export class XlsxModelRuntime implements EvaluableModel {
       }
     }
 
-    const candidateById = new Map(
-      (graph.inputCandidates || []).map((c) => [toId(c.id || c.label || ""), c]),
-    );
-    const outputCandidateById = new Map(
-      (graph.outputCandidates || []).map((c) => [toId(c.id || c.label || ""), c]),
-    );
+    // Index by both the current (block-qualified) id and the bare alias, so a
+    // model_schema persisted before block qualification still resolves.
+    const indexCandidates = <T extends { id?: string; label?: string; aliasId?: string }>(
+      list: T[] | undefined,
+    ): Map<string, T> => {
+      const map = new Map<string, T>();
+      for (const c of list || []) {
+        const primary = toId(c.id || c.label || "");
+        if (primary) map.set(primary, c);
+      }
+      for (const c of list || []) {
+        const alias = c.aliasId ? toId(c.aliasId) : "";
+        if (alias && !map.has(alias)) map.set(alias, c);
+      }
+      return map;
+    };
+    const candidateById = indexCandidates(graph.inputCandidates);
+    const outputCandidateById = indexCandidates(graph.outputCandidates);
 
     const levers: LeverBinding[] = [];
     const unboundLevers: string[] = [];
+    const duplicateLeverIds: string[] = [];
     for (const lever of schema.scenarioLevers || []) {
       const id = toId(lever.id);
       const cand = candidateById.get(id);
@@ -453,21 +519,50 @@ export class XlsxModelRuntime implements EvaluableModel {
         errors.push(`Lever '${id}' cell ${sheet}!${cell} could not be resolved`);
         continue;
       }
+      // Bind the Active cell when the block has one, so overrides apply under
+      // every scenario-toggle position rather than only on the Base branch.
+      const activeRef = lever.activeCell || cand?.activeCell;
+      const activePos = activeRef ? parseCellRef(activeRef) : null;
+      const writesActive = Boolean(activePos);
+      const targetPos = activePos ?? pos;
+      const targetCell = activePos ? activeRef! : cell;
+
       // Prefer the live cell value so percent-override math stays unit-consistent
       // even when persisted model_schema still carries ×10 canonicalized bases.
-      const cellVal = hf.getCellValue({ sheet: sheetId, row: pos.row, col: pos.col });
+      const cellVal = hf.getCellValue({ sheet: sheetId, row: targetPos.row, col: targetPos.col });
       const baseFromCell =
         typeof cellVal === "number" && Number.isFinite(cellVal) ? cellVal : null;
-      levers.push({
+      const binding: LeverBinding = {
         id,
         label: lever.label || lever.id,
         base: baseFromCell ?? Number(lever.scenarios?.base ?? cand?.value ?? 0),
         sheetId,
-        row: pos.row,
-        col: pos.col,
+        row: targetPos.row,
+        col: targetPos.col,
         sheet,
         cell,
-      });
+        writeCell: targetCell,
+        writesActive,
+        aliases: [lever.aliasId, cand?.aliasId].filter(
+          (a): a is string => Boolean(a) && toId(a!) !== id,
+        ),
+      };
+
+      // A duplicate id means two different cells claim the same lever. Silently
+      // keeping the last one binds a cell whose base differs from the one the
+      // caller sees, turning "+7.5%" into an arbitrary multiple. Refuse instead.
+      const clash = levers.find((l) => l.id === id);
+      if (clash) {
+        if (clash.sheet === binding.sheet && clash.cell === binding.cell) continue;
+        duplicateLeverIds.push(id);
+        errors.push(
+          `Lever id '${id}' is claimed by two cells (${clash.sheet}!${clash.cell} base ${clash.base}, ` +
+            `${binding.sheet}!${binding.cell} base ${binding.base}). ` +
+            `Re-ingest the workbook so block-qualified ids are assigned.`,
+        );
+        continue;
+      }
+      levers.push(binding);
     }
 
     const outputs: OutputBinding[] = [];
@@ -497,6 +592,8 @@ export class XlsxModelRuntime implements EvaluableModel {
         errors.push(`Output '${id}' cell ${sheet}!${cell} could not be resolved`);
         continue;
       }
+      const aggregateRef = metric.aggregateCell || (cand && "aggregateCell" in cand ? cand.aggregateCell : undefined);
+      const aggregatePos = aggregateRef ? parseCellRef(aggregateRef) : null;
       outputs.push({
         id,
         label: metric.label || metric.id,
@@ -505,7 +602,35 @@ export class XlsxModelRuntime implements EvaluableModel {
         col: pos.col,
         sheet,
         cell,
+        ...(aggregatePos && aggregateRef
+          ? {
+              aggregate: {
+                sheetId,
+                row: aggregatePos.row,
+                col: aggregatePos.col,
+                cell: aggregateRef,
+              },
+            }
+          : {}),
       });
+    }
+
+    // A duplicate id means overrides would write a cell whose base differs from
+    // the one reported to the caller. Returning a usable runtime here left the
+    // problem visible only to the validation endpoint, so a workbook already
+    // marked ready kept simulating with a lever silently dropped.
+    if (duplicateLeverIds.length > 0) {
+      return {
+        runtime: null,
+        ok: false,
+        reason: "duplicate_lever_ids",
+        errors,
+        warnings,
+        boundLevers: levers.map((l) => l.id),
+        boundOutputs: outputs.map((o) => o.id),
+        unboundLevers,
+        unboundOutputs,
+      };
     }
 
     if (levers.length === 0) {
@@ -593,6 +718,31 @@ export class XlsxModelRuntime implements EvaluableModel {
   }
 
   /**
+   * Outputs that belong on a reported P&L.
+   *
+   * `outputIds` also carries derived rows harvested from working schedules — a
+   * unit count like `fy23_total` on a volume sheet. Running plausibility checks
+   * over those produces findings about quantities that were never part of the
+   * financial statement, which reads as noise next to the real ones.
+   */
+  get reportableOutputIds(): string[] {
+    const axisSheet = this.timeAxis?.sheet;
+    if (!axisSheet) return this.outputIds;
+    const onAxisSheet = this.outputs.filter((o) => o.sheet === axisSheet).map((o) => o.id);
+    return onAxisSheet.length > 0 ? onAxisSheet : this.outputIds;
+  }
+
+  /**
+   * Outputs whose annual figure comes from the workbook's own total column.
+   * Callers must not re-sum these from evaluated periods — that would replace
+   * the workbook's arithmetic with their own and double-count any total column
+   * still present in the period set.
+   */
+  get outputsWithWorkbookTotal(): Set<string> {
+    return new Set(this.outputs.filter((o) => o.aggregate).map((o) => o.id));
+  }
+
+  /**
    * Directional probe: perturb each lever +1%, record which outputs move.
    * Label-anchor: fuzzy-match lever label vs extractor row label.
    */
@@ -653,28 +803,81 @@ export class XlsxModelRuntime implements EvaluableModel {
     return evidence;
   }
 
+  /**
+   * Overrides that bind a real lever but move nothing.
+   *
+   * An override matching no lever id is already reported via
+   * lastIgnoredOverrides. The quieter failure is an override that binds
+   * cleanly to a cell no output depends on: the run succeeds, the number is
+   * unchanged, and the report implies the lever was applied. Each override is
+   * evaluated on its own so the finding is per-lever rather than "nothing moved".
+   */
+  findInertOverrides(absoluteOverrides: Record<string, number>): Array<{
+    id: string;
+    sheet: string;
+    cell: string;
+  }> {
+    // One full recalculation per override. Bounded so a wide scenario on a large
+    // workbook cannot spend the whole simulation budget here; beyond the cap the
+    // persisted probe evidence already answers the same question.
+    const candidates = Object.entries(absoluteOverrides).slice(0, MAX_INERT_PROBES);
+    const baseline = this.evaluate({});
+    const inert: Array<{ id: string; sheet: string; cell: string }> = [];
+
+    for (const [id, value] of candidates) {
+      const binding = this.resolveLever(id);
+      if (!binding || !Number.isFinite(value)) continue;
+      if (value === binding.base) continue; // not a change, so not a finding
+      const probed = this.evaluate({ [id]: value });
+      const moved = this.outputs.some((out) => {
+        const before = baseline[out.id];
+        const after = probed[out.id];
+        if (!Number.isFinite(before) || !Number.isFinite(after)) return false;
+        return Math.abs(after - before) > Math.max(1e-9, Math.abs(before) * 1e-9);
+      });
+      if (!moved) inert.push({ id, sheet: binding.sheet, cell: binding.cell });
+    }
+
+    return inert;
+  }
+
+  /**
+   * Canonical lever id for an override id, or undefined when it matches nothing.
+   * Exposed so override resolution reads bases from the same lever the write
+   * will land on.
+   */
+  resolveInputId(id: string): string | undefined {
+    return this.resolveLever(id)?.id;
+  }
+
+  /** Resolve an override id to a lever, falling back to unambiguous aliases. */
+  private resolveLever(id: string): LeverBinding | undefined {
+    const key = toId(id);
+    const direct = this.levers.get(key);
+    if (direct) return direct;
+    const aliased = this.leverAliases.get(key);
+    return aliased ? this.levers.get(aliased) : undefined;
+  }
+
   evaluate(absoluteOverrides: Record<string, number>): Record<string, number> {
     this.lastEvaluationErrors.length = 0;
     this.lastIgnoredOverrides.length = 0;
-    const touched: Array<{ binding: LeverBinding; previous: unknown }> = [];
+    // Restore via getCellSerialized (formula text or raw value). getCellValue would
+    // bake computed numbers back into formula cells and permanently break the DAG —
+    // especially when probeBindings temporarily writes every lever.
+    const touched: Array<{ binding: LeverBinding; previous: string | number | boolean | null }> = [];
 
     try {
       for (const [id, value] of Object.entries(absoluteOverrides)) {
-        const binding = this.levers.get(toId(id));
+        const binding = this.resolveLever(id);
         if (!binding || !Number.isFinite(value)) {
           if (Number.isFinite(value)) this.lastIgnoredOverrides.push(id);
           continue;
         }
-        const previous = this.hf.getCellValue({
-          sheet: binding.sheetId,
-          row: binding.row,
-          col: binding.col,
-        });
-        this.hf.setCellContents(
-          { sheet: binding.sheetId, row: binding.row, col: binding.col },
-          [[value]],
-        );
-        touched.push({ binding, previous });
+        const addr = { sheet: binding.sheetId, row: binding.row, col: binding.col };
+        const previous = this.hf.getCellSerialized(addr);
+        this.hf.setCellContents(addr, [[value]]);
+        touched.push({ binding, previous: previous as string | number | boolean | null });
       }
 
       const result: Record<string, number> = {};
@@ -688,9 +891,14 @@ export class XlsxModelRuntime implements EvaluableModel {
         }
       }
       for (const out of this.outputs) {
-        const v = this.hf.getCellValue({ sheet: out.sheetId, row: out.row, col: out.col });
+        // Read the workbook's own period-total when it has one. Without this the
+        // headline P&L is whichever single column the row was bound to — on a
+        // monthly model that is April presented as the full year.
+        const addr = out.aggregate ?? out;
+        const label = out.aggregate ? out.aggregate.cell : out.cell;
+        const v = this.hf.getCellValue({ sheet: addr.sheetId, row: addr.row, col: addr.col });
         if (isCellError(v)) {
-          this.lastEvaluationErrors.push(`Output ${out.id} (${out.sheet}!${out.cell}): ${cellErrorMessage(v)}`);
+          this.lastEvaluationErrors.push(`Output ${out.id} (${out.sheet}!${label}): ${cellErrorMessage(v)}`);
           // Do not silently invent 0 — use NaN marker converted to nullish handling upstream;
           // keep numeric contract with NaN filtered by callers via Number.isFinite checks.
           result[out.id] = Number.NaN;
@@ -698,7 +906,7 @@ export class XlsxModelRuntime implements EvaluableModel {
           result[out.id] = v;
         } else {
           this.lastEvaluationErrors.push(
-            `Output ${out.id} (${out.sheet}!${out.cell}) is non-numeric: ${String(v)}`,
+            `Output ${out.id} (${out.sheet}!${label}) is non-numeric: ${String(v)}`,
           );
           result[out.id] = Number.NaN;
         }
@@ -725,13 +933,17 @@ export class XlsxModelRuntime implements EvaluableModel {
     }
 
     this.lastEvaluationErrors.length = 0;
-    const touched: Array<{ binding: LeverBinding; previous: unknown }> = [];
+    // Restore via getCellSerialized (formula text or raw value), matching
+    // evaluate(). getCellValue returns the *computed* number, so restoring with
+    // it bakes a constant into any formula-backed lever cell and permanently
+    // breaks the DAG for every later run served from the cached runtime.
+    const touched: Array<{ binding: LeverBinding; previous: string | number | boolean | null }> = [];
 
     try {
       for (const [id, value] of Object.entries(absoluteOverrides)) {
-        const binding = this.levers.get(toId(id));
+        const binding = this.resolveLever(id);
         if (!binding || !Number.isFinite(value)) continue;
-        const previous = this.hf.getCellValue({
+        const previous = this.hf.getCellSerialized({
           sheet: binding.sheetId,
           row: binding.row,
           col: binding.col,
@@ -740,7 +952,7 @@ export class XlsxModelRuntime implements EvaluableModel {
           { sheet: binding.sheetId, row: binding.row, col: binding.col },
           [[value]],
         );
-        touched.push({ binding, previous });
+        touched.push({ binding, previous: previous as string | number | boolean | null });
       }
 
       const leverValues: Record<string, number> = {};

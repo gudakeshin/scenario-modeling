@@ -2,7 +2,7 @@ import { describe, it, expect, vi } from "vitest";
 import { render } from "@testing-library/react";
 import axe from "axe-core";
 import { Stepper } from "./Stepper";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { ConfirmDialog } from "../ConfirmDialog";
 import { ProviderPicker } from "./ProviderPicker";
 
 describe("Data & Models primitives accessibility", () => {

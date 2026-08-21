@@ -13,9 +13,11 @@ import { DimensionalModel } from "./dimensionalModel.js";
 import { simulationsRun } from "../metrics.js";
 import { logger } from "../logger.js";
 import { config } from "../config.js";
+import { canonicalMetricId, withCanonicalMetrics } from "./metricTypes.js";
 import {
   aggregatePeriodPlDetailed,
   aggregateXlsxPeriodPl,
+  detectPeriodOutliers,
   hasPeriodGrowth,
   periodOverrides,
 } from "./simulationAggregation.js";
@@ -86,6 +88,16 @@ export const CORE_OUTPUT_IDS = new Set([
   "gross_profit",
 ]);
 
+/**
+ * True when a model-specific id stands for a core P&L metric.
+ * Matching on the literal id alone let "gross_revenue" through unguarded.
+ */
+function isCoreOutput(id: string): boolean {
+  if (CORE_OUTPUT_IDS.has(id)) return true;
+  const canonical = canonicalMetricId(id);
+  return canonical != null && CORE_OUTPUT_IDS.has(canonical);
+}
+
 export class SimulationFiniteError extends Error {
   constructor(
     message: string,
@@ -110,6 +122,24 @@ function isFiniteNumber(n: unknown): n is number {
   return typeof n === "number" && Number.isFinite(n);
 }
 
+const MONTH_HEADER = /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*/i;
+const QUARTER_HEADER = /\bq[1-4]\b/i;
+
+/**
+ * Name the calendar from the axis labels themselves.
+ *
+ * Counting columns alone mislabels anything that is neither monthly nor
+ * quarterly — a six-column half-year axis would be reported as monthly. Read
+ * the labels first and only fall back to the count when they say nothing.
+ */
+export function inferAxisGranularity(columns: string[]): "monthly" | "quarterly" {
+  const months = columns.filter((c) => MONTH_HEADER.test(c)).length;
+  const quarters = columns.filter((c) => QUARTER_HEADER.test(c)).length;
+  if (quarters > months) return "quarterly";
+  if (months > 0) return "monthly";
+  return columns.length > 6 ? "monthly" : "quarterly";
+}
+
 /**
  * Copy finite metrics into `out`, listing non-finite ones in `errors`.
  * Persists full float64 — round only at display/serialization edges.
@@ -129,7 +159,7 @@ export function collectFiniteMetrics(
         raw_value: raw,
         reason: raw == null ? "missing" : Number.isNaN(raw as number) ? "NaN" : "non_finite",
       });
-      if (CORE_OUTPUT_IDS.has(id)) coreFailed = true;
+      if (isCoreOutput(id)) coreFailed = true;
     }
   }
   // Also flag missing core outputs that were expected in source keys
@@ -204,11 +234,40 @@ async function applyFidelityGuard(
   pl: Record<string, number>,
   basePl: Record<string, number>,
   notices: string[],
-  context?: { scenarioId?: string; modelSummary?: string },
+  context?: {
+    scenarioId?: string;
+    modelSummary?: string;
+    /**
+     * Report invariant findings without rewriting any value.
+     *
+     * Required on the XLSX path: those numbers are the workbook's own
+     * arithmetic, and Excel parity is the contract. Repairing a value there
+     * substitutes our formula for the model's — it silently replaced a
+     * workbook-computed margin of 0.349 (a fraction) with a recomputed 35.25
+     * (a percent), which then read as a +8,858% move against the base.
+     * Repairs remain appropriate for LLM-assembled formula models.
+     */
+    reportOnly?: boolean;
+  },
 ): Promise<{ pl: Record<string, number>; fidelity: FidelityBlock; agentFindings?: InvariantViolation[] }> {
-  const { pl: normalized, applied, residualViolations } = attemptDeterministicNormalization(pl);
-  Object.assign(pl, normalized);
-  notices.push(...fidelityNotices(applied, residualViolations));
+  // Invariants are written against canonical ids (revenue, cogs, ebitda…). A
+  // workbook that reports "gross_revenue" and "material_vehicle_cost" matched
+  // none of them, so every ordering and margin check silently passed. Check the
+  // canonical projection instead.
+  const canonicalView = withCanonicalMetrics(pl);
+  const { pl: normalized, applied, residualViolations } =
+    attemptDeterministicNormalization(canonicalView);
+  // Only write back ids the model itself reports. Canonical aliases exist to
+  // make the checks fire, not to rewrite the workbook's own vocabulary — and on
+  // the XLSX path the workbook's arithmetic is the contract.
+  if (!context?.reportOnly) {
+    for (const [id, value] of Object.entries(normalized)) {
+      if (id in pl && Number.isFinite(value)) pl[id] = value;
+    }
+  }
+  notices.push(
+    ...fidelityNotices(context?.reportOnly ? [] : applied, residualViolations),
+  );
 
   let residual = residualViolations;
   if (residual.length > 0 && config.FIDELITY_AGENT_ENABLED) {
@@ -233,7 +292,7 @@ async function applyFidelityGuard(
 
   return {
     pl,
-    fidelity: buildFidelityBlock(applied, residual),
+    fidelity: buildFidelityBlock(context?.reportOnly ? [] : applied, residual),
     agentFindings: residual,
   };
 }
@@ -311,6 +370,35 @@ export function economicConsistencyWarnings(
   }
 
   return warnings;
+}
+
+/**
+ * Report overrides that bound to a lever but moved no output.
+ *
+ * Without this the run reports success and the metric is simply unchanged,
+ * which reads as "the lever had no material impact" rather than "the lever was
+ * never wired to anything".
+ */
+function inertOverrideNotices(
+  runtime: unknown,
+  absolute: Record<string, number>,
+): string[] {
+  const finder = (runtime as {
+    findInertOverrides?: (o: Record<string, number>) => Array<{ id: string; sheet: string; cell: string }>;
+  }).findInertOverrides;
+  if (typeof finder !== "function") return [];
+  let inert: Array<{ id: string; sheet: string; cell: string }>;
+  try {
+    inert = finder.call(runtime, absolute);
+  } catch {
+    return [];
+  }
+  if (inert.length === 0) return [];
+  return [
+    `These parameters changed a model cell but moved no output metric: ` +
+      `${inert.map((i) => `${i.id} (${i.sheet}!${i.cell})`).join(", ")}. ` +
+      `The result below does not reflect them — re-map them to a driver the P&L depends on.`,
+  ];
 }
 
 function unresolvedNotices(unresolved: string[]): string[] {
@@ -440,6 +528,7 @@ export async function previewSimulationForScenario(
         ? (runtime as { lastEvaluationErrors: string[] }).lastEvaluationErrors
         : [];
     if (runtimeErrors.length > 0) notices.push(...runtimeErrors);
+    notices.push(...inertOverrideNotices(runtime, absolute));
 
     const pl: Record<string, number> = {};
     const errors: FormulaErrorMetric[] = [];
@@ -451,13 +540,23 @@ export async function previewSimulationForScenario(
     if (coreFailed) {
       throw new SimulationFiniteError("Preview failed: core metrics non-finite", errors);
     }
-    void baseOut;
+    // Return the base rather than discarding it: the What-If panel needs deltas
+    // and was issuing a second empty-override preview purely to recover this.
+    const basePl: Record<string, number> = {};
+    collectFiniteMetrics(
+      Object.fromEntries(runtime.outputIds.map((id) => [id, baseOut[id]])),
+      basePl,
+      [],
+    );
+    const previewAxis =
+      (runtime as { timeAxisRef?: { columns?: string[] } | null }).timeAxisRef?.columns ?? [];
     return {
       pl,
+      base_pl: basePl,
       variables: { ...pl },
       periods: [{ period: "FY", pl, variables: { ...pl } }],
       period_count: 1,
-      granularity: "quarterly",
+      granularity: inferAxisGranularity(previewAxis),
       simulation_mode: "xlsx_cell_graph",
       levers: leverList,
       ignored_overrides: [...new Set(ignored)],
@@ -472,11 +571,13 @@ export async function previewSimulationForScenario(
   const out = model.evaluate(absolute);
   const base = model.baseValues();
   const pl: Record<string, number> = {};
+  const basePl: Record<string, number> = {};
   const errors: FormulaErrorMetric[] = [];
   collectFiniteMetrics(out, pl, errors);
-  void base;
+  collectFiniteMetrics(base, basePl, []);
   return {
     pl,
+    base_pl: basePl,
     variables: { ...out },
     periods: [{ period: "Total", pl, variables: { ...out } }],
     period_count: 1,
@@ -681,6 +782,15 @@ async function _runXlsxSimulation(
 
   const baseOut = runtime.evaluate({});
   const scenarioOut = runtime.evaluate(absolute);
+  // Report the calendar the model actually has. "quarterly" was hardcoded here
+  // while the axis carried twelve monthly columns.
+  const axisColumns =
+    (runtime as { timeAxisRef?: { columns?: string[] } | null }).timeAxisRef?.columns ?? [];
+  const xlsxGranularity = inferAxisGranularity(axisColumns);
+  const workbookTotalIds =
+    "outputsWithWorkbookTotal" in runtime
+      ? (runtime as { outputsWithWorkbookTotal: Set<string> }).outputsWithWorkbookTotal
+      : new Set<string>();
 
   const pl: Record<string, number> = {};
   const basePl: Record<string, number> = {};
@@ -711,6 +821,7 @@ async function _runXlsxSimulation(
 
   const warnings = absurdityWarnings(basePl, pl, overrides);
   const notices = unresolvedNotices(unresolved);
+  notices.push(...inertOverrideNotices(runtime, absolute));
   const runtimeErrors =
     "lastEvaluationErrors" in runtime &&
     Array.isArray((runtime as { lastEvaluationErrors: string[] }).lastEvaluationErrors)
@@ -740,12 +851,23 @@ async function _runXlsxSimulation(
         // When multi-period, also aggregate base from evaluatePeriods({}) so
         // base_pl and scenario aggregate share the same column granularity.
         if (periods.length > 1) {
+          const reportableIds =
+            "reportableOutputIds" in runtime
+              ? (runtime as { reportableOutputIds: string[] }).reportableOutputIds
+              : runtime.outputIds;
+          notices.push(...detectPeriodOutliers(periods, reportableIds));
           const { aggregate: agg, warnings: aggWarnings } = aggregateXlsxPeriodPl(
             periods,
             runtime.outputIds,
           );
           notices.push(...aggWarnings);
-          Object.assign(pl, agg);
+          // Keep the workbook's own total where it has one; re-summing periods
+          // would substitute our arithmetic for Excel's. Outputs without a total
+          // column still need the period aggregate, otherwise the headline stays
+          // stuck on whichever single column the row was bound to.
+          for (const [id, value] of Object.entries(agg)) {
+            if (!workbookTotalIds.has(id)) pl[id] = value;
+          }
 
           const basePeriodSlices = evaluatePeriods({});
           if (basePeriodSlices.length > 1) {
@@ -761,7 +883,9 @@ async function _runXlsxSimulation(
               runtime.outputIds,
             );
             notices.push(...baseAggWarnings);
-            Object.assign(basePl, baseAgg);
+            for (const [id, value] of Object.entries(baseAgg)) {
+              if (!workbookTotalIds.has(id)) basePl[id] = value;
+            }
           }
         }
       }
@@ -786,17 +910,42 @@ async function _runXlsxSimulation(
     throw new SimulationFiniteError("Simulation failed: core P&L metrics are non-finite", formulaErrors);
   }
 
+  // Repeat the accepted data issues on every run. A number built on data
+  // somebody waved through should say so wherever it is read, not only in the
+  // panel where the decision was made.
+  if (resolved.documentId) {
+    try {
+      const { listFindings } = await import("./dataQuality.js");
+      const accepted = (await listFindings(resolved.documentId)).filter(
+        (f) => f.status === "acknowledged",
+      );
+      for (const f of accepted) {
+        notices.push(
+          `Accepted data issue — ${f.title} (${f.sheet}${f.cells.length ? `!${f.cells.join(", ")}` : ""})` +
+            `${f.note ? `: "${f.note}"` : ""}`,
+        );
+      }
+    } catch (e) {
+      logger.warn({ err: e }, "[Simulation] data-quality notices skipped");
+    }
+  }
+
   const fidelityResult = await applyFidelityGuard(pl, basePl, notices, {
     scenarioId,
     modelSummary: "xlsx_cell_graph",
+    reportOnly: true,
   });
+
+  const dedupedNotices = [...new Set(notices)];
+  notices.length = 0;
+  notices.push(...dedupedNotices);
 
   const outputData: Record<string, unknown> = {
     aggregate: pl,
     base_pl: basePl,
     periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
     ...(basePeriods ? { base_periods: basePeriods.map((p) => ({ period: p.period, pl: p.pl })) } : {}),
-    granularity: "quarterly",
+    granularity: xlsxGranularity,
     period_count: periods.length,
     simulation_mode: "xlsx_cell_graph",
     fidelity: fidelityResult.fidelity,
@@ -814,7 +963,7 @@ async function _runXlsxSimulation(
     variables,
     periods,
     period_count: periods.length,
-    granularity: "quarterly",
+    granularity: xlsxGranularity,
     simulation_mode: "xlsx_cell_graph",
     fidelity: fidelityResult.fidelity,
     status: "completed",

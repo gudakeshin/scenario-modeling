@@ -13,7 +13,13 @@ import {
   ReferenceLine,
 } from "recharts";
 
-import { METRIC_ORDER, METRIC_LABELS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import {
+  METRIC_ORDER,
+  METRIC_LABELS,
+  fmtCurrency,
+  getCurrencySymbol,
+  withCanonicalMetrics,
+} from "@/lib/metrics";
 import { chartColors, formatCompactCurrency } from "@/lib/chartTheme";
 import { ChartDataTable } from "./ChartDataTable";
 
@@ -40,13 +46,19 @@ interface WaterfallItem {
 }
 
 export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: WaterfallChartProps) {
+  // Models name their lines however the source workbook does. Project onto the
+  // canonical ids the bridge is defined in, or a P&L that says "gross_revenue"
+  // and "total_opex" renders as a single EBITDA bar.
+  const canonicalPl = useMemo(() => withCanonicalMetrics(pl), [pl]);
+  const canonicalBasePl = useMemo(() => withCanonicalMetrics(basePl), [basePl]);
+
   const data = useMemo(() => {
     const items: WaterfallItem[] = [];
     let running = 0;
 
     for (const metric of METRIC_ORDER) {
-      if (!(metric in pl)) continue;
-      const val = pl[metric];
+      if (!(metric in canonicalPl)) continue;
+      const val = canonicalPl[metric];
 
       if (metric === "revenue") {
         // Revenue is the starting bar
@@ -88,15 +100,15 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
     }
 
     return items;
-  }, [pl]);
+  }, [canonicalPl]);
 
   // Delta waterfall (if base provided)
   const deltaData = useMemo(() => {
     if (!basePl) return null;
     const items: WaterfallItem[] = [];
     for (const metric of METRIC_ORDER) {
-      if (!(metric in pl) || !(metric in basePl)) continue;
-      const delta = pl[metric] - basePl[metric];
+      if (!(metric in canonicalPl) || !(metric in canonicalBasePl)) continue;
+      const delta = canonicalPl[metric] - canonicalBasePl[metric];
       items.push({
         name: METRIC_LABELS[metric] || metric,
         value: delta,
@@ -107,7 +119,7 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
       });
     }
     return items;
-  }, [pl, basePl]);
+  }, [canonicalPl, canonicalBasePl, basePl]);
 
   const CustomTooltip = ({ active, payload }: { active?: boolean; payload?: Array<{ payload: WaterfallItem }> }) => {
     if (!active || !payload?.length) return null;

@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { PanelHeader } from "./PanelHeader";
+import { DataQualityFindings } from "./DataQualityPanel";
 import {
   uploadDocument,
   listDocuments,
@@ -20,6 +21,8 @@ import {
 } from "@/lib/api";
 import { getCurrencySymbol } from "@/lib/metrics";
 import { useUiStore } from "@/stores/uiStore";
+import { useConfirm } from "@/hooks/useConfirm";
+import { toast } from "sonner";
 
 type Tab = "documents" | "context" | "model";
 
@@ -63,6 +66,8 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   const [dragOver, setDragOver] = useState(false);
   const [editingVar, setEditingVar] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const { confirm, confirmDialog } = useConfirm();
 
   useEffect(() => {
     if (!docManagerInitialTab) return;
@@ -71,7 +76,12 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   }, [docManagerInitialTab, setDocManagerInitialTab]);
 
   const loadDocuments = useCallback(async () => {
-    try { setDocuments(await listDocuments()); } catch { /* ignore */ }
+    try {
+      setDocuments(await listDocuments());
+      setLoadError(null);
+    } catch (e) {
+      setLoadError((e as Error).message || "Could not load documents.");
+    }
   }, []);
 
   const loadContext = useCallback(async () => {
@@ -94,7 +104,9 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
     try {
       const { model: m } = await getActiveModel();
       setModel(m);
-    } catch { /* ignore */ }
+    } catch (e) {
+      setLoadError((e as Error).message || "Could not load the active model.");
+    }
   }, []);
 
   useEffect(() => { loadDocuments(); loadContext(); loadModel(); }, [loadDocuments, loadContext, loadModel]);
@@ -146,17 +158,52 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   }, []);
 
   const handleDelete = async (docId: string) => {
+    const doc = documents.find((d) => d.document_id === docId);
+    const name = doc?.name ?? doc?.original_filename ?? "this document";
+    const ok = await confirm({
+      title: "Delete document?",
+      description: `"${name}" will be removed from this workspace. Rebuild context afterwards so the model reflects the change.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await deleteDocument(docId);
       await loadDocuments();
-    } catch { /* ignore */ }
+      toast.success(`Deleted ${name}`);
+    } catch (e) {
+      toast.error("Delete failed", { description: (e as Error).message });
+    }
   };
 
   const handleDeleteAll = async () => {
+    const total = documents.length;
+    if (total === 0) return;
+    const ok = await confirm({
+      title: `Delete all ${total} document${total > 1 ? "s" : ""}?`,
+      description:
+        "Every uploaded document in this workspace is removed permanently. The company context and model built from them are left in place but will be stale.",
+      confirmLabel: `Delete all ${total}`,
+      danger: true,
+    });
+    if (!ok) return;
+
+    const failures: string[] = [];
     for (const doc of documents) {
-      try { await deleteDocument(doc.document_id); } catch { /* ignore */ }
+      try {
+        await deleteDocument(doc.document_id);
+      } catch (e) {
+        failures.push(`${doc.name}: ${(e as Error).message}`);
+      }
     }
     await loadDocuments();
+    if (failures.length === 0) {
+      toast.success(`Deleted ${total} document${total > 1 ? "s" : ""}`);
+    } else {
+      toast.error(`${failures.length} of ${total} could not be deleted`, {
+        description: failures.slice(0, 3).join("\n"),
+      });
+    }
   };
 
   const handleBuildContext = async () => {
@@ -175,11 +222,22 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   };
 
   const handleResetContext = async () => {
+    const ok = await confirm({
+      title: "Reset company context?",
+      description:
+        "The extracted company profile and the financial model built from it are discarded. Your uploaded documents are kept, but you will need to run Build Context again before any scenario can run.",
+      confirmLabel: "Reset context",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await deleteCompanyContext();
       setContext(null);
       setModel(null);
-    } catch { /* ignore */ }
+      toast.success("Company context reset");
+    } catch (e) {
+      toast.error("Reset failed", { description: (e as Error).message });
+    }
   };
 
   const handleValidateModel = async () => {
@@ -200,9 +258,20 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
       setTab("context");
       onContextBuilt?.();
     } catch (e) {
-      const err = e as Error & { fidelity?: FidelityReport };
+      const err = e as Error & {
+        fidelity?: FidelityReport;
+        dataQuality?: { blocking: Array<{ sheet: string; cells: string[]; title: string }> };
+      };
       if (err.fidelity) setFidelityReport(err.fidelity);
-      setBuildError(err.message);
+      const blocking = err.dataQuality?.blocking ?? [];
+      setBuildError(
+        blocking.length > 0
+          ? `${err.message} See Data Quality below: ` +
+            blocking
+              .map((f) => `${f.title} (${f.sheet}${f.cells.length ? `!${f.cells.join(", ")}` : ""})`)
+              .join("; ")
+          : err.message,
+      );
       await loadContext();
       setTab("context");
     } finally {
@@ -299,6 +368,7 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   const needsValidation = spreadsheetNeedsValidation || contextNeedsValidation;
 
   return (
+    <>
     <div className="p-5 max-h-[80vh] overflow-y-auto">
       <PanelHeader
         title="Document Manager"
@@ -349,7 +419,20 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
             onDrop={handleDrop}
             onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
             onDragLeave={() => setDragOver(false)}
+            onClick={() => { if (!uploading) fileRef.current?.click(); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                if (!uploading) fileRef.current?.click();
+              }
+            }}
+            role="button"
+            tabIndex={uploading ? -1 : 0}
+            aria-disabled={uploading}
+            aria-label="Upload documents: drag and drop files here, or activate to browse"
             className={`rounded-xl border-2 border-dashed p-6 text-center transition-all ${
+              uploading ? "cursor-default" : "cursor-pointer"
+            } ${
               dragOver ? "border-accent bg-accent/5" : "border-[var(--border)] hover:border-accent/40"
             }`}
           >
@@ -364,20 +447,39 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                 e.target.value = "";
               }}
             />
-            <p className="text-sm text-[var(--text-secondary)] mb-2">
+            <p className="text-sm text-[var(--text-secondary)] mb-2" aria-live="polite" aria-atomic="true">
               {uploading
                 ? (uploadProgress || "Uploading...")
                 : "Drag & drop files here, or click to browse"}
             </p>
-            <button type="button" onClick={() => fileRef.current?.click()} disabled={uploading} className="text-accent text-sm font-medium hover:underline">
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); fileRef.current?.click(); }}
+              disabled={uploading}
+              className="text-accent text-sm font-medium hover:underline disabled:opacity-40"
+            >
               Select Files
             </button>
             <p className="text-xs text-[var(--text-muted)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX, XLSM — max 50MB each · multiple files supported</p>
           </div>
 
           {uploadError && (
-            <div className="text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg whitespace-pre-line">
+            <div role="alert" className="text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg whitespace-pre-line">
               {uploadError}
+            </div>
+          )}
+
+          {/* D6 — a failed fetch must not look like "no documents yet" */}
+          {loadError && (
+            <div role="alert" className="flex items-center justify-between gap-3 text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg">
+              <span>{loadError}</span>
+              <button
+                type="button"
+                onClick={() => void loadDocuments()}
+                className="shrink-0 rounded-lg border border-[var(--danger)]/30 px-2.5 py-1 text-xs font-medium hover:bg-[var(--danger-bg)]"
+              >
+                Retry
+              </button>
             </div>
           )}
 
@@ -439,7 +541,7 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                       </div>
                     )}
                   </div>
-                  <button type="button" onClick={() => handleDelete(doc.document_id)} className="ml-2 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors" title="Delete">
+                  <button type="button" onClick={() => handleDelete(doc.document_id)} className="ml-2 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors" title="Delete" aria-label={`Delete ${doc.name}`}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                   </button>
                 </div>
@@ -487,6 +589,18 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                   </button>
                 </div>
               )}
+
+              {/*
+                Data issues come first: they are about the numbers the user just
+                uploaded, and they decide whether anything below can be trusted.
+                Structural ingestion detail sits underneath.
+              */}
+              <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">
+                  Data Quality
+                </span>
+                <DataQualityFindings onResolved={() => { void loadDocuments(); void loadContext(); }} />
+              </div>
 
               {(ingestionReport || context.context_data.ingestion_report) && (
                 <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
@@ -784,5 +898,7 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
         </div>
       )}
     </div>
+      {confirmDialog}
+    </>
   );
 }

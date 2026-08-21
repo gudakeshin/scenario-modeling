@@ -234,16 +234,57 @@ export async function getWorkspaceInputLeverIds(workspaceId: string): Promise<Se
   const ids = new Set<string>();
 
   const doc = await pool.query(
-    `SELECT model_schema FROM documents
+    `SELECT document_id, model_schema FROM documents
      WHERE workspace_id = $1 AND model_schema IS NOT NULL
      ORDER BY CASE WHEN validation_status = 'ready' THEN 0 ELSE 1 END, created_at DESC
      LIMIT 1`,
     [workspaceId],
   );
+
+  // Prefer reviewed bindings: only constant inputs that actually move an output
+  // are mappable. Offering every extracted row let a "raw material prices"
+  // request map onto product-family growth rates, which then reported success
+  // while changing nothing.
+  const documentId = doc.rows[0]?.document_id as string | undefined;
+  let usedBindings = false;
+  if (documentId) {
+    const bindingRes = await pool.query<{
+      binding_slug: string;
+      aliases: string[] | null;
+      sheet: string;
+      cell: string | null;
+      active_cell: string | null;
+    }>(
+      `SELECT binding_slug, aliases, sheet, cell, active_cell FROM model_bindings
+       WHERE document_id = $1
+         AND binding_kind = 'lever'
+         AND role = 'constant_input'
+         AND status <> 'rejected'
+         AND moves_outputs IS DISTINCT FROM false`,
+      [documentId],
+    );
+
+    // A lever sitting on data the user has not yet vouched for is not offered
+    // for mapping. Otherwise the model happily proposes a scenario built on a
+    // cell it has already been told is wrong.
+    const { openFindingCells, findingCellKey } = await import("./dataQuality.js");
+    const flagged = await openFindingCells(documentId);
+
+    for (const row of bindingRes.rows) {
+      const touchesFlagged = [row.cell, row.active_cell].some(
+        (c) => c && flagged.has(findingCellKey(row.sheet, c)),
+      );
+      if (touchesFlagged) continue;
+      ids.add(row.binding_slug);
+      for (const alias of row.aliases ?? []) ids.add(alias);
+    }
+    usedBindings = bindingRes.rows.length > 0;
+  }
+
   const schema = doc.rows[0]?.model_schema as
     | { scenarioLevers?: Array<{ id?: string }>; outputMetrics?: Array<{ id?: string }> }
     | null;
-  if (schema?.scenarioLevers?.length) {
+  if (!usedBindings && schema?.scenarioLevers?.length) {
     for (const lever of schema.scenarioLevers) {
       if (lever?.id) ids.add(lever.id);
     }

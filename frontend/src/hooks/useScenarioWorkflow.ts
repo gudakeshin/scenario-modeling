@@ -1,6 +1,7 @@
 "use client";
 
 import { useCallback, useEffect } from "react";
+import { toast } from "sonner";
 import {
   parseScenario,
   refineScenario,
@@ -17,7 +18,8 @@ import {
   type FollowUpAnswer,
 } from "@/lib/api";
 import { probePlanningConnectors } from "@/lib/features";
-import { setCurrency, getCurrencyLabel, fmtMetric, metricLabel, formatFidelityViolations } from "@/lib/metrics";
+import { buildRunReportSections } from "@/lib/runReport";
+import { setCurrency, getCurrencyLabel, fmtMetric, metricLabel } from "@/lib/metrics";
 import type { Message, ThinkingData, CausalChainStep, AgentTraceStep } from "@/types/chat";
 import { useChatStore } from "@/stores/chatStore";
 import { useUiStore } from "@/stores/uiStore";
@@ -62,10 +64,10 @@ export function useScenarioWorkflow() {
 
   const {
     onboardingStatus, isLoading,
-    setShowReview, setShowDocManager, setPreloadedInsight, setPeriodData,
+    openPanel, showPanel, closePanel, setExpandedPanel, closeAllPanels,
+    setPreloadedInsight, setPeriodData,
     setChartData, setPendingQuestions, setOnboardingStatus, bumpRefineKey,
-    setIsLoading, setExpandedPanel, closeAllPanels, setShowInsights,
-    setShowPeriods, setShowTemplates, setDimensionalPov, setDimensionalMetric,
+    setIsLoading, setDimensionalPov, setDimensionalMetric,
     openDocManagerForValidation,
   } = useUiStore();
 
@@ -182,7 +184,9 @@ export function useScenarioWorkflow() {
         deleteConversation(id);
         if (wasActive) closeAllPanels();
       } catch (e) {
-        window.alert((e as Error).message || "Failed to delete scenario");
+        toast.error("Could not delete scenario", {
+          description: (e as Error).message,
+        });
       }
     },
     [activeId, deleteConversation, closeAllPanels]
@@ -207,7 +211,7 @@ export function useScenarioWorkflow() {
             throw new Error(result.failed[0]?.error || "Failed to delete scenarios");
           }
           if (result.failed.length > 0) {
-            window.alert(
+            toast.warning(
               `Deleted ${result.deleted.length}; ${result.failed.length} could not be deleted.`,
             );
           }
@@ -220,7 +224,9 @@ export function useScenarioWorkflow() {
         deleteConversations(toRemove);
         if (wasActive) closeAllPanels();
       } catch (e) {
-        window.alert((e as Error).message || "Failed to delete scenarios");
+        toast.error("Could not delete scenarios", {
+          description: (e as Error).message,
+        });
       }
     },
     [activeId, deleteConversations, closeAllPanels]
@@ -295,8 +301,7 @@ export function useScenarioWorkflow() {
           if (result.clarification_needed) parts.push(result.clarification_needed);
           if (parts.length === 0) parts.push("No new parameters extracted from follow-up.");
           addAssistantMessage(cId, parts.join("\n\n"));
-          setShowReview(true);
-          setExpandedPanel("review");
+          openPanel("review");
         } catch (e) {
           addAssistantMessage(cId, "Follow-up failed: " + (e as Error).message);
         }
@@ -430,8 +435,7 @@ export function useScenarioWorkflow() {
             "4. Review and confirm the generated model\n" +
             "5. Then describe your scenarios here!\n\n" +
             "_The system will learn from your documents and create a custom model for your business._";
-          setShowDocManager(true);
-          setExpandedPanel("docManager");
+          openPanel("docManager");
         } else {
           assistantContent =
             "Something went wrong. Please make sure the backend is running and try again.";
@@ -460,7 +464,7 @@ export function useScenarioWorkflow() {
       }));
       setIsLoading(false);
       if (scenarioIdFromApi) {
-        setShowReview(true);
+        showPanel("review");
         // Prefer follow-up panel over Review when probing questions are pending
         setExpandedPanel(hasFollowUps ? "followUp" : "review");
       }
@@ -468,7 +472,7 @@ export function useScenarioWorkflow() {
     [
       activeId, active?.scenarioId, sessionId, addAssistantMessage,
       setConversations, setActiveId, updateConversation, setIsLoading,
-      setShowReview, setExpandedPanel, setPendingQuestions, setShowDocManager,
+      openPanel, showPanel, setExpandedPanel, setPendingQuestions,
       persistSession, assistantMode, documentConversationId, setDocumentConversationId,
     ]
   );
@@ -477,8 +481,7 @@ export function useScenarioWorkflow() {
     const scenarioId = active?.scenarioId;
     const convId = activeId;
     if (!scenarioId || !convId) return;
-    setShowReview(false);
-    setExpandedPanel(null);
+    closePanel("review");
     setIsLoading(true);
     setDimensionalPov({});
     setDimensionalMetric(null);
@@ -495,35 +498,15 @@ export function useScenarioWorkflow() {
           .join("\n");
       addAssistantMessage(convId, plText);
 
-      // Surface absurdity warnings from simulation validation
-      if (result.absurdity_warnings && result.absurdity_warnings.length > 0) {
-        const warningText =
-          "**Validation Warnings:**\n" +
-          result.absurdity_warnings.map((w: string) => `- ${w}`).join("\n") +
-          "\n\n_The model detected potentially disproportionate results. Please review the parameters above._";
-        addAssistantMessage(convId, warningText);
-      }
-
-      const fidelityText = formatFidelityViolations(result.fidelity);
-      if (fidelityText) {
-        addAssistantMessage(convId, fidelityText);
-      }
-
-      // Surface non-finite / formula-error metrics (Wave 0 finite-output contract)
-      if (result.formula_error_metrics && result.formula_error_metrics.length > 0) {
-        const errText =
-          "**Formula / numeric errors:**\n" +
-          result.formula_error_metrics
-            .map((e) => `- **${e.metric_id}**: ${e.reason}${e.raw_value != null ? ` (${String(e.raw_value)})` : ""}`)
-            .join("\n") +
-          "\n\n_Non-finite core metrics fail the run; other invalid metrics are omitted from the P&L map._";
-        addAssistantMessage(convId, errText);
+      // Every finding the run produced, in one place — see lib/runReport.ts.
+      for (const section of buildRunReportSections(result)) {
+        addAssistantMessage(convId, section.text);
       }
 
       // Store period data for interactive view
       if (result.periods && result.periods.length > 1) {
         setPeriodData({ periods: result.periods, granularity: result.granularity || "quarterly", pl: result.pl });
-        setShowPeriods(true);
+        showPanel("periods");
         addAssistantMessage(convId, `Multi-period breakdown available (${result.periods.length} ${result.granularity || "quarterly"} periods). See the panel below.`);
       }
 
@@ -561,8 +544,7 @@ export function useScenarioWorkflow() {
       try {
         const insight = await generateBusinessAnalysis(scenarioId);
         setPreloadedInsight(insight);
-        setShowInsights(true);
-        setExpandedPanel("insights");
+        openPanel("insights");
 
         // Show QA loop result summary in chat
         const qaStatus = insight.qa_report
@@ -605,8 +587,8 @@ export function useScenarioWorkflow() {
     setIsLoading(false);
   }, [
     active?.scenarioId, activeId, addAssistantMessage,
-    setShowReview, setExpandedPanel, setIsLoading, setPeriodData, setShowPeriods,
-    setChartData, setPreloadedInsight, setShowInsights, setDimensionalPov, setDimensionalMetric,
+    closePanel, showPanel, openPanel, setIsLoading, setPeriodData,
+    setChartData, setPreloadedInsight, setDimensionalPov, setDimensionalMetric,
     openDocManagerForValidation,
   ]);
 
@@ -703,7 +685,7 @@ export function useScenarioWorkflow() {
 
         addAssistantMessage(convId, parts.join("\n\n") || "Parameters refined. Review them below.", refineThinking);
         bumpRefineKey();
-        setShowReview(true);
+        showPanel("review");
         setExpandedPanel(
           data.follow_up_questions && data.follow_up_questions.length > 0 ? "followUp" : "review",
         );
@@ -714,7 +696,7 @@ export function useScenarioWorkflow() {
     },
     [
       active?.scenarioId, activeId, addAssistantMessage,
-      setPendingQuestions, setIsLoading, bumpRefineKey, setShowReview, setExpandedPanel,
+      setPendingQuestions, setIsLoading, bumpRefineKey, showPanel, setExpandedPanel,
     ]
   );
 
@@ -734,9 +716,8 @@ export function useScenarioWorkflow() {
     ]);
     setActiveId(convId);
     addMessage(convId, msg);
-    setShowTemplates(false);
-    setShowReview(true);
-    setExpandedPanel("review");
+    closePanel("templates");
+    openPanel("review");
 
     // Start session for follow-ups on cloned scenario
     createSession(newScenarioId)
@@ -744,7 +725,7 @@ export function useScenarioWorkflow() {
         persistSession(convId, sess.session_id, newScenarioId);
       })
       .catch(() => {});
-  }, [setConversations, setActiveId, addMessage, setShowTemplates, setShowReview, setExpandedPanel, persistSession]);
+  }, [setConversations, setActiveId, addMessage, closePanel, openPanel, persistSession]);
 
   return {
     conversations,

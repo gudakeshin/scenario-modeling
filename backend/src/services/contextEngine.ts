@@ -92,6 +92,8 @@ export interface ContextData {
   tie_out_status?: "ok" | "variances";
   /** When tie-out finds material variances, context is not silently usable. */
   usability?: "usable" | "needs_review";
+  /** Persisted HyperFormula vs Excel fidelity report from model validation. */
+  runtime_validation?: Record<string, unknown>;
 }
 
 export interface HeaderMappingSuggestion {
@@ -270,7 +272,9 @@ Rules for financial_metrics:
     schema: contextExtractionSchema,
     toolName: "submit_company_context",
     toolDescription: "Submit the extracted company context and P&L structure",
-    maxTokens: 4000,
+    // Workbooks with many line items produce long financial_metrics arrays;
+    // a low cap truncates the tool JSON and fails schema validation.
+    maxTokens: 16000,
     temperature: 0.1,
     purpose: "context_build",
   });

@@ -5,6 +5,7 @@ import { detectDenominationFromText, normalizeCurrencyUnit, type CurrencyUnit } 
 import { PARITY_UNSUPPORTED_FUNCTIONS } from "./excelParitySupport.generated.js";
 import {
   ARTIFACT_VERSION,
+  normalizeFormulaOperators,
   type IngestionWarning,
   type SparseCell,
   type SparseWorkbookSnapshot,
@@ -21,6 +22,19 @@ export interface WorkbookSheetMeta {
   /** Per-sheet denomination when detected from sheet headers/notes. */
   currency?: string;
   unit?: string;
+  /** Chart-of-accounts / product-master style sheet — never a source of levers. */
+  referenceOnly?: boolean;
+  /** 0-based index of the sheet's period-total column, when it has one. */
+  aggregateColIndex?: number;
+  /**
+   * 0-based indices of the sheet's period columns.
+   *
+   * Comparing values across a row only means something when the cells are the
+   * same kind of thing. A cost schedule commonly puts headcount and an annual
+   * rate on the same row as twelve monthly amounts; treating that whole row as
+   * one series makes the headcount look like an outlier against the costs.
+   */
+  periodColumnIndices?: number[];
 }
 
 export interface WorkbookDependency {
@@ -29,21 +43,66 @@ export interface WorkbookDependency {
   readsFrom: string[];
 }
 
+/**
+ * A labelled row within a section block. `blockLabel` is the most recent section
+ * header above the row (e.g. "VOLUME GROWTH ASSUMPTIONS"), which disambiguates
+ * repeated row labels across blocks — two "Bullet" rows in different blocks are
+ * different drivers, not the same one.
+ */
+export interface WorkbookInputCandidate {
+  id: string;
+  label: string;
+  sheet: string;
+  cell: string;
+  value: number;
+  /** Section header above this row, when the sheet is organised in blocks. */
+  blockLabel?: string;
+  /** Bare `toId(label)` — kept as an alias so legacy schemas still resolve. */
+  aliasId?: string;
+  /** True when the candidate cell holds a formula (never a valid lever). */
+  isFormula?: boolean;
+  /** "Active" column twin driven by a scenario toggle (e.g. E24 for B24). */
+  activeCell?: string;
+  /** Cell whose value selects which column `activeCell` resolves to. */
+  toggleCell?: string;
+}
+
+export interface WorkbookOutputCandidate {
+  id: string;
+  label: string;
+  sheet: string;
+  row: number;
+  cell?: string;
+  value: number;
+  blockLabel?: string;
+  aliasId?: string;
+  isFormula?: boolean;
+  /** Workbook's own period-total cell for this row (e.g. P&L!O4 = SUM(C4:N4)). */
+  aggregateCell?: string;
+}
+
+export interface WorkbookTimeAxis {
+  sheet: string;
+  columns: string[];
+  aggregateCol?: string;
+  /** Year-over-year comparison columns (FY25/FY24) are not forecast periods. */
+  kind?: "periods" | "year_comparison";
+  /** Primary (current) year column when kind === "year_comparison". */
+  primaryColumn?: string;
+}
+
 export interface WorkbookGraph {
   sheets: Record<string, WorkbookSheetMeta>;
   dependencies: WorkbookDependency[];
-  inputCandidates?: Array<{ id: string; label: string; sheet: string; cell: string; value: number }>;
-  outputCandidates?: Array<{ id: string; label: string; sheet: string; row: number; cell?: string; value: number }>;
+  inputCandidates?: WorkbookInputCandidate[];
+  outputCandidates?: WorkbookOutputCandidate[];
   scenarioToggle?: { cell: string; values: string[] };
-  timeAxis?: {
-    sheet: string;
-    columns: string[];
-    aggregateCol?: string;
-    /** Year-over-year comparison columns (FY25/FY24) are not forecast periods. */
-    kind?: "periods" | "year_comparison";
-    /** Primary (current) year column when kind === "year_comparison". */
-    primaryColumn?: string;
-  };
+  timeAxis?: WorkbookTimeAxis;
+  /**
+   * Every per-sheet time-axis candidate, so the chosen axis is auditable and a
+   * later re-bind can switch sheets without re-parsing the workbook.
+   */
+  timeAxisCandidates?: WorkbookTimeAxis[];
   currency?: string;
   unit?: string;
   /** Per-sheet denomination map (sheet name → currency/unit). */
@@ -60,6 +119,48 @@ export interface WorkbookGraph {
   extractionDate?: string;
 }
 
+/**
+ * Pick the time axis from the sheet that hosts the output metrics.
+ *
+ * A workbook typically carries several period axes — actuals, plan, cost
+ * schedules — and they need not share a calendar. The axis that matters is the
+ * one on the sheet whose rows are read as results; any other choice mislabels
+ * every period while still producing numbers.
+ *
+ * Ties (and the no-outputs case) fall back to the widest axis, then to
+ * workbook order, so the result is deterministic.
+ */
+export function selectTimeAxis(
+  candidates: WorkbookTimeAxis[],
+  outputCandidates: Array<{ sheet: string }>,
+  sheetRoles: Record<string, { role: SheetRole }> = {},
+): WorkbookTimeAxis | undefined {
+  if (candidates.length === 0) return undefined;
+  if (candidates.length === 1) return candidates[0];
+
+  const outputsPerSheet = new Map<string, number>();
+  for (const c of outputCandidates) {
+    outputsPerSheet.set(c.sheet, (outputsPerSheet.get(c.sheet) ?? 0) + 1);
+  }
+
+  let best = candidates[0];
+  let bestScore = -1;
+  for (const candidate of candidates) {
+    // The summary sheet decides the calendar. Intermediate schedules (revenue
+    // build-ups, cost rosters) expose more derived rows than the P&L does, so
+    // counting rows alone hands the axis to a working sheet.
+    const isSummary = sheetRoles[candidate.sheet]?.role === "summary";
+    const outputs = outputsPerSheet.get(candidate.sheet) ?? 0;
+    const score =
+      (isSummary ? 10_000_000 : 0) + outputs * 1000 + candidate.columns.length;
+    if (score > bestScore) {
+      bestScore = score;
+      best = candidate;
+    }
+  }
+  return best;
+}
+
 /** Soft threshold for "large workbook" warning — snapshots are still kept. */
 export const CELL_SNAPSHOT_WARN_CELLS = 250_000;
 
@@ -67,6 +168,146 @@ const MONTH_REGEX = /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[
 const QUARTER_REGEX = /\bq[1-4](?:[-\s]?fy?\s?\d{0,4})?\b/i;
 const FY_REGEX = /\bfy[-\s]?\d{2,4}\b/i;
 const AGG_COL_REGEX = /\b(total|fy|annual|year)\b/i;
+
+/** Longer than this and the text is a sheet banner, not a column header. */
+const MAX_COLUMN_HEADER_CHARS = 60;
+
+/** Aggregating functions that mark a roll-up cell. */
+const ROW_AGGREGATE_RE = /\b(SUM|SUBTOTAL|AGGREGATE)\s*\(/i;
+/** A1:B2 style range, used to test whether an aggregate stays within one row. */
+const RANGE_RE = /\$?([A-Z]{1,3})\$?(\d+)\s*:\s*\$?([A-Z]{1,3})\$?(\d+)/gi;
+
+/**
+ * Sheets that are pure reference data — GL charts of accounts, part/product
+ * masters. Their "numbers" are identifiers, not quantities, so they must never
+ * become scenario levers.
+ */
+const REFERENCE_SHEET_REGEX = /\b(gl|g\/l|account|accounts|coa|master|reference|ref|lookup|codes?|dictionary|mapping)\b/i;
+
+/** Column headers that mark a scenario variant rather than a period. */
+const SCENARIO_COLUMN_REGEX = /^\s*(base|bull|bear|upside|downside|central|best|worst|active|current|plan|budget)\b/i;
+
+/** Header naming the live/selected column of a Base|Bull|Bear|Active block. */
+const ACTIVE_COLUMN_REGEX = /^\s*active\b/i;
+
+/**
+ * A section header: a row carrying text but no numeric partner, which therefore
+ * labels the rows beneath it rather than holding a value of its own.
+ * Excel writers frequently repeat the header text across the merged span, so a
+ * row whose distinct text is a single value is still a header.
+ */
+function isSectionHeaderRow(texts: string[], hasNumeric: boolean): boolean {
+  if (hasNumeric) return false;
+  const distinct = [...new Set(texts.map((t) => t.trim()).filter(Boolean))];
+  return distinct.length === 1 && distinct[0].length > 0;
+}
+
+/** Strip decoration Excel authors add to section headers ("▶  FY24 PLAN  (units)"). */
+export function normalizeBlockLabel(raw: string): string {
+  return raw
+    .replace(/[▶►▪◆•]/g, " ")
+    .replace(/\([^)]*\)/g, " ")
+    .replace(/\|.*$/, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+/** 0-based column index → Excel letters (0 → A, 26 → AA). */
+export function colIndexToLetters(index: number): string {
+  let n = index + 1;
+  let out = "";
+  while (n > 0) {
+    const rem = (n - 1) % 26;
+    out = String.fromCharCode(65 + rem) + out;
+    n = Math.floor((n - 1) / 26);
+  }
+  return out;
+}
+
+/**
+ * Reference-style numeric columns: GL codes, part numbers, IDs. These are
+ * integers of near-uniform width with no decimals and no repetition of scale —
+ * quantities essentially never look like this.
+ */
+export function looksLikeIdentifierColumn(values: number[]): boolean {
+  const finite = values.filter((v) => Number.isFinite(v));
+  if (finite.length < 3) return false;
+  const allIntegers = finite.every((v) => Number.isInteger(v) && Math.abs(v) >= 1000);
+  if (!allIntegers) return false;
+  const widths = new Set(finite.map((v) => String(Math.abs(v)).length));
+  return widths.size <= 2;
+}
+
+/** Filler words that add nothing when a block label qualifies a row label. */
+const BLOCK_FILLER_REGEX = /\b(assumptions?|inputs?|drivers?|plan|summary|section|details?)\b/gi;
+
+function blockSlug(blockLabel: string): string {
+  const trimmed = blockLabel.replace(BLOCK_FILLER_REGEX, " ").replace(/\s+/g, " ").trim();
+  return toId(trimmed || blockLabel);
+}
+
+interface IdentifiableCandidate {
+  id: string;
+  aliasId?: string;
+  label: string;
+  sheet: string;
+  cell?: string;
+  blockLabel?: string;
+}
+
+/**
+ * Give every candidate a stable, unique id.
+ *
+ * Bare `toId(label)` collides whenever a workbook repeats row labels across
+ * blocks ("Bullet" under both VOLUME GROWTH and PRICE CHANGE). A collision that
+ * survives to the runtime silently binds the wrong cell, so ids are widened —
+ * block, then sheet, then cell — only as far as uniqueness requires. The bare
+ * id is always retained as `aliasId` so previously stored schemas still resolve.
+ */
+export function assignCandidateIds<T extends IdentifiableCandidate>(candidates: T[]): T[] {
+  const byBareId = new Map<string, T[]>();
+  for (const c of candidates) {
+    const bare = c.id;
+    const group = byBareId.get(bare);
+    if (group) group.push(c);
+    else byBareId.set(bare, [c]);
+  }
+
+  for (const [bare, group] of byBareId) {
+    if (group.length === 1) {
+      group[0].aliasId = bare;
+      continue;
+    }
+    const widened = group.map((c) => {
+      const block = c.blockLabel ? blockSlug(c.blockLabel) : "";
+      return block && block !== bare ? `${block}_${bare}` : bare;
+    });
+    const blockUnique = new Set(widened).size === group.length;
+    group.forEach((c, i) => {
+      c.aliasId = bare;
+      if (blockUnique) {
+        c.id = widened[i];
+        return;
+      }
+      const sheetQualified = `${toId(c.sheet)}_${widened[i]}`;
+      c.id = sheetQualified;
+    });
+    // Sheet qualification can still tie (same sheet, same block, same label) —
+    // fall back to the cell address, which is unique by construction.
+    const seen = new Map<string, number>();
+    for (const c of group) {
+      const count = (seen.get(c.id) ?? 0) + 1;
+      seen.set(c.id, count);
+    }
+    for (const c of group) {
+      if ((seen.get(c.id) ?? 0) > 1 && c.cell) {
+        c.id = `${c.id}_${toId(c.cell)}`;
+      }
+    }
+  }
+
+  return candidates;
+}
 const VOLATILE_FN_REGEX = /\b(RAND|RANDBETWEEN|RANDARRAY|NOW|TODAY)\s*\(/i;
 const FUNCTION_TOKEN_REGEX = /(?:_xlfn\.)?([A-Z][A-Z0-9._]*)\s*\(/gi;
 const HF_FUNCTIONS = new Set(HyperFormula.getRegisteredFunctionNames("enGB"));
@@ -140,7 +381,7 @@ export function parseNumericLike(value: unknown): number | null {
 }
 
 function normalizeFormula(raw: string): string {
-  const trimmed = raw.trim();
+  const trimmed = normalizeFormulaOperators(raw.trim());
   return trimmed.startsWith("=") ? trimmed : `=${trimmed}`;
 }
 
@@ -157,6 +398,32 @@ export function getCellFormula(cell: ExcelJS.Cell): string | null {
 }
 
 /** ExcelJS cached formula result when present (for fidelity expected values). */
+/** Excel error literal cached on a formula cell, if that is what it evaluates to. */
+export function getCachedFormulaError(cell: ExcelJS.Cell): string | undefined {
+  const candidates: unknown[] = [
+    (cell as ExcelJS.Cell & { result?: unknown }).result,
+    cell.value,
+  ];
+  for (const candidate of candidates) {
+    if (!candidate) continue;
+    if (typeof candidate === "string" && /^#[A-Z0-9_/]+[!?]?$/i.test(candidate.trim())) {
+      return candidate.trim();
+    }
+    if (typeof candidate === "object" && !Array.isArray(candidate) && !(candidate instanceof Date)) {
+      const obj = candidate as { error?: unknown; result?: unknown };
+      if (typeof obj.error === "string") return obj.error.trim();
+      if (typeof obj.result === "string" && /^#[A-Z0-9_/]+[!?]?$/i.test(obj.result.trim())) {
+        return obj.result.trim();
+      }
+      if (obj.result && typeof obj.result === "object") {
+        const nested = (obj.result as { error?: unknown }).error;
+        if (typeof nested === "string") return nested.trim();
+      }
+    }
+  }
+  return undefined;
+}
+
 export function getCachedFormulaResult(cell: ExcelJS.Cell): number | undefined {
   const fromResultProp = parseNumericLike(
     (cell as ExcelJS.Cell & { result?: unknown }).result,
@@ -317,7 +584,7 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
   >();
   const sheetOrder: string[] = [];
   let scenarioToggle: WorkbookGraph["scenarioToggle"];
-  let timeAxis: WorkbookGraph["timeAxis"];
+  const timeAxisCandidates: WorkbookTimeAxis[] = [];
   let formulaCount = 0;
   let crossSheetLinkCount = 0;
   let cellCount = 0;
@@ -372,8 +639,33 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
     let numericCells = 0;
     let maxCol = 0;
     let maxRow = 0;
-    const rowPairs: Array<{ row: number; label: string; numericValue: number; numericCell: string }> = [];
+    const rowPairs: Array<{
+      row: number;
+      label: string;
+      numericValue: number;
+      numericCell: string;
+      isFormula: boolean;
+      blockLabel?: string;
+      activeCell?: string;
+    }> = [];
     const sparseCells: SparseCell[] = [];
+    /** Most recent section header — disambiguates repeated row labels. */
+    let currentBlockLabel: string | undefined;
+    /** 0-based index of the block's "Active" column, when it has one. */
+    let activeColIdx: number | null = null;
+    /**
+     * Per column, how many formulas aggregate across their own row
+     * (`=SUM(F3:Q3)`). This identifies a roll-up column structurally, which
+     * beats guessing from header text — "Annual Rate (₹)" reads like a total
+     * and is an input, while "FY24 Cost (₹Cr)" reads like a period and is not.
+     */
+    const rowAggregateCountByCol = new Map<number, number>();
+    /**
+     * Header texts by column index from the sheet's first three rows. Kept as a
+     * list because row 1 is typically a banner repeated across every column,
+     * which would otherwise shadow the real header row beneath it.
+     */
+    const headerTextsByCol = new Map<number, string[]>();
 
     sheet.eachRow((row, rowNumber) => {
       maxCol = Math.max(maxCol, row.cellCount || 0);
@@ -381,6 +673,13 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
       let firstText: string | null = null;
       let firstNumValue: number | null = null;
       let firstNumCell: string | null = null;
+      let firstNumIsFormula = false;
+      /** All text seen on this row — used to classify header vs data rows. */
+      const rowTexts: string[] = [];
+      /** Text by column index, for locating the Active column of a block. */
+      const rowTextByCol = new Map<number, string>();
+      /** Cell address by column index, for resolving the Active cell. */
+      const rowAddressByCol = new Map<number, string>();
 
       row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
         const raw = cell.value;
@@ -412,9 +711,22 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
         if (snapshotValue != null && snapshotValue !== "") {
           const sparseCell: SparseCell = { r: rowIdx, c: colIdx, v: snapshotValue };
           if (formula) {
+            sparseCell.is_formula = true;
             const expected = getCachedFormulaResult(cell);
+            const cachedError = expected == null ? getCachedFormulaError(cell) : undefined;
             if (expected != null) {
               sparseCell.expected = expected;
+            } else if (cachedError) {
+              // The workbook itself is in error here; say so rather than
+              // reporting it as a merely missing cached value.
+              sparseCell.cached_error = cachedError;
+              warnings.push({
+                code: "missing_formula_result",
+                message: `Formula cell evaluates to ${cachedError} in the source workbook`,
+                sheet: sheet.name,
+                cell: cell.address,
+                detail: formula,
+              });
             } else {
               warnings.push({
                 code: "missing_formula_result",
@@ -424,6 +736,9 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
                 detail: formula,
               });
             }
+          } else if (typeof snapshotValue === "string" && snapshotValue.trim().startsWith("=")) {
+            // Documentation notes that look like formulas — keep as text for HF.
+            sparseCell.is_formula = false;
           }
           sparseCells.push(sparseCell);
           cellCount++;
@@ -445,16 +760,26 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
           denomTextChunks.push(raw.trim());
         }
 
+        rowAddressByCol.set(colIdx, cell.address);
+        if (rowNumber <= 3 && displayText && !formula) {
+          const existing = headerTextsByCol.get(colIdx);
+          if (existing) existing.push(displayText);
+          else headerTextsByCol.set(colIdx, [displayText]);
+        }
+
         const numericLike = parseNumericLike(raw);
         if (numericLike != null) {
           numericCells++;
           if (firstNumValue == null) {
             firstNumValue = numericLike;
             firstNumCell = cell.address;
+            firstNumIsFormula = Boolean(formula);
           }
         }
         if (typeof raw === "string" && raw.trim()) {
           textCells++;
+          rowTexts.push(raw.trim());
+          rowTextByCol.set(colIdx, raw.trim());
           if (!firstText) firstText = raw.trim();
         } else if (!firstText && typeof raw !== "number" && !formula && displayText && !/^-?\d/.test(displayText)) {
           firstText = displayText;
@@ -463,6 +788,14 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
         if (formula) {
           formulaCells++;
           formulaCount++;
+          if (ROW_AGGREGATE_RE.test(formula)) {
+            for (const m of formula.matchAll(RANGE_RE)) {
+              if (Number(m[2]) === rowNumber && Number(m[4]) === rowNumber) {
+                rowAggregateCountByCol.set(colIdx, (rowAggregateCountByCol.get(colIdx) ?? 0) + 1);
+                break;
+              }
+            }
+          }
           const fromRef = `${sheet.name}!${cell.address}`;
           const readsFrom = extractReadsFrom(formula);
           if (isCrossSheetFormula(formula)) {
@@ -539,11 +872,18 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
               .map((m) => m[1]);
             const uniq = [...new Set(labels.map((v) => v.trim()))];
             if (uniq.length >= 2) {
-              const selectorMatch = formula.match(/IF\(([^=]+)=/i);
-              const selectorCell = selectorMatch?.[1]?.replace(/\$/g, "").trim();
+              // The toggle is the cell the IF *tests*, not the cell holding the
+              // IF. Selectors are commonly written sheet-qualified and absolute
+              // ('Assumptions'!$B$4); stripping both is what makes the real
+              // switch resolvable instead of falling back to a consumer cell.
+              const selectorMatch = formula.match(/IF\(([^=<>]+)=/i);
+              const selectorRaw = selectorMatch?.[1]?.replace(/\$/g, "").trim() ?? "";
+              const qualified = selectorRaw.match(/^(?:'([^']+)'|([A-Za-z0-9_ ]+))!([A-Z]{1,3}\d+)$/i);
+              const selectorSheet = qualified ? (qualified[1] || qualified[2]).trim() : sheet.name;
+              const selectorCell = qualified ? qualified[3] : selectorRaw;
               scenarioToggle = {
-                cell: selectorCell && /^[A-Z]{1,3}\d+$/i.test(selectorCell)
-                  ? `${sheet.name}!${selectorCell}`
+                cell: /^[A-Z]{1,3}\d+$/i.test(selectorCell)
+                  ? `${selectorSheet}!${selectorCell.toUpperCase()}`
                   : fromRef,
                 values: uniq,
               };
@@ -552,12 +892,39 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
         }
       });
 
+      // Section header: text with no numeric partner, and one distinct string
+      // (Excel repeats header text across the merged span).
+      if (isSectionHeaderRow(rowTexts, firstNumValue != null)) {
+        currentBlockLabel = normalizeBlockLabel(rowTexts[0]) || undefined;
+        activeColIdx = null;
+        return;
+      }
+
+      // Column-header row of a block ("Model Family | Base | Bull | Bear | Active").
+      // Locates the live column that the workbook's formulas actually read.
+      if (firstNumValue == null && rowTexts.length > 1) {
+        let foundActive: number | null = null;
+        let scenarioCols = 0;
+        for (const [colIdx, text] of rowTextByCol) {
+          if (SCENARIO_COLUMN_REGEX.test(text)) scenarioCols++;
+          if (ACTIVE_COLUMN_REGEX.test(text) && foundActive == null) foundActive = colIdx;
+        }
+        // Only trust an Active column inside a genuine scenario-variant block.
+        activeColIdx = foundActive != null && scenarioCols >= 2 ? foundActive : null;
+        return;
+      }
+
       if (firstText && firstNumValue != null && firstNumCell) {
+        const activeCell =
+          activeColIdx != null ? rowAddressByCol.get(activeColIdx) : undefined;
         rowPairs.push({
           row: rowNumber,
           label: firstText,
           numericValue: firstNumValue,
           numericCell: firstNumCell,
+          isFormula: firstNumIsFormula,
+          ...(currentBlockLabel ? { blockLabel: currentBlockLabel } : {}),
+          ...(activeCell && activeCell !== firstNumCell ? { activeCell } : {}),
         });
       }
     });
@@ -572,11 +939,58 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
       numericCells,
       timeHeaders,
     );
+    // The workbook's own period-total column (e.g. P&L "FY24 Total" = SUM(C4:N4)).
+    // Reading it beats re-summing evaluated periods, which double-counts whenever
+    // the extracted period set does not exactly match the workbook's own.
+    // Scanned over every header cell: the period-column filter drops "FY24 Total"
+    // before it can be matched, which is why it was previously never found.
+    let aggregateColIdx: number | null = null;
+    let aggregateColHeader: string | undefined;
+
+    // Structural signal first: the column that sums across its own row.
+    const rollupCols = [...rowAggregateCountByCol.entries()]
+      .filter(([, count]) => count >= 2)
+      .sort((a, b) => b[1] - a[1] || b[0] - a[0]);
+    if (rollupCols.length > 0) {
+      aggregateColIdx = rollupCols[0][0];
+      aggregateColHeader = (headerTextsByCol.get(aggregateColIdx) ?? []).find(
+        (t) => t.length <= MAX_COLUMN_HEADER_CHARS,
+      );
+    }
+
+    for (const [colIdx, texts] of [...headerTextsByCol].sort((a, b) => a[0] - b[0])) {
+      if (aggregateColIdx != null) break;
+      const match = texts.find(
+        (text) =>
+          AGG_COL_REGEX.test(text) &&
+          // A banner spanning the sheet is not a column header.
+          text.length <= MAX_COLUMN_HEADER_CHARS &&
+          (/\b(total|annual)\b/i.test(text) || !isPeriodColumnHeader(text)),
+      );
+      if (!match) continue;
+      aggregateColIdx = colIdx;
+      aggregateColHeader = match;
+      break;
+    }
+
+    const periodColumnIndices: number[] = [];
+    for (const [colIdx, texts] of [...headerTextsByCol].sort((a, b) => a[0] - b[0])) {
+      if (colIdx === aggregateColIdx) continue;
+      // A roll-up column is not a period, however its header reads. Including
+      // one makes every row look like it has a value twelve times the rest.
+      if ((rowAggregateCountByCol.get(colIdx) ?? 0) > 0) continue;
+      const usable = texts.filter((t) => t.length <= MAX_COLUMN_HEADER_CHARS);
+      if (usable.some((t) => /\b(total|cumulative|ytd)\b/i.test(t))) continue;
+      if (usable.some((t) => isPeriodColumnHeader(t))) periodColumnIndices.push(colIdx);
+    }
+
     sheets[sheet.name] = {
       role,
       timeColumns: [...new Set(timeHeaders)],
       rowCount: maxRow || sheet.rowCount,
       colCount: maxCol,
+      ...(aggregateColIdx != null ? { aggregateColIndex: aggregateColIdx } : {}),
+      ...(periodColumnIndices.length > 0 ? { periodColumnIndices } : {}),
     };
 
     // Per-sheet denomination from the first few rows of labels/notes
@@ -605,60 +1019,109 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
       cells: sparseCells,
     };
 
-    if (role === "assumptions" || role === "lookup" || role === "timeseries") {
+    // Reference sheets hold identifiers (GL codes, part numbers), not quantities.
+    // Treating those as levers produced dozens of dead drivers with bases like
+    // 214510 — a GL account number presented to the user as a value to flex.
+    const isReferenceSheet =
+      role === "lookup" &&
+      (REFERENCE_SHEET_REGEX.test(sheet.name.replace(/[_\-.]+/g, " ")) ||
+        // Identifier-shaped numbers are only reference data when the sheet
+        // carries no denomination. A price list looks identifier-shaped too
+        // (₹114,411 / ₹175,000), and those are genuine levers.
+        (looksLikeIdentifierColumn(rowPairs.map((pair) => pair.numericValue)) &&
+          !sheets[sheet.name].currency));
+    if (isReferenceSheet) {
+      sheets[sheet.name].referenceOnly = true;
+    }
+
+    const aggregateCellFor = (row: number): string | undefined =>
+      aggregateColIdx != null ? `${colIndexToLetters(aggregateColIdx)}${row}` : undefined;
+
+    const pushOutput = (pair: (typeof rowPairs)[number], id: string) => {
+      const aggregateCell = aggregateCellFor(pair.row);
+      outputCandidates.push({
+        id,
+        label: pair.label,
+        sheet: sheet.name,
+        row: pair.row,
+        cell: pair.numericCell,
+        value: pair.numericValue,
+        isFormula: pair.isFormula,
+        ...(pair.blockLabel ? { blockLabel: pair.blockLabel } : {}),
+        ...(aggregateCell ? { aggregateCell } : {}),
+      });
+    };
+
+    const isSummarySheet = role === "summary" || /p&l|profit|income|summary/i.test(sheet.name);
+
+    if (!isReferenceSheet && (role === "assumptions" || role === "lookup" || role === "timeseries")) {
       for (const pair of rowPairs.slice(0, 30)) {
         const id = toId(pair.label);
         if (!id) continue;
+        // A formula cell is a computed result, never an input: writing a scenario
+        // value into one overwrites the model's own arithmetic. Such rows are
+        // still worth reporting, so they become derived outputs instead.
+        if (pair.isFormula) {
+          if (!isSummarySheet) pushOutput(pair, id);
+          continue;
+        }
         inputCandidates.push({
           id,
           label: pair.label,
           sheet: sheet.name,
           cell: pair.numericCell,
           value: pair.numericValue,
+          isFormula: false,
+          ...(pair.blockLabel ? { blockLabel: pair.blockLabel } : {}),
+          ...(pair.activeCell ? { activeCell: pair.activeCell } : {}),
         });
       }
     }
-    if (role === "summary" || /p&l|profit|income|summary/i.test(sheet.name)) {
+    if (isSummarySheet) {
       for (const pair of rowPairs.slice(0, 20)) {
         const id = toId(pair.label);
         if (!id) continue;
-        outputCandidates.push({
-          id,
-          label: pair.label,
-          sheet: sheet.name,
-          row: pair.row,
-          cell: pair.numericCell,
-          value: pair.numericValue,
-        });
+        pushOutput(pair, id);
       }
     }
 
     // Prefer compact period column headers so prose titles with an embedded FY
     // token (e.g. cover sheets) do not steal the time axis from FY25/FY24 cols.
     const periodCols = [...new Set(timeHeaders.filter(isPeriodColumnHeader))];
-    if (!timeAxis && periodCols.length >= 2) {
+    if (periodCols.length >= 2) {
       const hasMonthOrQuarter = periodCols.some(
         (h) => MONTH_REGEX.test(h) || QUARTER_REGEX.test(h),
       );
       const fyCols = periodCols.filter((h) => FY_REGEX.test(h));
+      const aggregateHeader = aggregateColHeader;
       if (!hasMonthOrQuarter && fyCols.length >= 1) {
-        timeAxis = {
+        timeAxisCandidates.push({
           sheet: sheet.name,
           columns: periodCols,
           kind: "year_comparison",
           primaryColumn: fyCols[0],
-        };
+        });
       } else {
-        const aggregateCol = periodCols.find((h) => AGG_COL_REGEX.test(h));
-        timeAxis = {
+        timeAxisCandidates.push({
           sheet: sheet.name,
           columns: periodCols,
           kind: "periods",
-          aggregateCol,
-        };
+          aggregateCol: aggregateHeader ?? periodCols.find((h) => AGG_COL_REGEX.test(h)),
+        });
       }
     }
   });
+
+  assignCandidateIds(inputCandidates);
+  assignCandidateIds(outputCandidates);
+
+  // Choose the time axis from the sheet the outputs actually live on.
+  //
+  // The previous rule was first-sheet-wins in workbook order, which on a model
+  // whose actuals sheet precedes its P&L labelled every P&L period with the
+  // prior year's month. Column indices still lined up, so nothing failed loudly —
+  // the entire result was just off by a year.
+  const timeAxis = selectTimeAxis(timeAxisCandidates, outputCandidates, sheets);
 
   const unsupportedEntries = [...unsupportedFunctions.entries()].sort();
   for (const [functionName, record] of unsupportedEntries.slice(0, 100)) {
@@ -779,6 +1242,7 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
     ...(outputCandidates.length > 0 ? { outputCandidates } : {}),
     ...(scenarioToggle ? { scenarioToggle } : {}),
     ...(timeAxis ? { timeAxis } : {}),
+    ...(timeAxisCandidates.length > 0 ? { timeAxisCandidates } : {}),
     ...(currency ? { currency } : {}),
     ...(unit ? { unit } : {}),
     ...(namedRanges.length > 0 ? { namedRanges } : {}),

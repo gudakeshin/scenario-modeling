@@ -5,7 +5,8 @@
 
 import type { ModelDefinition, ModelVariable } from "../models/registry.js";
 import type { CompiledModel } from "./expression.js";
-import { inferMetricTypeFromId, isRatioLike, resolveMetricType } from "./metricTypes.js";
+import { inferMetricTypeFromId, isRatioLike, resolveMetricType, canonicalMetricId } from "./metricTypes.js";
+import { medianOutliers } from "./dataQuality.js";
 
 export interface PeriodPlSnapshot {
   period: string;
@@ -179,8 +180,31 @@ export function aggregateXlsxPeriodPl(
   const warnings: string[] = [];
   if (periods.length === 0) return { aggregate: {}, warnings };
 
-  const hasRevenue = outputIds.includes("revenue") ||
-    periods.some((p) => p.pl.revenue != null || p.variables.revenue != null);
+  // Find the revenue line under whatever name the model uses. Looking only for
+  // the literal id "revenue" meant a model reporting "net_revenue" fell back to
+  // an unweighted mean of monthly margins — which is not the annual margin.
+  const revenueId = (() => {
+    const candidates = new Set<string>([
+      ...outputIds,
+      ...periods.flatMap((p) => [...Object.keys(p.pl), ...Object.keys(p.variables)]),
+    ]);
+    const preference = ["revenue", "net_revenue", "revenue_from_operations", "total_revenue", "gross_revenue"];
+    for (const id of preference) {
+      if (!candidates.has(id)) continue;
+      const hasValue = periods.some(
+        (p) => Number.isFinite(p.pl[id]) || Number.isFinite(p.variables[id]),
+      );
+      if (hasValue) return id;
+    }
+    for (const id of candidates) {
+      if (canonicalMetricId(id) !== "revenue") continue;
+      const hasValue = periods.some(
+        (p) => Number.isFinite(p.pl[id]) || Number.isFinite(p.variables[id]),
+      );
+      if (hasValue) return id;
+    }
+    return undefined;
+  })();
 
   const aggregate: Record<string, number> = {};
   for (const id of outputIds) {
@@ -191,7 +215,7 @@ export function aggregateXlsxPeriodPl(
       hint,
     );
     if (isRatioLike(mt) || (mt === "unknown" && isRatioLike(inferMetricTypeFromId(id)))) {
-      const denom = hasRevenue ? "revenue" : undefined;
+      const denom = revenueId;
       const { value, weighted } = weightedRatioAverage(periods, id, denom);
       aggregate[id] = (value);
       if (!weighted && periods.length > 1) {
@@ -247,4 +271,56 @@ export function periodOverrides(
     out[v.id] = base * Math.pow(1 + v.period_growth_pct / 100, periodIndex);
   }
   return out;
+}
+
+
+/**
+ * Periods whose value is wildly out of line with their siblings.
+ *
+ * A single corrupt cell in a source schedule propagates into the P&L and then
+ * into the annual total, where it is invisible: the year is simply too big.
+ * Comparing each period against the median of the others surfaces it while the
+ * numbers are still per-period. Median-based so the outlier cannot mask itself.
+ */
+export function detectPeriodOutliers(
+  periods: Array<{ period: string; pl: Record<string, number> }>,
+  metricIds: string[],
+  factor = 10,
+): string[] {
+  if (periods.length < 4) return [];
+
+  // Group by period, not by metric. One bad month lands on every line of the
+  // P&L, and reporting each line separately says the same thing six times while
+  // obscuring that they share a cause.
+  const affectedByPeriod = new Map<string, Array<{ metric: string; value: number; median: number }>>();
+
+  for (const metricId of metricIds) {
+    // Ratios legitimately stay flat or swing; only flow metrics are comparable.
+    if (/margin|rate|pct|percent|ratio/i.test(metricId)) continue;
+
+    const values = periods
+      .map((p) => ({ label: p.period, value: p.pl[metricId] }))
+      .filter((v): v is { label: string; value: number } => Number.isFinite(v.value));
+
+    const result = medianOutliers(values, factor);
+    if (!result) continue;
+
+    for (const outlier of result.outliers) {
+      const entry = affectedByPeriod.get(outlier.label) ?? [];
+      entry.push({ metric: metricId, value: outlier.value, median: result.median });
+      affectedByPeriod.set(outlier.label, entry);
+    }
+  }
+
+  const fmt = (n: number) => n.toLocaleString("en-IN", { maximumFractionDigits: 2 });
+  return [...affectedByPeriod.entries()].map(([period, metrics]) => {
+    const lead = metrics[0];
+    const others = metrics.slice(1).map((m) => m.metric);
+    return (
+      `Period outlier: ${period} is far out of line with the other ${periods.length - 1} periods — ` +
+      `${lead.metric} is ${fmt(lead.value)} against a median of ${fmt(lead.median)}` +
+      `${others.length > 0 ? `, and the same applies to ${others.join(", ")}` : ""}. ` +
+      `The annual total carries this difference.`
+    );
+  });
 }

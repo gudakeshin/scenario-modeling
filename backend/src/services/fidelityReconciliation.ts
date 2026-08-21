@@ -7,6 +7,7 @@ import { HyperFormula, DetailedCellError } from "hyperformula";
 import { config } from "../config.js";
 import {
   densifySnapshot,
+  isSparseFormulaCell,
   type SparseWorkbookSnapshot,
 } from "./ingestionArtifacts.js";
 
@@ -169,8 +170,7 @@ export function reconcileFidelity(
     for (const cell of sheet.cells) {
       const a1 = `${colToLetter(cell.c)}${cell.r + 1}`;
       const key = `${sheetName}!${a1}`;
-      const isFormula =
-        typeof cell.v === "string" && String(cell.v).trim().startsWith("=");
+      const isFormula = isSparseFormulaCell(cell);
 
       const hfVal = hf.getCellValue({ sheet: sheetId, row: cell.r, col: cell.c });
 

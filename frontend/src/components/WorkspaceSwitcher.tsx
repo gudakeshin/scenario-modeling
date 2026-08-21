@@ -2,6 +2,8 @@
 
 import { useEffect, useRef, useState } from "react";
 import { useWorkspaceStore } from "@/stores/workspaceStore";
+import { ConfirmDialog } from "./ConfirmDialog";
+import { toast } from "sonner";
 
 type ChromeVariant = "sidebar" | "page";
 
@@ -59,6 +61,12 @@ export function WorkspaceSwitcher({ variant = "sidebar" }: { variant?: ChromeVar
   const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [renamingId, setRenamingId] = useState<string | null>(null);
+  const [renameDraft, setRenameDraft] = useState("");
+  const [deleting, setDeleting] = useState(false);
+  const [deleteTarget, setDeleteTarget] = useState<
+    { id: string; name: string; docCount: number; scenarioCount: number } | null
+  >(null);
   const rootRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLInputElement>(null);
   const c = chrome[variant];
@@ -104,23 +112,38 @@ export function WorkspaceSwitcher({ variant = "sidebar" }: { variant?: ChromeVar
     }
   };
 
-  const handleRename = async (id: string, currentName: string) => {
-    const name = window.prompt("Rename workspace", currentName)?.trim();
+  const startRename = (id: string, currentName: string) => {
+    setRenameDraft(currentName);
+    setRenamingId(id);
+  };
+
+  const commitRename = async (id: string, currentName: string) => {
+    const name = renameDraft.trim();
+    setRenamingId(null);
     if (!name || name === currentName) return;
     try {
       await renameWorkspace(id, name);
     } catch (e) {
-      window.alert((e as Error).message);
+      toast.error("Rename failed", { description: (e as Error).message });
     }
   };
 
-  const handleDelete = async (id: string, name: string, docCount?: number, scenarioCount?: number) => {
-    const detail = `This permanently deletes ${docCount ?? 0} document(s) and archives ${scenarioCount ?? 0} scenario(s).`;
-    if (!window.confirm(`Delete workspace "${name}"?\n\n${detail}`)) return;
+  const handleDelete = (id: string, name: string, docCount?: number, scenarioCount?: number) => {
+    setDeleteTarget({ id, name, docCount: docCount ?? 0, scenarioCount: scenarioCount ?? 0 });
+  };
+
+  const confirmDelete = async () => {
+    const target = deleteTarget;
+    if (!target) return;
+    setDeleting(true);
     try {
-      await deleteWorkspace(id);
+      await deleteWorkspace(target.id);
+      toast.success(`Deleted workspace "${target.name}"`);
+      setDeleteTarget(null);
     } catch (e) {
-      window.alert((e as Error).message);
+      toast.error("Delete failed", { description: (e as Error).message });
+    } finally {
+      setDeleting(false);
     }
   };
 
@@ -149,6 +172,26 @@ export function WorkspaceSwitcher({ variant = "sidebar" }: { variant?: ChromeVar
           <ul role="listbox" className="max-h-64 overflow-y-auto py-1">
             {workspaces.map((w) => (
               <li key={w.workspace_id} className="group flex items-center">
+                {renamingId === w.workspace_id ? (
+                  <input
+                    autoFocus
+                    type="text"
+                    value={renameDraft}
+                    aria-label={`Rename ${w.name}`}
+                    onChange={(e) => setRenameDraft(e.target.value)}
+                    onBlur={() => void commitRename(w.workspace_id, w.name)}
+                    onKeyDown={(e) => {
+                      if (e.key === "Enter") {
+                        e.preventDefault();
+                        void commitRename(w.workspace_id, w.name);
+                      } else if (e.key === "Escape") {
+                        e.preventDefault();
+                        setRenamingId(null);
+                      }
+                    }}
+                    className={`${c.input} mx-2 my-1`}
+                  />
+                ) : (
                 <button
                   type="button"
                   role="option"
@@ -173,10 +216,11 @@ export function WorkspaceSwitcher({ variant = "sidebar" }: { variant?: ChromeVar
                     </span>
                   )}
                 </button>
-                <span className="hidden group-hover:flex items-center pr-2 gap-1">
+                )}
+                <span className="hidden group-hover:flex group-focus-within:flex items-center pr-2 gap-1">
                   <button
                     type="button"
-                    onClick={() => handleRename(w.workspace_id, w.name)}
+                    onClick={() => startRename(w.workspace_id, w.name)}
                     className={c.mutedHover}
                     aria-label={`Rename ${w.name}`}
                   >
@@ -243,6 +287,17 @@ export function WorkspaceSwitcher({ variant = "sidebar" }: { variant?: ChromeVar
           </div>
         </div>
       )}
+
+      <ConfirmDialog
+        open={deleteTarget !== null}
+        title={`Delete workspace "${deleteTarget?.name ?? ""}"?`}
+        description={`This permanently deletes ${deleteTarget?.docCount ?? 0} document(s) and archives ${deleteTarget?.scenarioCount ?? 0} scenario(s). This cannot be undone.`}
+        confirmLabel="Delete workspace"
+        danger
+        pending={deleting}
+        onCancel={() => setDeleteTarget(null)}
+        onConfirm={() => void confirmDelete()}
+      />
     </div>
   );
 }

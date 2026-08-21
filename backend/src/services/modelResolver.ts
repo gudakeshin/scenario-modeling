@@ -11,6 +11,7 @@ import { LruCache } from "../utils/lruCache.js";
 import { getModelDefinition } from "../models/registry.js";
 import { CompiledModel, type EvaluableModel, type TypedOverride, type DeltaType } from "./expression.js";
 import { getXlsxRuntime, type XlsxModelSchemaLike } from "./xlsxRuntime.js";
+import { loadBindingSchema } from "./modelBindingService.js";
 import type { WorkbookGraph } from "./excelExtractor.js";
 import { DimensionalModel, factsToLeafMap } from "./dimensionalModel.js";
 import { sha256, stableStringify } from "../utils/hashChain.js";
@@ -177,16 +178,41 @@ export async function getEvaluableModelForScenario(scenarioId: string): Promise<
   // 3. Validated spreadsheet model document (HyperFormula — never use xlsx_catalog DAG)
   const doc = await findSpreadsheetModelDoc(workspaceId);
   if (doc) {
+    // Name the actual reason. "Not validated yet" is true but useless when what
+    // is really blocking is a specific value in the user's own upload.
+    const { listBlockingFindings } = await import("./dataQuality.js");
+    const blocking = await listBlockingFindings(doc.document_id);
+    if (blocking.length > 0) {
+      throw new ModelResolutionError(
+        `This model has ${blocking.length} unreviewed data issue(s) in the uploaded workbook: ` +
+          `${blocking
+            .map((f) => `${f.sheet}${f.cells.length ? `!${f.cells.join("/")}` : ""} — ${f.title}`)
+            .join("; ")}. ` +
+          `Open Data Quality, decide on each one, then run again.`,
+      );
+    }
+
     if (doc.validation_status !== "ready") {
       throw new ModelResolutionError(
         "Spreadsheet model is not validated yet. Please complete analyst validation before simulation.",
       );
     }
+    // Reviewed bindings win over the raw model_schema: they carry the unique
+    // block-qualified ids, the Active-column write targets, and the period-total
+    // cells, and they exclude anything a reviewer rejected. Fall back to
+    // model_schema for documents ingested before the binding layer existed.
+    const bindingSchema = await loadBindingSchema(doc.document_id);
+    const effectiveSchema = bindingSchema ?? doc.model_schema;
     const runtime = doc.workbook_graph
       ? getXlsxRuntime(
-          `${doc.document_id}:${sha256(stableStringify(doc.workbook_snapshot ?? doc.workbook_graph))}`,
+          `${doc.document_id}:${sha256(
+            stableStringify({
+              snapshot: doc.workbook_snapshot ?? doc.workbook_graph,
+              schema: effectiveSchema,
+            }),
+          )}`,
           doc.workbook_graph,
-          doc.model_schema,
+          effectiveSchema,
           doc.workbook_snapshot,
         )
       : null;
@@ -200,7 +226,7 @@ export async function getEvaluableModelForScenario(scenarioId: string): Promise<
       model: runtime,
       source: "xlsx_cell_graph",
       documentId: doc.document_id,
-      modelSchema: doc.model_schema,
+      modelSchema: effectiveSchema,
     };
   }
 
@@ -283,11 +309,21 @@ export function resolveOverridesToAbsolute(
   overrides: ScenarioOverride[],
 ): { absolute: Record<string, number>; unresolved: string[] } {
   const baseById = new Map(model.inputs.map((i) => [i.id, i.base]));
+  // An engine may answer to pre-qualification ids as well as its current ones.
+  // Resolving through it keeps the base we read and the cell we write on the
+  // same lever — the divergence that turned "+7.5%" into an arbitrary multiple.
+  const resolveId = (id: string): string => {
+    if (baseById.has(id)) return id;
+    const resolver = (model as { resolveInputId?: (i: string) => string | undefined })
+      .resolveInputId;
+    return (typeof resolver === "function" ? resolver.call(model, id) : undefined) ?? id;
+  };
   const absolute: Record<string, number> = {};
   const unresolved: string[] = [];
 
-  for (const o of overrides) {
-    if (!Number.isFinite(o.value)) continue;
+  for (const raw of overrides) {
+    if (!Number.isFinite(raw.value)) continue;
+    const o = { ...raw, variableId: resolveId(raw.variableId) };
     const base = baseById.get(o.variableId);
     if (o.delta_type === "percent") {
       if (base == null || base === 0) {

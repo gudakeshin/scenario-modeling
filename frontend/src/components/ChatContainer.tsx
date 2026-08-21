@@ -13,6 +13,9 @@ import { useChatStore } from "@/stores/chatStore";
 import { strings } from "@/lib/strings";
 import { getAgentStatus, type AgentStatus } from "@/lib/api";
 import { TradingWindowBanner } from "./TradingWindowBanner";
+import { PanelMenu } from "./PanelMenu";
+import { APP_SHELL_ID } from "./AnalysisModal";
+import { PANELS, PANEL_GROUPS, isPanelAvailable, type PanelDef, type PanelId } from "@/lib/panels";
 
 export function ChatContainer() {
   const [mobileSidebarOpen, setMobileSidebarOpen] = useState(false);
@@ -51,35 +54,26 @@ export function ChatContainer() {
     };
   }, []);
 
-  const {
-    showReview, showComparison, showAudit, showMonteCarlo, showTornado,
-    showAttribution, showDriverTree, showGoalSeek, showFidelity,
-    showVersionHistory, showActualsCompare, showLiveWhatIf,
-    showTemplates, showInsights, showPeriods, showCharts, showSharing,
-    showRoles, showDocuments, showDocManager,
-    periodData, chartData, expandedPanel,
-    setShowReview, setShowComparison, setShowAudit, setShowMonteCarlo,
-    setShowTornado, setShowAttribution, setShowDriverTree, setShowGoalSeek,
-    setShowFidelity,
-    setShowVersionHistory, setShowActualsCompare, setShowLiveWhatIf,
-    setShowTemplates, setShowInsights, setShowPeriods,
-    setShowCharts, setShowSharing, setShowRoles, setShowDocuments,
-    setShowDocManager, setExpandedPanel,
-  } = useUiStore();
+  // Narrow selectors — destructuring the whole store re-rendered this
+  // component (and the modal below it) on every unrelated UI change.
+  const openPanels = useUiStore((s) => s.openPanels);
+  const periodData = useUiStore((s) => s.periodData);
+  const chartData = useUiStore((s) => s.chartData);
+  const togglePanel = useUiStore((s) => s.togglePanel);
+  const openPanel = useUiStore((s) => s.openPanel);
 
   const assistantMode = useChatStore((s) => s.assistantMode);
 
-  // Toggle helper: activate+expand or deactivate+collapse
-  const tp = (id: string, show: boolean, setShow: (v: boolean) => void) => () => {
-    if (show) {
-      setShow(false);
-      if (expandedPanel === id) setExpandedPanel(null);
-    } else {
-      setShow(true);
-      setExpandedPanel(id);
-    }
+  const availability = {
+    hasScenario: Boolean(active?.scenarioId),
+    hasPeriodData: Boolean(periodData),
+    hasChartData: Boolean(chartData),
   };
 
+  const available = (p: PanelDef) => isPanelAvailable(p, availability);
+  const isOpen = (id: PanelId) => openPanels.includes(id);
+
+  /** Labels stay stable; open state is carried by aria-pressed + styling. */
   const actionBtn = (isActive: boolean) =>
     `rounded-xl border px-3 py-1.5 text-xs font-medium transition-all ${
       isActive
@@ -87,8 +81,14 @@ export function ChatContainer() {
         : "border-[var(--border)] text-[var(--text-secondary)] hover:bg-[var(--panel-bg)] hover:border-[var(--panel-border)] hover:shadow-card"
     } disabled:opacity-40`;
 
+  const reviewPanel = PANELS.find((p) => p.id === "review")!;
+  const insightsPanel = PANELS.find((p) => p.id === "insights")!;
+
+  const menuItems = (group: Exclude<PanelDef["group"], null>) =>
+    PANELS.filter((p) => p.group === group && !p.primary && available(p));
+
   return (
-    <div className="flex h-[100dvh] overflow-hidden bg-background">
+    <div id={APP_SHELL_ID} className="flex h-[100dvh] overflow-hidden bg-background">
       <a
         href="#main-content"
         className="sr-only focus:not-sr-only focus:absolute focus:z-50 focus:top-2 focus:left-2 focus:rounded-lg focus:bg-accent focus:px-3 focus:py-2 focus:text-sm focus:font-medium focus:text-white focus:shadow-panel"
@@ -165,7 +165,7 @@ export function ChatContainer() {
               </div>
               <button
                 type="button"
-                onClick={() => { setShowDocManager(true); setExpandedPanel("docManager"); }}
+                onClick={() => openPanel("docManager")}
                 className="mt-2 px-5 py-2.5 rounded-xl bg-accent text-white text-sm font-semibold hover:bg-accent/90 transition-colors"
               >
                 Open Document Manager
@@ -186,129 +186,88 @@ export function ChatContainer() {
             />
           </div>
 
-          {/* ── Action bar ── */}
+          {/* ── Action bar ── 7 controls, derived from the panel registry */}
           {active?.scenarioId && (
             <div className="px-4 py-2.5 border-t border-[var(--border)] bg-[var(--panel-bg)] flex flex-wrap items-center justify-center gap-2 shrink-0">
-              <button type="button" onClick={tp("review", showReview, setShowReview)} disabled={isLoading} className={actionBtn(showReview)}>
-                {showReview ? "Hide Review" : "Review Parameters"}
-              </button>
-              <button type="button" onClick={tp("comparison", showComparison, setShowComparison)} disabled={isLoading} className={actionBtn(showComparison)}>
-                {showComparison ? "Hide Compare" : "Compare"}
-              </button>
-              <button type="button" onClick={tp("monteCarlo", showMonteCarlo, setShowMonteCarlo)} disabled={isLoading} className={actionBtn(showMonteCarlo)}>
-                {showMonteCarlo ? "Hide MC" : "Monte Carlo"}
-              </button>
-              <button type="button" onClick={tp("tornado", showTornado, setShowTornado)} disabled={isLoading} className={actionBtn(showTornado)}>
-                {showTornado ? "Hide Tornado" : "Sensitivity"}
-              </button>
-              <button type="button" onClick={tp("attribution", showAttribution, setShowAttribution)} disabled={isLoading} className={actionBtn(showAttribution)}>
-                {showAttribution ? "Hide Attribution" : "Attribution"}
-              </button>
-              <button type="button" onClick={tp("driverTree", showDriverTree, setShowDriverTree)} disabled={isLoading} className={actionBtn(showDriverTree)}>
-                {showDriverTree ? "Hide Drivers" : "Driver Tree"}
-              </button>
-              <button type="button" onClick={tp("goalSeek", showGoalSeek, setShowGoalSeek)} disabled={isLoading} className={actionBtn(showGoalSeek)}>
-                {showGoalSeek ? "Hide Goal Seek" : "Goal Seek"}
-              </button>
-              <button type="button" onClick={tp("fidelity", showFidelity, setShowFidelity)} disabled={isLoading} className={actionBtn(showFidelity)}>
-                {showFidelity ? "Hide Fidelity" : "Audit Fidelity"}
-              </button>
-              <button type="button" onClick={tp("versions", showVersionHistory, setShowVersionHistory)} disabled={isLoading} className={actionBtn(showVersionHistory)}>
-                {showVersionHistory ? "Hide Versions" : "Versions"}
-              </button>
-              <button type="button" onClick={tp("actuals", showActualsCompare, setShowActualsCompare)} disabled={isLoading} className={actionBtn(showActualsCompare)}>
-                {showActualsCompare ? "Hide Actuals" : "Actuals"}
-              </button>
-              <button type="button" onClick={tp("whatIf", showLiveWhatIf, setShowLiveWhatIf)} disabled={isLoading} className={actionBtn(showLiveWhatIf)}>
-                {showLiveWhatIf ? "Hide What-If" : "What-If"}
-              </button>
-              {periodData && (
-                <button type="button" onClick={tp("periods", showPeriods, setShowPeriods)} disabled={isLoading} className={actionBtn(showPeriods)}>
-                  {showPeriods ? "Hide Periods" : "Periods"}
-                </button>
-              )}
-              {chartData && (
-                <button type="button" onClick={tp("charts", showCharts, setShowCharts)} disabled={isLoading} className={actionBtn(showCharts)}>
-                  {showCharts ? "Hide Charts" : "Charts"}
-                </button>
-              )}
-              <button type="button" onClick={tp("sharing", showSharing, setShowSharing)} disabled={isLoading} className={actionBtn(showSharing)}>
-                {showSharing ? "Hide Sharing" : "Share"}
-              </button>
-              <button type="button" onClick={tp("audit", showAudit, setShowAudit)} className={actionBtn(showAudit)}>
-                {showAudit ? "Hide Audit" : "Audit"}
-              </button>
-              <button type="button" onClick={tp("templates", showTemplates, setShowTemplates)} className={actionBtn(showTemplates)}>
-                {showTemplates ? "Hide Templates" : "Templates"}
-              </button>
-              <button type="button" onClick={tp("roles", showRoles, setShowRoles)} className={actionBtn(showRoles)}>
-                {showRoles ? "Hide Roles" : "Roles"}
-              </button>
-              <button type="button" onClick={tp("documents", showDocuments, setShowDocuments)} className={actionBtn(showDocuments)}>
-                {showDocuments ? "Hide Docs" : "Documents"}
-              </button>
-              <button type="button" onClick={tp("docManager", showDocManager, setShowDocManager)} className={actionBtn(showDocManager)}>
-                {showDocManager ? "Hide Document Manager" : "Document Manager"}
-              </button>
               <button
                 type="button"
-                onClick={() => {
-                  if (showInsights) {
-                    setShowInsights(false);
-                    if (expandedPanel === "insights") setExpandedPanel(null);
-                  } else {
-                    setShowInsights(true);
-                    setExpandedPanel("insights");
-                  }
-                }}
+                onClick={() => togglePanel(reviewPanel.id)}
                 disabled={isLoading}
+                aria-pressed={isOpen(reviewPanel.id)}
+                className={actionBtn(isOpen(reviewPanel.id))}
+              >
+                {reviewPanel.actionLabel}
+              </button>
+
+              {PANEL_GROUPS.map((g) => (
+                <PanelMenu
+                  key={g.id}
+                  label={g.label}
+                  items={menuItems(g.id)}
+                  openPanels={openPanels}
+                  isLoading={isLoading}
+                  onToggle={togglePanel}
+                />
+              ))}
+
+              <button
+                type="button"
+                onClick={() => togglePanel(insightsPanel.id)}
+                disabled={isLoading}
+                aria-pressed={isOpen(insightsPanel.id)}
                 className={`rounded-xl border px-3 py-1.5 text-xs font-semibold transition-all ${
-                  showInsights
+                  isOpen(insightsPanel.id)
                     ? "bg-accent text-white border-accent shadow-sm"
                     : "bg-accent/10 border-accent/30 text-accent hover:bg-accent/20"
                 } disabled:opacity-40`}
               >
-                {showInsights ? "Hide Insights" : "So What?"}
+                {insightsPanel.actionLabel}
               </button>
+
               <ExportControls scenarioId={active.scenarioId} />
             </div>
           )}
 
-          {/* Template, Documents & Manager buttons when no scenario active */}
+          {/* Pre-scenario: only the entry points that work without a run */}
           {!active?.scenarioId && (
-            <div className="px-4 py-2.5 border-t border-[var(--border)] bg-[var(--panel-bg)] flex justify-center gap-2 shrink-0">
+            <div className="px-4 py-2.5 border-t border-[var(--border)] bg-[var(--panel-bg)] flex flex-wrap justify-center gap-2 shrink-0">
               <button
                 type="button"
-                onClick={tp("docManager", showDocManager, setShowDocManager)}
+                onClick={() => togglePanel("docManager")}
+                aria-pressed={isOpen("docManager")}
                 className={`rounded-xl border px-4 py-2 text-sm font-medium transition-all ${
-                  !onboardingStatus?.ready
+                  !onboardingStatus?.ready && !isOpen("docManager")
                     ? "bg-accent text-white border-accent hover:bg-accent/90"
+                    : isOpen("docManager")
+                    ? "bg-accent/10 border-accent/30 text-accent shadow-sm"
                     : "border-[var(--border)] text-[var(--text-secondary)] hover:bg-background hover:shadow-card"
                 }`}
               >
-                {showDocManager ? "Hide Manager" : "Document Manager"}
+                Document Manager
               </button>
               <button
                 type="button"
-                onClick={() => {
-                  if (showTemplates) {
-                    setShowTemplates(false);
-                    if (expandedPanel === "templates") setExpandedPanel(null);
-                  } else {
-                    setShowTemplates(true);
-                    setExpandedPanel("templates");
-                  }
-                }}
-                className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] hover:bg-background hover:shadow-card transition-all"
+                onClick={() => togglePanel("templates")}
+                aria-pressed={isOpen("templates")}
+                className={`rounded-xl border px-4 py-2 text-sm font-medium transition-all ${
+                  isOpen("templates")
+                    ? "bg-accent/10 border-accent/30 text-accent shadow-sm"
+                    : "border-[var(--border)] text-[var(--text-secondary)] hover:bg-background hover:shadow-card"
+                }`}
               >
-                {showTemplates ? "Hide Templates" : "Browse Templates"}
+                Browse Templates
               </button>
               <button
                 type="button"
-                onClick={tp("documents", showDocuments, setShowDocuments)}
-                className="rounded-xl border border-[var(--border)] px-4 py-2 text-sm font-medium text-[var(--text-secondary)] hover:bg-background hover:shadow-card transition-all"
+                onClick={() => togglePanel("documents")}
+                aria-pressed={isOpen("documents")}
+                className={`rounded-xl border px-4 py-2 text-sm font-medium transition-all ${
+                  isOpen("documents")
+                    ? "bg-accent/10 border-accent/30 text-accent shadow-sm"
+                    : "border-[var(--border)] text-[var(--text-secondary)] hover:bg-background hover:shadow-card"
+                }`}
               >
-                {showDocuments ? "Hide Documents" : "Talk to Documents"}
+                Talk to Documents
               </button>
             </div>
           )}

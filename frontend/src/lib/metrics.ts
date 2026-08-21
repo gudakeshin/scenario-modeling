@@ -14,6 +14,89 @@ export const METRIC_ORDER = [
   "net_income",
 ] as const;
 
+/**
+ * Workbook-specific metric ids → the canonical ids the UI orders and colours by.
+ * Mirrors backend metricTypes.canonicalMetricId.
+ *
+ * Without this a model that reports `gross_revenue` / `material_vehicle_cost` /
+ * `total_opex` intersects METRIC_ORDER only at `ebitda`, and the P&L waterfall
+ * renders a single bar.
+ */
+const CANONICAL_ALIASES: Record<string, string> = {
+  net_revenue: "revenue",
+  gross_revenue: "revenue",
+  total_revenue: "revenue",
+  revenue_from_operations: "revenue",
+  revenue_cr: "revenue",
+  net_sales: "revenue",
+  sales: "revenue",
+  turnover: "revenue",
+  cost_of_revenue: "cogs",
+  cost_of_goods_sold: "cogs",
+  cost_of_sales: "cogs",
+  material_cost: "cogs",
+  material_vehicle_cost: "cogs",
+  raw_material_cost: "cogs",
+  total_opex: "opex",
+  operating_expenses: "opex",
+  total_operating_expenses: "opex",
+  profit_before_tax: "net_income",
+  profit_after_tax: "net_income",
+  net_profit: "net_income",
+  pat: "net_income",
+  operating_profit: "operating_income",
+};
+
+/** Preferred source when several model ids map to the same canonical metric. */
+const CANONICAL_PREFERENCE: Record<string, string[]> = {
+  revenue: ["revenue", "net_revenue", "revenue_from_operations", "total_revenue", "gross_revenue"],
+  cogs: ["cogs", "cost_of_revenue", "cost_of_goods_sold", "material_vehicle_cost"],
+  opex: ["opex", "total_opex", "operating_expenses"],
+  net_income: ["net_income", "net_profit", "profit_after_tax", "pat", "profit_before_tax"],
+};
+
+/** Canonical id for a model-specific metric id, or undefined when it has none. */
+export function canonicalMetricId(id: string): string | undefined {
+  const key = id.trim().toLowerCase();
+  if (!key) return undefined;
+  if ((METRIC_ORDER as readonly string[]).includes(key)) return key;
+  return CANONICAL_ALIASES[key];
+}
+
+/**
+ * Add canonical entries for a P&L map without discarding the model's own ids,
+ * so charts can rely on canonical names while tables still show real labels.
+ */
+export function withCanonicalMetrics(
+  values: Record<string, number> | undefined | null,
+): Record<string, number> {
+  if (!values) return {};
+  const out: Record<string, number> = { ...values };
+  const grouped = new Map<string, string[]>();
+
+  for (const id of Object.keys(values)) {
+    const canonical = canonicalMetricId(id);
+    if (!canonical || canonical === id) continue;
+    const group = grouped.get(canonical);
+    if (group) group.push(id);
+    else grouped.set(canonical, [id]);
+  }
+
+  for (const [canonical, sourceIds] of grouped) {
+    if (canonical in out) continue;
+    const preference = CANONICAL_PREFERENCE[canonical] ?? [];
+    const rank = (id: string) => {
+      const i = preference.indexOf(id);
+      return i < 0 ? Number.MAX_SAFE_INTEGER : i;
+    };
+    const source = [...sourceIds].sort((a, b) => rank(a) - rank(b))[0];
+    const value = values[source];
+    if (Number.isFinite(value)) out[canonical] = value;
+  }
+
+  return out;
+}
+
 /** Human-readable labels for all model metrics (P&L + input variables) */
 export const METRIC_LABELS: Record<string, string> = {
   revenue: "Revenue",

@@ -28,6 +28,9 @@ const modelSchemaZ = z.object({
     unit: z.string().default("value"),
     sheet: z.string().optional(),
     cell: z.string().optional(),
+    activeCell: z.string().optional(),
+    aliasId: z.string().optional(),
+    blockLabel: z.string().optional(),
   })).default([]),
   outputMetrics: z.array(z.object({
     id: z.string(),
@@ -35,6 +38,8 @@ const modelSchemaZ = z.object({
     sheet: z.string().default(""),
     row: z.number().default(0),
     cell: z.string().optional(),
+    aggregateCell: z.string().optional(),
+    aliasId: z.string().optional(),
     isKPI: z.boolean().default(false),
   })).default([]),
   timeDimension: z.object({
@@ -55,6 +60,12 @@ interface ModelSchemaLever {
   unit: string;
   sheet?: string;
   cell?: string;
+  /** "Active" column twin driven by a scenario toggle — the cell to write. */
+  activeCell?: string;
+  /** Bare label id, retained so schemas stored before block qualification resolve. */
+  aliasId?: string;
+  /** Section header that disambiguates repeated row labels. */
+  blockLabel?: string;
 }
 
 interface ModelSchemaOutput {
@@ -63,6 +74,9 @@ interface ModelSchemaOutput {
   sheet: string;
   row: number;
   cell?: string;
+  /** Workbook's own period-total cell for this row (e.g. P&L!O4). */
+  aggregateCell?: string;
+  aliasId?: string;
   isKPI: boolean;
 }
 
@@ -124,6 +138,13 @@ function normalizeModelSchema(schema: ModelSchema, docName: string, graph: Workb
         unit: l.unit || "value",
         sheet: l.sheet || cand?.sheet,
         cell: l.cell || cand?.cell,
+        ...(l.activeCell || cand?.activeCell
+          ? { activeCell: l.activeCell || cand?.activeCell }
+          : {}),
+        ...(l.aliasId || cand?.aliasId ? { aliasId: l.aliasId || cand?.aliasId } : {}),
+        ...(l.blockLabel || cand?.blockLabel
+          ? { blockLabel: l.blockLabel || cand?.blockLabel }
+          : {}),
       };
     });
   const fallbackLevers: ModelSchemaLever[] = (graph.inputCandidates || []).slice(0, 25).map((c) => ({
@@ -140,6 +161,9 @@ function normalizeModelSchema(schema: ModelSchema, docName: string, graph: Workb
     unit: "value",
     sheet: c.sheet,
     cell: c.cell,
+    ...(c.activeCell ? { activeCell: c.activeCell } : {}),
+    ...(c.aliasId ? { aliasId: c.aliasId } : {}),
+    ...(c.blockLabel ? { blockLabel: c.blockLabel } : {}),
   }));
   const normalizedLevers = parsedLevers.length > 0 ? parsedLevers : fallbackLevers;
 
@@ -154,6 +178,10 @@ function normalizeModelSchema(schema: ModelSchema, docName: string, graph: Workb
         sheet: m.sheet || cand?.sheet || Object.keys(graph.sheets)[0] || "Sheet1",
         row: Number(m.row || cand?.row || idx + 1),
         cell: m.cell || cand?.cell,
+        ...(m.aggregateCell || cand?.aggregateCell
+          ? { aggregateCell: m.aggregateCell || cand?.aggregateCell }
+          : {}),
+        ...(m.aliasId || cand?.aliasId ? { aliasId: m.aliasId || cand?.aliasId } : {}),
         isKPI: Boolean(m.isKPI),
       };
     });
@@ -163,6 +191,8 @@ function normalizeModelSchema(schema: ModelSchema, docName: string, graph: Workb
     sheet: c.sheet,
     row: c.row,
     cell: c.cell,
+    ...(c.aggregateCell ? { aggregateCell: c.aggregateCell } : {}),
+    ...(c.aliasId ? { aliasId: c.aliasId } : {}),
     isKPI: true,
   }));
   const normalizedOutputs = parsedOutputs.length > 0 ? parsedOutputs : fallbackOutputs;
@@ -232,6 +262,9 @@ function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelS
       }
       if (!existing.sheet) existing.sheet = c.sheet;
       if (!existing.cell) existing.cell = c.cell;
+      if (!existing.activeCell && c.activeCell) existing.activeCell = c.activeCell;
+      if (!existing.aliasId && c.aliasId) existing.aliasId = c.aliasId;
+      if (!existing.blockLabel && c.blockLabel) existing.blockLabel = c.blockLabel;
       continue;
     }
     if (Math.abs(cVal) > 0) {
@@ -245,6 +278,9 @@ function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelS
         unit: "value",
         sheet: c.sheet,
         cell: c.cell,
+        ...(c.activeCell ? { activeCell: c.activeCell } : {}),
+        ...(c.aliasId ? { aliasId: c.aliasId } : {}),
+        ...(c.blockLabel ? { blockLabel: c.blockLabel } : {}),
       };
       schema.scenarioLevers.push(newLever);
       leverById.set(cid, newLever);
@@ -258,6 +294,8 @@ function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelS
     if (existing) {
       if (!existing.cell && c.cell) existing.cell = c.cell;
       if (!existing.sheet) existing.sheet = c.sheet;
+      if (!existing.aggregateCell && c.aggregateCell) existing.aggregateCell = c.aggregateCell;
+      if (!existing.aliasId && c.aliasId) existing.aliasId = c.aliasId;
     } else if (Math.abs(cVal) > 0) {
       const metric: ModelSchemaOutput = {
         id: cid,
@@ -265,6 +303,8 @@ function enrichFromCandidates(schema: ModelSchema, graph: WorkbookGraph): ModelS
         sheet: c.sheet,
         row: c.row,
         cell: c.cell,
+        ...(c.aggregateCell ? { aggregateCell: c.aggregateCell } : {}),
+        ...(c.aliasId ? { aliasId: c.aliasId } : {}),
         isKPI: true,
       };
       schema.outputMetrics.push(metric);
@@ -404,6 +444,9 @@ export function buildFallbackModelSchema(graph: WorkbookGraph, docName: string):
     unit: "value",
     sheet: c.sheet,
     cell: c.cell,
+    ...(c.activeCell ? { activeCell: c.activeCell } : {}),
+    ...(c.aliasId ? { aliasId: c.aliasId } : {}),
+    ...(c.blockLabel ? { blockLabel: c.blockLabel } : {}),
   }));
   if (scenarioLevers.length === 0 && graph.scenarioToggle) {
     scenarioLevers.push({
@@ -417,12 +460,27 @@ export function buildFallbackModelSchema(graph: WorkbookGraph, docName: string):
     });
   }
 
-  const outputMetrics: ModelSchemaOutput[] = (graph.outputCandidates || []).slice(0, 12).map((c) => ({
+  // Rank summary-sheet rows first: derived rows on working schedules (revenue
+  // build-ups, cost rosters) far outnumber the P&L's, and a flat truncation
+  // would drop the actual reporting lines.
+  const summaryRoleSheets = new Set(
+    Object.entries(graph.sheets)
+      .filter(([, meta]) => meta.role === "summary")
+      .map(([name]) => name),
+  );
+  const rankedOutputs = [...(graph.outputCandidates || [])].sort((a, b) => {
+    const aScore = summaryRoleSheets.has(a.sheet) ? 0 : 1;
+    const bScore = summaryRoleSheets.has(b.sheet) ? 0 : 1;
+    return aScore - bScore;
+  });
+  const outputMetrics: ModelSchemaOutput[] = rankedOutputs.slice(0, 12).map((c) => ({
     id: toId(c.id || c.label),
     label: c.label,
     sheet: c.sheet || summarySheet,
     row: c.row,
     cell: c.cell,
+    ...(c.aggregateCell ? { aggregateCell: c.aggregateCell } : {}),
+    ...(c.aliasId ? { aliasId: c.aliasId } : {}),
     isKPI: true,
   }));
   if (outputMetrics.length === 0) {

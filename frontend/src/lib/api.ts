@@ -1859,6 +1859,7 @@ export async function validateModelSchema(documentId?: string): Promise<{
   bound_outputs?: string[];
   warnings?: string[];
   fidelity?: FidelityReport;
+  data_quality?: { blocking: DataQualityFinding[]; all: DataQualityFinding[] };
   error?: string;
   errors?: string[];
 }> {
@@ -1874,6 +1875,7 @@ export async function validateModelSchema(documentId?: string): Promise<{
       errors?: string[];
       reason?: string;
       fidelity?: FidelityReport;
+      data_quality?: { blocking: DataQualityFinding[]; all: DataQualityFinding[] };
     };
     const msg = [
       detail.error || "Validation failed",
@@ -1882,9 +1884,81 @@ export async function validateModelSchema(documentId?: string): Promise<{
     ]
       .filter(Boolean)
       .join(" — ");
-    const e = new Error(msg) as Error & { fidelity?: FidelityReport };
+    const e = new Error(msg) as Error & {
+      fidelity?: FidelityReport;
+      dataQuality?: { blocking: DataQualityFinding[]; all: DataQualityFinding[] };
+    };
     e.fidelity = detail.fidelity;
+    e.dataQuality = detail.data_quality;
     throw e;
+  }
+  return res.json();
+}
+
+// ── Data quality ──
+
+export type DataQualityCode =
+  | "period_outlier"
+  | "cached_formula_error"
+  | "series_gap"
+  | "hardcoded_plug"
+  | "calendar_mismatch"
+  | "inert_assumption";
+
+export interface DataQualityFinding {
+  findingKey: string;
+  code: DataQualityCode;
+  severity: "error" | "warning";
+  title: string;
+  message: string;
+  sheet: string;
+  cells: string[];
+  rowLabel?: string;
+  evidence?: Record<string, unknown>;
+  status: "open" | "acknowledged";
+  note?: string | null;
+  acknowledgedBy?: string | null;
+  acknowledgedAt?: string | null;
+}
+
+export interface DataQualityReport {
+  document_id: string;
+  findings: DataQualityFinding[];
+  blocking: DataQualityFinding[];
+  counts: { total: number; open: number; blocking: number };
+}
+
+/** Findings raised against the workspace's active model. */
+export async function getDataQuality(): Promise<DataQualityReport> {
+  const res = await apiFetch(`${API_BASE}/api/v1/context/model/data-quality`, {
+    headers: authHeaders(),
+  });
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to load data quality");
+  }
+  return res.json();
+}
+
+/**
+ * Record a decision on a finding. The note is required: accepting a data issue
+ * is a judgement call and the reason travels with every result built on it.
+ */
+export async function acknowledgeDataQualityFinding(
+  findingKey: string,
+  note: string,
+): Promise<{ acknowledged: boolean; finding: DataQualityFinding }> {
+  const res = await apiFetch(
+    `${API_BASE}/api/v1/context/model/data-quality/${encodeURIComponent(findingKey)}/acknowledge`,
+    {
+      method: "POST",
+      headers: authHeaders({ "Content-Type": "application/json" }),
+      body: JSON.stringify({ note }),
+    },
+  );
+  if (!res.ok) {
+    const err = await res.json().catch(() => ({}));
+    throw new Error((err as { error?: string }).error || "Failed to acknowledge finding");
   }
   return res.json();
 }

@@ -17,7 +17,7 @@ import { ThemeToggle } from "../ThemeToggle";
 import { ActiveModelBanner } from "./ActiveModelBanner";
 import { ConnectionCard } from "./ConnectionCard";
 import { ConnectionDrawer } from "./ConnectionDrawer";
-import { ConfirmDialog } from "./ConfirmDialog";
+import { ConfirmDialog } from "../ConfirmDialog";
 import { ModelBrowser } from "./ModelBrowser";
 import { ImportWizard } from "./ImportWizard";
 

@@ -5,7 +5,7 @@ import Link from "next/link";
 import type { Conversation } from "@/types/chat";
 import { ThemeToggle } from "./ThemeToggle";
 import { WorkspaceSwitcher } from "./WorkspaceSwitcher";
-import { ConfirmDialog } from "./data/ConfirmDialog";
+import { ConfirmDialog } from "./ConfirmDialog";
 import { strings } from "@/lib/strings";
 import { usePlanningConnectorsEnabled } from "@/lib/features";
 
@@ -66,6 +66,7 @@ function ConversationRow({
 }) {
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState(c.title);
+  const [confirmDelete, setConfirmDelete] = useState(false);
   const inputRef = useRef<HTMLInputElement>(null);
 
   useEffect(() => {
@@ -82,9 +83,7 @@ function ConversationRow({
     setEditing(false);
   };
 
-  const handleDelete = () => {
-    if (window.confirm(strings.sidebar.deleteConfirm)) onDelete();
-  };
+  const handleDelete = () => setConfirmDelete(true);
 
   return (
     <li className="group relative">
@@ -174,6 +173,18 @@ function ConversationRow({
           </div>
         </div>
       )}
+      <ConfirmDialog
+        open={confirmDelete}
+        title={strings.sidebar.delete}
+        description={strings.sidebar.deleteConfirm}
+        confirmLabel={strings.sidebar.delete}
+        danger
+        onCancel={() => setConfirmDelete(false)}
+        onConfirm={() => {
+          setConfirmDelete(false);
+          onDelete();
+        }}
+      />
     </li>
   );
 }

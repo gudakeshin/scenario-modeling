@@ -69,6 +69,7 @@ export function AuditTrailViewer({ scenarioId, onClose, onMinimize }: AuditTrail
   const [entries, setEntries] = useState<AuditEntry[]>([]);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [page, setPage] = useState(0);
   const PAGE_SIZE = 20;
 
@@ -78,8 +79,9 @@ export function AuditTrailViewer({ scenarioId, onClose, onMinimize }: AuditTrail
       const data = await getAuditTrail({ scenario_id: scenarioId, limit: PAGE_SIZE, offset: page * PAGE_SIZE });
       setEntries(data.entries);
       setTotal(data.total);
-    } catch {
-      // ignore
+      setLoadError(null);
+    } catch (e) {
+      setLoadError((e as Error).message || "Could not load the audit trail.");
     }
     setLoading(false);
   }, [scenarioId, page]);
@@ -97,6 +99,19 @@ export function AuditTrailViewer({ scenarioId, onClose, onMinimize }: AuditTrail
         onMinimize={onMinimize || onClose}
         isMinimized={false}
       />
+
+      {loadError && (
+        <div role="alert" className="mb-3 flex items-center justify-between gap-3 rounded-lg bg-[var(--danger-bg)] px-3 py-2 text-sm text-[var(--danger)]">
+          <span>{loadError}</span>
+          <button
+            type="button"
+            onClick={() => void load()}
+            className="shrink-0 rounded-lg border border-[var(--danger)]/30 px-2.5 py-1 text-xs font-medium hover:bg-[var(--danger-bg)]"
+          >
+            Retry
+          </button>
+        </div>
+      )}
       {loading ? (
         <p className="text-xs text-[var(--text-faint)]">Loading...</p>
       ) : entries.length === 0 ? (

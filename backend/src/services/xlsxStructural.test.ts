@@ -225,6 +225,77 @@ test("densifySnapshot: keeps wide sparse sheets jagged", () => {
   assert.strictEqual(dense.Wide[1][9_999], 42);
 });
 
+test("densifySnapshot: escapes =prefixed documentation notes; normalizes Unicode ops", async () => {
+  const { looksLikeExcelFormula, normalizeFormulaOperators } = await import(
+    "./ingestionArtifacts.js"
+  );
+  assert.equal(looksLikeExcelFormula("= Blended realization − trade discount"), false);
+  assert.equal(looksLikeExcelFormula("=Volume_MT × ₹/t ÷ 10"), false);
+  assert.equal(looksLikeExcelFormula("=Assumptions!B2*1000"), true);
+  assert.equal(looksLikeExcelFormula("=A1*2"), true);
+  assert.equal(looksLikeExcelFormula("=SUM(A1:A10)"), true);
+  assert.equal(normalizeFormulaOperators("=A1−B1×2÷3"), "=A1-B1*2/3");
+
+  const dense = densifySnapshot({
+    format: "sparse_v1",
+    sheetOrder: ["Assumptions"],
+    sheets: {
+      Assumptions: {
+        rows: 2,
+        cols: 2,
+        cells: [
+          { r: 0, c: 0, v: 10 },
+          {
+            r: 0,
+            c: 1,
+            v: "= Blended realization − trade discount",
+            is_formula: false,
+          },
+          { r: 1, c: 0, v: "=A1*2", is_formula: true, expected: 20 },
+          // Legacy artifact: no is_formula flag — heuristic must still escape notes
+          { r: 1, c: 1, v: "= Volume_MT × ₹/t ÷ 10" },
+        ],
+      },
+    },
+    cellCount: 4,
+    formulaCount: 1,
+  });
+
+  assert.equal(dense.Assumptions[0][1], "'= Blended realization − trade discount");
+  assert.equal(dense.Assumptions[1][0], "=A1*2");
+  assert.equal(dense.Assumptions[1][1], "'= Volume_MT × ₹/t ÷ 10");
+
+  const { HyperFormula } = await import("hyperformula");
+  const hf = HyperFormula.buildFromSheets(dense, { licenseKey: "gpl-v3" });
+  const note = hf.getCellValue({ sheet: 0, row: 0, col: 1 });
+  const formula = hf.getCellValue({ sheet: 0, row: 1, col: 0 });
+  assert.equal(note, "= Blended realization − trade discount");
+  assert.equal(formula, 20);
+});
+
+test("excelExtractor: marks =prefixed notes as non-formulas", async () => {
+  const wb = new ExcelJS.Workbook();
+  const s = wb.addWorksheet("Assumptions");
+  s.getCell("A1").value = 14;
+  s.getCell("B1").value = { formula: "A1*2", result: 28 };
+  s.getCell("D25").value = "= Blended realization − trade discount";
+  s.getCell("D26").value = "= Sum of all ₹/t variable cost levers";
+
+  const artifact = await extractWorkbookArtifact(Buffer.from(await wb.xlsx.writeBuffer()));
+  const d25 = artifact.snapshot!.sheets.Assumptions.cells.find((c) => c.r === 24 && c.c === 3);
+  const b1 = artifact.snapshot!.sheets.Assumptions.cells.find((c) => c.r === 0 && c.c === 1);
+  assert.ok(d25);
+  assert.strictEqual(d25!.is_formula, false);
+  assert.strictEqual(b1!.is_formula, true);
+
+  const { reconcileFidelity } = await import("./fidelityReconciliation.js");
+  const report = reconcileFidelity(artifact.snapshot!, []);
+  assert.ok(
+    !report.unsupported_cells.some((u) => u.cell === "D25" || u.cell === "D26"),
+    `notes should not be unsupported: ${JSON.stringify(report.unsupported_cells)}`,
+  );
+});
+
 test("excelExtractor: aggregates functions absent from HyperFormula registry", async () => {
   const wb = new ExcelJS.Workbook();
   const sheet = wb.addWorksheet("Model");

@@ -137,16 +137,24 @@ const envSchema = z.object({
   DEPLOYMENT_PROFILE: z.enum(["standard", "showcase", "enterprise"]).default("standard"),
   /**
    * When true, scenario creator cannot approve their own scenario (maker-checker).
-   * Hard-required under DEPLOYMENT_PROFILE=enterprise (see loadConfig).
+   *
+   * Left undefined when unset so loadConfig can resolve it per profile: required
+   * under `enterprise`, off by default elsewhere. Defaulting it on everywhere
+   * made single-operator installs unusable — the only user could never approve
+   * the scenario they had just created, so no run could ever start.
    */
   ENFORCE_MAKER_CHECKER: z
     .string()
     .optional()
     .transform((v) => {
-      if (v == null || v === "") return true;
+      if (v == null || v === "") return undefined;
       return v === "1" || v.toLowerCase() === "true";
     }),
-  /** HyperFormula license key — gpl-v3 allowed in dev/test only. */
+  /**
+   * HyperFormula license key. This product is non-commercial, so the free
+   * GPLv3 key is valid in every environment (ADR 0005). A commercial
+   * Handsoncode key can still be supplied if the licensing posture changes.
+   */
   HYPERFORMULA_LICENSE_KEY: z.string().min(1).default("gpl-v3"),
   /** Bearer token required to scrape /metrics in production. */
   METRICS_TOKEN: z.string().min(16).optional(),
@@ -207,12 +215,6 @@ function loadConfig(): AppConfig {
     console.error("DEMO_MODE must not be enabled in production");
     process.exit(1);
   }
-  if (env.NODE_ENV === "production" && env.HYPERFORMULA_LICENSE_KEY === "gpl-v3") {
-    console.error(
-      "HYPERFORMULA_LICENSE_KEY=gpl-v3 is not permitted in production — procure a commercial Handsoncode license",
-    );
-    process.exit(1);
-  }
   if (env.NODE_ENV === "production" && !env.METRICS_TOKEN) {
     console.error("METRICS_TOKEN is required in production (min 16 characters)");
     process.exit(1);
@@ -230,6 +232,9 @@ function loadConfig(): AppConfig {
     );
     process.exit(1);
   }
+  // Resolve the per-profile default now that the profile is known.
+  env.ENFORCE_MAKER_CHECKER =
+    env.ENFORCE_MAKER_CHECKER ?? env.DEPLOYMENT_PROFILE === "enterprise";
   if (
     env.DEPLOYMENT_PROFILE === "enterprise" &&
     (!env.CREDENTIALS_ENCRYPTION_KEY ||
