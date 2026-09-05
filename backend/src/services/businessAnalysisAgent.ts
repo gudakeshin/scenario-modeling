@@ -87,6 +87,9 @@ interface AnalysisContext extends PlModeInput {
   sensitivity?: { target_metric: string; bars: { variable_name: string; spread: number; low_delta: number; high_delta: number }[] } | null;
   monte_carlo?: { metrics: Record<string, { p10: number; p50: number; p90: number; mean: number; stddev: number }> } | null;
   currency_symbol: string;
+  /** e.g. "Crore" — every figure in `pl`/`base_pl` is already expressed in
+   *  this scale. Empty when the workbook has no detected scale (raw ones). */
+  currency_unit: string;
   period_count?: number;
   company_name?: string;
   industry?: string;
@@ -164,7 +167,15 @@ const CURRENCY_SYMBOLS: Record<string, string> = {
   AUD: "A$", CAD: "C$", CHF: "CHF", SGD: "S$",
 };
 
-async function getCurrencyFromContext(scenarioId: string): Promise<string> {
+/**
+ * The workbook's scale (e.g. "Crore") is not optional context — every P&L
+ * figure the agent is handed is already expressed in it. Without a unit
+ * attached, an LLM given "₹28,488.46" with no other signal invents its own
+ * scale word ("₹28,488.46M"), silently misstating a ₹284.88bn revenue line as
+ * ₹28.49bn. Both symbol and unit travel together so every formatted amount
+ * carries the real scale.
+ */
+async function getCurrencyFromContext(scenarioId: string): Promise<{ symbol: string; unit: string }> {
   try {
     const r = await pool.query(
       `SELECT cc.context_data FROM company_context cc
@@ -173,10 +184,12 @@ async function getCurrencyFromContext(scenarioId: string): Promise<string> {
        WHERE s.scenario_id = $1 LIMIT 1`,
       [scenarioId]
     );
-    const code = (r.rows[0]?.context_data as Record<string, unknown>)?.currency as string;
-    return CURRENCY_SYMBOLS[code] || code || "$";
+    const data = r.rows[0]?.context_data as Record<string, unknown> | undefined;
+    const code = data?.currency as string;
+    const unit = (data?.currency_unit as string) || "";
+    return { symbol: CURRENCY_SYMBOLS[code] || code || "$", unit };
   } catch {
-    return "$";
+    return { symbol: "$", unit: "" };
   }
 }
 
@@ -276,7 +289,7 @@ async function loadAnalysisContext(
     base_pl = await resolveBasePl(rawPl, model, scenarioId);
   }
 
-  const currency_symbol = await getCurrencyFromContext(scenarioId);
+  const { symbol: currency_symbol, unit: currency_unit } = await getCurrencyFromContext(scenarioId);
   const company = await getCompanyContextForScenario(scenarioId);
 
   return {
@@ -285,6 +298,7 @@ async function loadAnalysisContext(
     pl,
     base_pl,
     currency_symbol,
+    currency_unit,
     absurdity_warnings: absurdity_warnings.length > 0 ? absurdity_warnings : undefined,
     period_count: periodCount,
     parameters: pRes.rows.map((r: { extracted_name: string; mapped_variable_id: string; scenario_value: number; status: string }) => ({
@@ -305,6 +319,7 @@ async function loadAnalysisContext(
 
 function generateIntegrityFallback(ctx: AnalysisContext, mode: AnalysisModeResult): BusinessInsight {
   const c = ctx.currency_symbol;
+  const u = ctx.currency_unit ? ` ${ctx.currency_unit}` : "";
   const leverSummary = ctx.parameters.length > 0
     ? ctx.parameters.map((p) => `${p.name}=${p.value}%`).join(", ")
     : "stated scenario levers";
@@ -322,7 +337,7 @@ function generateIntegrityFallback(ctx: AnalysisContext, mode: AnalysisModeResul
     {
       title: "Scenario absolute levels are not proven net impact",
       detail: levelLines.length > 0
-        ? `Scenario shows ${levelLines.map(([k, v]) => `${k}=${c}${v.toLocaleString()}`).join("; ")} — cite only as levels, not as war/shock impact vs base.`
+        ? `Scenario shows ${levelLines.map(([k, v]) => `${k}=${c}${v.toLocaleString()}${u}`).join("; ")} — cite only as levels, not as war/shock impact vs base.`
         : "Scenario P&L levels exist but cannot be compared to a valid baseline.",
       severity: "negative",
       evidence: levelLines.map(([metric_id, value]) => ({ metric_id, value })),
@@ -387,6 +402,7 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
   }
 
   const c = ctx.currency_symbol;
+  const u = ctx.currency_unit ? ` ${ctx.currency_unit}` : "";
   const deltas: { metric: string; base: number; scenario: number; delta: number; pct: number }[] = [];
   for (const [metric, scenarioVal] of Object.entries(ctx.pl)) {
     const baseVal = ctx.base_pl[metric] ?? 0;
@@ -402,7 +418,7 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
 
   const direction = (netIncome?.delta ?? 0) >= 0 ? "positive" : "negative";
   const headline = netIncome
-    ? `This scenario has a net ${direction} impact of ${c}${Math.abs(netIncome.delta).toLocaleString()} (${netIncome.pct >= 0 ? "+" : ""}${netIncome.pct.toFixed(1)}%) on net income, driven primarily by changes in ${topMover?.metric?.replace(/_/g, " ") || "key drivers"}.`
+    ? `This scenario has a net ${direction} impact of ${c}${Math.abs(netIncome.delta).toLocaleString()}${u} (${netIncome.pct >= 0 ? "+" : ""}${netIncome.pct.toFixed(1)}%) on net income, driven primarily by changes in ${topMover?.metric?.replace(/_/g, " ") || "key drivers"}.`
     : `Scenario "${ctx.nl_input}" has been analyzed. Review the implications below.`;
 
   const implications: BusinessInsight["implications"] = [];
@@ -411,7 +427,7 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
     const label = d.metric.replace(/_/g, " ");
     implications.push({
       title: `${label} ${d.delta >= 0 ? "increases" : "decreases"} by ${Math.abs(d.pct).toFixed(1)}%`,
-      detail: `${label} moves from ${c}${d.base.toLocaleString()} to ${c}${d.scenario.toLocaleString()} (${d.delta >= 0 ? "+" : "-"}${c}${Math.abs(d.delta).toLocaleString()}).${
+      detail: `${label} moves from ${c}${d.base.toLocaleString()}${u} to ${c}${d.scenario.toLocaleString()}${u} (${d.delta >= 0 ? "+" : "-"}${c}${Math.abs(d.delta).toLocaleString()}${u}).${
         Math.abs(d.pct) > 10 ? " This is a material change that warrants close attention." : ""
       }`,
       severity: sev,
@@ -433,7 +449,7 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
   if (ctx.sensitivity?.bars && ctx.sensitivity.bars.length > 0) {
     const topSensitive = ctx.sensitivity.bars[0];
     risks.push({
-      risk: `High sensitivity to ${topSensitive.variable_name} — a ±swing produces ${c}${topSensitive.spread.toLocaleString()} variation`,
+      risk: `High sensitivity to ${topSensitive.variable_name} — a ±swing produces ${c}${topSensitive.spread.toLocaleString()}${u} variation`,
       likelihood: "medium",
       mitigation: `Develop contingency plans for ${topSensitive.variable_name} volatility. Consider scenario planning for best/worst cases.`,
     });
@@ -446,7 +462,7 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
       const rangeAsPct = niMc.mean !== 0 ? (range / niMc.mean) * 100 : 0;
       if (rangeAsPct > 20) {
         risks.push({
-          risk: `Wide outcome uncertainty: P10-P90 range for net income is ${c}${range.toLocaleString()} (${rangeAsPct.toFixed(0)}% of mean)`,
+          risk: `Wide outcome uncertainty: P10-P90 range for net income is ${c}${range.toLocaleString()}${u} (${rangeAsPct.toFixed(0)}% of mean)`,
           likelihood: "medium",
           mitigation: "The wide confidence band suggests multiple outcomes are plausible. Consider phased investment or real-options approach.",
         });
@@ -469,14 +485,14 @@ function generateFallbackAnalysis(ctx: AnalysisContext): BusinessInsight {
     recommendations.push({
       action: "Proceed with scenario — the expected impact is net positive",
       priority: "short-term",
-      rationale: `Net income improves by ${c}${netIncome.delta.toLocaleString()}. Validate assumptions and develop an implementation timeline.`,
+      rationale: `Net income improves by ${c}${netIncome.delta.toLocaleString()}${u}. Validate assumptions and develop an implementation timeline.`,
       owner: "FP&A / Strategy",
     });
   } else if (netIncome && netIncome.delta < 0) {
     recommendations.push({
       action: "Develop mitigation plan before proceeding",
       priority: "immediate",
-      rationale: `Net income declines by ${c}${Math.abs(netIncome.delta).toLocaleString()}. Identify offsetting cost savings or revenue upside.`,
+      rationale: `Net income declines by ${c}${Math.abs(netIncome.delta).toLocaleString()}${u}. Identify offsetting cost savings or revenue upside.`,
       owner: "FP&A / Operations",
     });
   }
@@ -543,7 +559,8 @@ Rules:
 - Recommendations should name an owner (FP&A, Operations, Sales, Strategy, CEO, etc.)
 - The headline should be something a CEO can read in 5 seconds and know the key decision
 - End confidence_note with: "AI-generated analysis — validate with domain experts."
-- When ANALYSIS MODE is integrity: follow the INTEGRITY MODE rules in the user message exactly.`;
+- When ANALYSIS MODE is integrity: follow the INTEGRITY MODE rules in the user message exactly.
+- Every figure in the data you're given already carries its unit (e.g. "₹28,488.46 Crore"). When you restate a number in your own prose, keep that exact unit — never append, infer, or convert to a different scale word (Million, Billion, Lakh, etc.). "₹28,488.46 Crore" is not "₹28,488.46 Million"; those differ by 100x.`;
 
 const INTEGRITY_MODE_RULES = `## ANALYSIS MODE: integrity (MANDATORY)
 
@@ -559,7 +576,14 @@ The baseline is missing or ~0 (or % deltas are otherwise uninterpretable). Produ
 
 function buildCanonicalMetricsTable(ctx: AnalysisContext): string[] {
   const c = ctx.currency_symbol;
-  const lines = ["## CANONICAL METRICS (cite ONLY these exact values)", "metric_id | base | scenario"];
+  const u = ctx.currency_unit ? ` ${ctx.currency_unit}` : "";
+  const lines = [
+    "## CANONICAL METRICS (cite ONLY these exact values)",
+    ...(u
+      ? [`Every figure below is already expressed in ${ctx.currency_unit} — cite it exactly with that unit; do not append your own scale word (Million/Billion/Lakh) or convert it.`]
+      : []),
+    "metric_id | base | scenario",
+  ];
   const keys = new Set([...Object.keys(ctx.pl), ...Object.keys(ctx.base_pl)]);
   for (const metric of keys) {
     if (metric === "periods" || metric === "aggregate" || metric === "absurdity_warnings" || metric === "base_pl" || metric === "period_count") {
@@ -568,13 +592,14 @@ function buildCanonicalMetricsTable(ctx: AnalysisContext): string[] {
     const scenario = ctx.pl[metric];
     const base = ctx.base_pl[metric] ?? 0;
     if (typeof scenario !== "number" || !Number.isFinite(scenario)) continue;
-    lines.push(`- ${metric}: base=${c}${base} scenario=${c}${scenario}`);
+    lines.push(`- ${metric}: base=${c}${base}${u} scenario=${c}${scenario}${u}`);
   }
   return lines;
 }
 
 function buildUserPrompt(ctx: AnalysisContext): string {
   const c = ctx.currency_symbol;
+  const u = ctx.currency_unit ? ` ${ctx.currency_unit}` : "";
   const mode = detectAnalysisMode(ctx);
   const parts = [
     `## Scenario: "${ctx.nl_input}"`,
@@ -586,6 +611,7 @@ function buildUserPrompt(ctx: AnalysisContext): string {
     ctx.business_model ? `Business model: ${ctx.business_model}` : "",
     ctx.cost_revenue_composition || "",
     ctx.period_count ? `Periods: ${ctx.period_count} quarters` : "",
+    ctx.currency_unit ? `All figures below are already in ${ctx.currency_unit} — write them back exactly with that unit, never in Million/Billion/Lakh or any other scale.` : "",
     "",
     "## Assumptions Changed",
     ...ctx.parameters.map((p) => `- ${p.name} (${p.variable_id}): ${p.value}% [${p.status}]`),
@@ -604,7 +630,7 @@ function buildUserPrompt(ctx: AnalysisContext): string {
     const base = ctx.base_pl[metric] ?? 0;
     const delta = val - base;
     const pct = Math.abs(base) > BASE_NEAR_ZERO ? ((delta / base) * 100).toFixed(1) : "n/a";
-    parts.push(`- ${metric}: ${c}${base.toLocaleString()} → ${c}${val.toLocaleString()} (${delta >= 0 ? "+" : "-"}${c}${Math.abs(delta).toLocaleString()}, ${pct}%)`);
+    parts.push(`- ${metric}: ${c}${base.toLocaleString()}${u} → ${c}${val.toLocaleString()}${u} (${delta >= 0 ? "+" : "-"}${c}${Math.abs(delta).toLocaleString()}${u}, ${pct}%)`);
   }
 
   if (ctx.causal_chain && ctx.causal_chain.length > 0) {
@@ -624,14 +650,14 @@ function buildUserPrompt(ctx: AnalysisContext): string {
   if (ctx.sensitivity?.bars && ctx.sensitivity.bars.length > 0) {
     parts.push("", "## Sensitivity Analysis (highest-impact variables)");
     for (const bar of ctx.sensitivity.bars.slice(0, 5)) {
-      parts.push(`- ${bar.variable_name}: spread ${c}${bar.spread.toLocaleString()} (low: ${bar.low_delta >= 0 ? "+" : "-"}${c}${Math.abs(bar.low_delta).toLocaleString()}, high: +${c}${bar.high_delta.toLocaleString()})`);
+      parts.push(`- ${bar.variable_name}: spread ${c}${bar.spread.toLocaleString()}${u} (low: ${bar.low_delta >= 0 ? "+" : "-"}${c}${Math.abs(bar.low_delta).toLocaleString()}${u}, high: +${c}${bar.high_delta.toLocaleString()}${u})`);
     }
   }
 
   if (ctx.monte_carlo?.metrics) {
     parts.push("", "## Monte Carlo Results (probabilistic)");
     for (const [metric, data] of Object.entries(ctx.monte_carlo.metrics)) {
-      parts.push(`- ${metric}: P10=${c}${data.p10.toLocaleString()} | P50=${c}${data.p50.toLocaleString()} | P90=${c}${data.p90.toLocaleString()} (stddev: ${c}${data.stddev.toLocaleString()})`);
+      parts.push(`- ${metric}: P10=${c}${data.p10.toLocaleString()}${u} | P50=${c}${data.p50.toLocaleString()}${u} | P90=${c}${data.p90.toLocaleString()}${u} (stddev: ${c}${data.stddev.toLocaleString()}${u})`);
     }
   }
 
@@ -863,11 +889,15 @@ function valuesMatch(claimed: number, actual: number): boolean {
 
 /** Extract numeric tokens from prose (handles 10,986.18 and 182.7). */
 export function extractNumericClaims(text: string): number[] {
-  // Mask years and percentages so "2025"→25 and "25–50%" never become P&L claims.
+  // Mask years, percentages, and bps figures so "2025"→25, "25–50%", and
+  // "-250 bps" never become raw P&L claims (a bare bps number can otherwise
+  // scale-collide with an unrelated metric, e.g. -250 vs a ~28,000 revenue).
   const masked = text
     .replace(/\b(?:19|20)\d{2}\b/g, " ")
     .replace(/-?\d+(?:\.\d+)?\s*[–—-]\s*-?\d+(?:\.\d+)?\s*%/g, " ")
-    .replace(/-?\d+(?:\.\d+)?\s*%/g, " ");
+    .replace(/-?\d+(?:\.\d+)?\s*%/g, " ")
+    .replace(/-?\d+(?:\.\d+)?\s*[–—-]\s*-?\d+(?:\.\d+)?\s*(?:bps|basis points?)\b/gi, " ")
+    .replace(/-?\d+(?:\.\d+)?\s*(?:bps|basis points?)\b/gi, " ");
   const out: number[] = [];
   const re = /(?<![A-Za-z])(-?\d{1,3}(?:,\d{3})*(?:\.\d+)?|-?\d+\.\d+)(?![\w%])/g;
   let m: RegExpExecArray | null;
@@ -1019,6 +1049,9 @@ function mergeKnownForLookup(
 }
 
 function formatGroundingMismatchFeedback(m: EvidenceMismatch): string {
+  if (m.metric_id === "bps_consistency") {
+    return `- "${m.implication_title}": states ${m.claimed_value} bps, but the percentages quoted in the same sentence imply ${m.actual_value} bps — make the bps figure and the percentages agree.`;
+  }
   const claimedZero =
     Math.abs(m.claimed_value) <= BASE_NEAR_ZERO &&
     m.actual_value != null &&
@@ -1030,6 +1063,61 @@ function formatGroundingMismatchFeedback(m: EvidenceMismatch): string {
     return `- "${m.implication_title}": ${m.metric_id} claimed ${m.claimed_value} → N/A (remove claim or pick a real metric_id from CANONICAL METRICS)`;
   }
   return `- "${m.implication_title}": ${m.metric_id} claimed ${m.claimed_value} → use ${m.actual_value}`;
+}
+
+const BPS_CONSISTENCY_TOLERANCE = 10;
+
+/** Extract "X% → Y%" / "X% to Y%" transitions from prose. */
+function extractPercentTransitions(text: string): Array<{ from: number; to: number }> {
+  const re = /(-?\d+(?:\.\d+)?)\s*%\s*(?:→|->|-->|to)\s*(-?\d+(?:\.\d+)?)\s*%/gi;
+  const out: Array<{ from: number; to: number }> = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    out.push({ from: Number(m[1]), to: Number(m[2]) });
+  }
+  return out;
+}
+
+/** Extract "N bps" / "N basis points" claims from prose. */
+function extractBpsClaims(text: string): number[] {
+  const re = /(-?\d+(?:\.\d+)?)\s*(?:bps|basis points?)\b/gi;
+  const out: number[] = [];
+  let m: RegExpExecArray | null;
+  while ((m = re.exec(text)) !== null) {
+    out.push(Number(m[1]));
+  }
+  return out;
+}
+
+/**
+ * Deterministic check: a stated "N bps" move must equal the percentage-point
+ * gap of any "X% → Y%" transition quoted in the same prose block. This
+ * catches headline arithmetic drift (e.g. "180 bps" next to a quoted
+ * "24.0% → 23.0%", which is actually a 100 bps move) that metric-lookup
+ * grounding can never see, because neither number is a P&L citation.
+ */
+function checkBpsConsistency(insight: BusinessInsight): EvidenceMismatch[] {
+  const mismatches: EvidenceMismatch[] = [];
+  for (const part of collectInsightProse(insight)) {
+    const transitions = extractPercentTransitions(part.text);
+    if (transitions.length === 0) continue;
+    const bpsClaims = extractBpsClaims(part.text);
+    for (const claimedBps of bpsClaims) {
+      const matchesAny = transitions.some(
+        (t) => Math.abs(Math.abs(claimedBps) - Math.abs((t.to - t.from) * 100)) <= BPS_CONSISTENCY_TOLERANCE,
+      );
+      if (!matchesAny) {
+        const expected = transitions[0];
+        mismatches.push({
+          implication_title: part.label,
+          metric_id: "bps_consistency",
+          claimed_value: claimedBps,
+          actual_value: Math.round(Math.abs((expected.to - expected.from) * 100)),
+        });
+      }
+    }
+  }
+  return mismatches;
 }
 
 /**
@@ -1133,6 +1221,8 @@ export function verifyEvidenceAgainstValues(
       });
     }
   }
+
+  for (const m of checkBpsConsistency(insight)) pushUnique(m);
 
   return { ok: mismatches.length === 0, mismatches };
 }

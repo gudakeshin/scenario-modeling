@@ -4,11 +4,23 @@
  * All components should import from here instead of defining their own METRIC_LABELS.
  */
 
-/** Canonical display order for P&L metrics */
+import { useSyncExternalStore } from "react";
+
+/**
+ * Canonical display order for P&L metrics — all six are absolute currency
+ * lines. `gross_margin` (a percentage — see inferMetricType below, which
+ * treats every "*margin*" id as percent) must NOT sit in this list: the
+ * waterfall reads this array as its bridge and does `value - running` on
+ * each entry, and a ~0.57 fraction fed through that arithmetic collapses to
+ * `-running` — i.e. the "Gross Margin" bar reads as the negative of
+ * whatever ran before it (Revenue, when COGS wasn't separately captured),
+ * so Revenue and "Gross Margin" show the same magnitude on the chart.
+ * `gross_profit` is the actual absolute figure this step needs.
+ */
 export const METRIC_ORDER = [
   "revenue",
   "cogs",
-  "gross_margin",
+  "gross_profit",
   "opex",
   "ebitda",
   "net_income",
@@ -123,6 +135,7 @@ export const METRIC_COLORS: Record<string, string> = {
   revenue: "var(--chart-positive)",
   cogs: "var(--chart-negative)",
   gross_margin: "var(--chart-neutral)",
+  gross_profit: "var(--chart-neutral)",
   opex: "var(--chart-accent-3)",
   ebitda: "var(--accent)",
   net_income: "var(--text-primary)",
@@ -160,6 +173,36 @@ let _currencyUnit = "";
 /** Workspace preference for scale display (Crore vs Million). */
 let _preferUnit: DisplayUnit | "auto" = "auto";
 
+/**
+ * `_currency`/`_currencyUnit` are read by plain functions (fmtMetric,
+ * fmtCurrency, …) called straight from JSX, not through React state — a
+ * component that renders once before the workspace's real currency loads
+ * (a fast panel like Driver Tree beating the slower onboarding-status
+ * fetch, or a workspace switch mid-session) keeps showing the stale "$"
+ * default forever, because nothing tells React to re-render it once the
+ * real value arrives. `useCurrencyVersion` gives components a value that
+ * changes on every setCurrency call, so subscribing to it forces exactly
+ * that re-render.
+ */
+let _version = 0;
+const _listeners = new Set<() => void>();
+function bumpVersion() {
+  _version++;
+  for (const l of _listeners) l();
+}
+function subscribeCurrency(onChange: () => void): () => void {
+  _listeners.add(onChange);
+  return () => _listeners.delete(onChange);
+}
+function getCurrencyVersion() {
+  return _version;
+}
+/** Call in any component that formats amounts via this module, so it
+ *  re-renders when the workspace's real currency/unit finishes loading. */
+export function useCurrencyVersion(): number {
+  return useSyncExternalStore(subscribeCurrency, getCurrencyVersion, getCurrencyVersion);
+}
+
 const numberFormatCache = new Map<string, Intl.NumberFormat>();
 
 function indianFmt(opts: Intl.NumberFormatOptions): Intl.NumberFormat {
@@ -175,10 +218,12 @@ function indianFmt(opts: Intl.NumberFormatOptions): Intl.NumberFormat {
 export function setCurrency(code: string, unit?: string) {
   _currency = code || "USD";
   _currencyUnit = unit || "";
+  bumpVersion();
 }
 
 export function setPreferDisplayUnit(unit: DisplayUnit | "auto") {
   _preferUnit = unit;
+  bumpVersion();
 }
 
 export function getCurrencySymbol(): string {
@@ -259,7 +304,11 @@ export type MetricType = "currency" | "count" | "percent" | "ratio" | "volume" |
 export function inferMetricType(id: string, name?: string): MetricType {
   const text = `${id} ${name ?? ""}`.toLowerCase();
   if (/margin|rate|growth|pct|percent/.test(text)) return "percent";
-  if (/ratio|turnover/.test(text)) return "ratio";
+  // "ratio"/"turnover" must sit on a token boundary (snake_case ids join
+  // words with "_", so \b alone doesn't help — "_" is a word character). A
+  // bare substring test mistook "revenue_from_operations" for a ratio,
+  // since "operations" contains "ratio" (ope-RATIO-ns).
+  if (/(^|[^a-z])(ratio|turnover)([^a-z]|$)/i.test(text)) return "ratio";
   if (/headcount|fte|stores/.test(text)) return "count";
   if (/volume|units/.test(text)) return "volume";
   return "currency";

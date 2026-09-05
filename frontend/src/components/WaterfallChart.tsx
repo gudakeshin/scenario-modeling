@@ -19,6 +19,7 @@ import {
   fmtCurrency,
   getCurrencySymbol,
   withCanonicalMetrics,
+  useCurrencyVersion,
 } from "@/lib/metrics";
 import { chartColors, formatCompactCurrency } from "@/lib/chartTheme";
 import { ChartDataTable } from "./ChartDataTable";
@@ -46,6 +47,7 @@ interface WaterfallItem {
 }
 
 export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: WaterfallChartProps) {
+  useCurrencyVersion();
   // Models name their lines however the source workbook does. Project onto the
   // canonical ids the bridge is defined in, or a P&L that says "gross_revenue"
   // and "total_opex" renders as a single EBITDA bar.
@@ -82,8 +84,12 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
           isTotal: true,
         });
       } else {
-        // Intermediate items (COGS, OpEx subtracted from running)
-        const delta = metric === "gross_margin" ? val - running : val;
+        // Intermediate items (COGS, OpEx subtracted from running). Gross
+        // Profit is an absolute level, not a subtraction amount — when a
+        // model has no separate COGS line, this recovers COGS implicitly
+        // as (gross_profit - running), landing `running` at the reported
+        // gross profit instead of double-counting or skipping the step.
+        const delta = metric === "gross_profit" ? val - running : val;
         const isSubtraction = metric === "cogs" || metric === "opex";
         const amount = isSubtraction ? -val : delta;
         const start = running;

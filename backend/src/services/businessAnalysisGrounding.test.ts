@@ -91,6 +91,53 @@ test("extractNumericClaims: masks years and percent ranges", () => {
   assert.ok(!nums.includes(-10));
 });
 
+test("extractNumericClaims: masks bps and basis-point ranges", () => {
+  const nums = extractNumericClaims(
+    "EBITDA margin erodes by 180 bps, with a further 50-100 basis points at risk under the bear case",
+  );
+  assert.ok(!nums.includes(180), `should not extract 180 from "180 bps": ${nums}`);
+  assert.ok(!nums.includes(50), `should not extract 50 from bps range: ${nums}`);
+  assert.ok(!nums.includes(100), `should not extract 100 from bps range: ${nums}`);
+});
+
+test("verifyEvidenceAgainstValues: bps claim no longer scale-collides with an unrelated metric", () => {
+  // Regression: a bare "-250" from "-250 bps" used to be swept up as a raw
+  // P&L citation and scale-match against revenue (28488.46 / 250 ≈ 114×).
+  const insight = sampleInsight({
+    implications: [
+      {
+        title: "Margin compresses further in the bear case",
+        detail: "Revenue holds near plan, but margin compresses by an additional -250 bps in the bear case.",
+        severity: "negative",
+      },
+    ],
+  });
+  const result = verifyEvidenceAgainstValues(insight, { revenue: 28488.4632 });
+  assert.strictEqual(result.ok, true, `expected no mismatches, got: ${JSON.stringify(result.mismatches)}`);
+});
+
+test("verifyEvidenceAgainstValues: bps figure inconsistent with quoted percentages fails", () => {
+  const insight = sampleInsight({
+    headline:
+      "5% raw material cost increase erodes EBITDA margin by 180 bps (24.0% → 23.0%) with no pricing power to offset costs",
+  });
+  const result = verifyEvidenceAgainstValues(insight, { revenue: 28488.4632 });
+  assert.strictEqual(result.ok, false);
+  const m = result.mismatches.find((x) => x.metric_id === "bps_consistency");
+  assert.ok(m, `expected a bps_consistency mismatch, got: ${JSON.stringify(result.mismatches)}`);
+  assert.strictEqual(m?.claimed_value, 180);
+  assert.strictEqual(m?.actual_value, 100);
+});
+
+test("verifyEvidenceAgainstValues: bps figure consistent with quoted percentages passes", () => {
+  const insight = sampleInsight({
+    headline:
+      "5% raw material cost increase erodes EBITDA margin by 100 bps (24.0% → 23.0%) with no pricing power to offset costs",
+  });
+  const result = verifyEvidenceAgainstValues(insight, { revenue: 28488.4632 });
+  assert.strictEqual(result.ok, true, `expected no mismatches, got: ${JSON.stringify(result.mismatches)}`);
+});
+
 test("verifyEvidenceAgainstValues: evidence mismatch fails", () => {
   const insight = sampleInsight({
     implications: [

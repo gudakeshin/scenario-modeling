@@ -59,4 +59,27 @@ describe("WaterfallChart", () => {
       expect(screen.getAllByText(label).length).toBeGreaterThan(0);
     }
   });
+
+  it("does not render Gross Margin's percentage as a currency bar equal to Revenue", () => {
+    // Regression: a model with no bare "cogs" key (e.g. a compound id like
+    // "p_l_cost_of_goods_sold") plus a `gross_margin` *fraction* (0.5695,
+    // i.e. 56.95%) used to feed straight into the waterfall's `value -
+    // running` step. With no COGS bar to shrink `running` first, that left
+    // `running` at Revenue, so the bar showed ~(0.57 - revenue) ≈ -revenue —
+    // Revenue and "Gross Margin" reading as the same magnitude on the chart.
+    render(
+      <WaterfallChart
+        pl={{
+          revenue: 28488.4632,
+          p_l_cost_of_goods_sold: 12264.283408,
+          gross_margin: 0.5695,
+          gross_profit: 16224.179792,
+          total_operating_expenses: 10157.000108,
+          ebitda: 6539.6796844,
+        }}
+      />,
+    );
+    expect(screen.queryByText("Gross Margin")).not.toBeInTheDocument();
+    expect(screen.getAllByText("Gross Profit").length).toBeGreaterThan(0);
+  });
 });
