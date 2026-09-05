@@ -82,4 +82,15 @@ describe("WaterfallChart", () => {
     expect(screen.queryByText("Gross Margin")).not.toBeInTheDocument();
     expect(screen.getAllByText("Gross Profit").length).toBeGreaterThan(0);
   });
+
+  it("shows an explanatory empty state for a model with no canonical P&L ids", () => {
+    // A bare dimensional model (e.g. just "amount"/"units", no Revenue/COGS/
+    // OpEx/EBITDA breakdown) intersects METRIC_ORDER at nothing. Previously
+    // this rendered an empty Recharts <BarChart> — a blank box with no
+    // explanation, which reads as "the chart is broken" rather than "this
+    // model has no waterfall-shaped data".
+    render(<WaterfallChart pl={{ amount: 718300, units: 350 }} />);
+    expect(screen.getByText(/No standard P&L bridge/)).toBeInTheDocument();
+    expect(screen.getByText(/amount, units/)).toBeInTheDocument();
+  });
 });

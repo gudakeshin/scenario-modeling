@@ -108,6 +108,13 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
     return items;
   }, [canonicalPl]);
 
+  // A model whose P&L uses ids outside the canonical set entirely (e.g. a
+  // bare dimensional "amount"/"units" pair with no Revenue/COGS/OpEx/EBITDA
+  // breakdown) intersects METRIC_ORDER at nothing, so `data` is empty. An
+  // empty Recharts <BarChart> renders as a blank box with no explanation —
+  // tell the user why instead of silently showing nothing.
+  const availableMetrics = useMemo(() => Object.keys(canonicalPl), [canonicalPl]);
+
   // Delta waterfall (if base provided)
   const deltaData = useMemo(() => {
     if (!basePl) return null;
@@ -139,6 +146,23 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
       </div>
     );
   };
+
+  if (data.length === 0) {
+    return (
+      <div>
+        <p className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-2">{title}</p>
+        <div className="h-52 flex items-center justify-center text-center px-6">
+          <p className="text-xs text-[var(--text-muted)]">
+            No standard P&L bridge (Revenue → COGS → Gross Profit → OpEx → EBITDA → Net Income) found in this model.
+            {availableMetrics.length > 0 && (
+              <> This model reports: {availableMetrics.slice(0, 6).join(", ")}
+              {availableMetrics.length > 6 ? ", …" : ""}. Try the Trend Lines tab instead.</>
+            )}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div>
