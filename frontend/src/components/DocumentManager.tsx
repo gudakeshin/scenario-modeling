@@ -19,7 +19,7 @@ import {
   type IngestionReport,
   type FidelityReport,
 } from "@/lib/api";
-import { getCurrencySymbol } from "@/lib/metrics";
+import { getCurrencySymbol, useCurrencyVersion } from "@/lib/metrics";
 import { useUiStore } from "@/stores/uiStore";
 import { useConfirm } from "@/hooks/useConfirm";
 import { toast } from "sonner";
@@ -48,6 +48,7 @@ function ingestionSummary(doc: DocumentRecord): string | null {
 }
 
 export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) {
+  useCurrencyVersion();
   const docManagerInitialTab = useUiStore((s) => s.docManagerInitialTab);
   const setDocManagerInitialTab = useUiStore((s) => s.setDocManagerInitialTab);
   const [tab, setTab] = useState<Tab>(docManagerInitialTab || "documents");

@@ -3,7 +3,7 @@
 import { useEffect, useState } from "react";
 import Link from "next/link";
 import { getPortfolioDashboard, type PortfolioDashboard } from "@/lib/api";
-import { fmtCurrency } from "@/lib/metrics";
+import { fmtCurrency, useCurrencyVersion } from "@/lib/metrics";
 import { TradingWindowBanner } from "@/components/TradingWindowBanner";
 
 function fmtKpi(value: number | string | null | undefined): string {
@@ -15,6 +15,8 @@ function fmtKpi(value: number | string | null | undefined): string {
 }
 
 export default function DashboardPage() {
+  // Re-render once the workspace's real currency/unit loads (see useCurrencyVersion).
+  useCurrencyVersion();
   const [data, setData] = useState<PortfolioDashboard | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);

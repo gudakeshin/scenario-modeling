@@ -10,7 +10,7 @@ import {
   type ScenarioVersion,
   type ScenarioVersionDiff,
 } from "@/lib/api";
-import { fmtMetric, fmtMetricSigned, metricLabel } from "@/lib/metrics";
+import { fmtMetric, fmtMetricSigned, metricLabel, useCurrencyVersion } from "@/lib/metrics";
 
 interface VersionHistoryPanelProps {
   scenarioId: string;
@@ -19,6 +19,7 @@ interface VersionHistoryPanelProps {
 }
 
 export function VersionHistoryPanel({ scenarioId, onClose, onMinimize }: VersionHistoryPanelProps) {
+  useCurrencyVersion();
   const [versions, setVersions] = useState<ScenarioVersion[]>([]);
   const [fromVer, setFromVer] = useState<number | null>(null);
   const [toVer, setToVer] = useState<number | null>(null);

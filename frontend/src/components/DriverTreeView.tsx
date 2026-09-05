@@ -9,7 +9,7 @@ import {
   type DriverTreeNode,
   type DriverTreeResult,
 } from "@/lib/api";
-import { fmtMetric, pickDefaultTargetMetric } from "@/lib/metrics";
+import { fmtMetric, pickDefaultTargetMetric, useCurrencyVersion } from "@/lib/metrics";
 
 interface DriverTreeViewProps {
   scenarioId: string;
@@ -121,6 +121,7 @@ function TreeNode({
 }
 
 export function DriverTreeView({ scenarioId, onClose, onMinimize }: DriverTreeViewProps) {
+  useCurrencyVersion();
   const [result, setResult] = useState<DriverTreeResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

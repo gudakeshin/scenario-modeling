@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { fmtMetric, fmtMetricSigned, inferMetricType, withCanonicalMetrics } from "./metrics";
+import { act, render, screen } from "@testing-library/react";
+import { fmtCurrency, fmtMetric, fmtMetricSigned, inferMetricType, setCurrency, useCurrencyVersion, withCanonicalMetrics } from "./metrics";
 
 describe("inferMetricType", () => {
   it("classifies margins and rates as percent", () => {
@@ -22,6 +23,29 @@ describe("fmtMetric", () => {
 
   it("formats signed percent deltas", () => {
     expect(fmtMetricSigned("ebitda_margin", -1.2)).toBe("-1.2%");
+  });
+});
+
+// ── Reactive currency (useCurrencyVersion) ──
+
+describe("useCurrencyVersion", () => {
+  it("re-renders a mounted component when setCurrency is called later", () => {
+    // Regression: fmtCurrency/fmtMetric read module-level state directly, so a
+    // component that renders once before the workspace's real currency loads
+    // (Driver Tree beating the slower onboarding-status fetch) kept showing
+    // the stale "$" default forever — nothing told React to re-render it.
+    setCurrency("USD");
+    function Amount() {
+      useCurrencyVersion();
+      return <span data-testid="amount">{fmtCurrency(28488.46)}</span>;
+    }
+    render(<Amount />);
+    expect(screen.getByTestId("amount").textContent).toBe("$28,488");
+
+    act(() => setCurrency("INR", "Crore"));
+    expect(screen.getByTestId("amount").textContent).toBe("₹ 28,488.46 Cr");
+
+    setCurrency("USD"); // don't leak into other tests
   });
 });
 

@@ -15,7 +15,7 @@ import {
 import { PanelHeader } from "./PanelHeader";
 import { ChartDataTable } from "./ChartDataTable";
 import { runAttribution, getActiveModel, type AttributionResult } from "@/lib/api";
-import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol, pickDefaultTargetMetric, metricLabel } from "@/lib/metrics";
+import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol, pickDefaultTargetMetric, metricLabel, useCurrencyVersion } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface AttributionViewProps {
@@ -25,6 +25,7 @@ interface AttributionViewProps {
 }
 
 export function AttributionView({ scenarioId, onClose, onMinimize }: AttributionViewProps) {
+  useCurrencyVersion();
   const [result, setResult] = useState<AttributionResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);

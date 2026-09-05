@@ -3,7 +3,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { compareActuals, type ActualsCompareRow } from "@/lib/api";
-import { fmtMetric, fmtMetricSigned, metricLabel } from "@/lib/metrics";
+import { fmtMetric, fmtMetricSigned, metricLabel, useCurrencyVersion } from "@/lib/metrics";
 
 interface ActualsCompareViewProps {
   scenarioId: string;
@@ -25,6 +25,7 @@ function deltaCell(metricId: string, n: number | null) {
 }
 
 export function ActualsCompareView({ scenarioId, onClose, onMinimize }: ActualsCompareViewProps) {
+  useCurrencyVersion();
   const [rows, setRows] = useState<ActualsCompareRow[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);

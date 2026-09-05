@@ -14,7 +14,7 @@ import {
   AreaChart,
 } from "recharts";
 import type { PeriodResult } from "@/lib/api";
-import { METRIC_LABELS, METRIC_COLORS, fmtMetric, getCurrencySymbol } from "@/lib/metrics";
+import { METRIC_LABELS, METRIC_COLORS, fmtMetric, getCurrencySymbol, useCurrencyVersion } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 import { ChartDataTable } from "./ChartDataTable";
 
@@ -26,6 +26,7 @@ interface TrendLineChartProps {
 type ChartMode = "line" | "area";
 
 export function TrendLineChart({ periods, granularity: _granularity }: TrendLineChartProps) {
+  useCurrencyVersion();
   void _granularity; // retained for future use (axis label formatting)
   const [selectedMetrics, setSelectedMetrics] = useState<Set<string>>(new Set(["revenue", "net_income", "ebitda"]));
   const [chartMode, setChartMode] = useState<ChartMode>("line");

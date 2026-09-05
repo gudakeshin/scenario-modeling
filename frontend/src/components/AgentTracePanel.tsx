@@ -1,7 +1,7 @@
 "use client";
 
 import { useState } from "react";
-import { fmtMetric, getCurrencyLabel } from "@/lib/metrics";
+import { fmtMetric, getCurrencyLabel, useCurrencyVersion } from "@/lib/metrics";
 
 export interface CausalChainStep {
   step: string;
@@ -61,6 +61,7 @@ export function AgentTracePanel({
   constraintViolations,
   previewReconciliation,
 }: AgentTracePanelProps) {
+  useCurrencyVersion();
   const [expanded, setExpanded] = useState(true);
   const [showTools, setShowTools] = useState(false);
 

@@ -4,7 +4,7 @@ import { useState, useMemo } from "react";
 import { BarChart, Bar, XAxis, YAxis, CartesianGrid, Tooltip, ResponsiveContainer, Cell } from "recharts";
 import type { PeriodResult } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
-import { METRIC_LABELS, fmtMetric, getCurrencySymbol } from "@/lib/metrics";
+import { METRIC_LABELS, fmtMetric, getCurrencySymbol, useCurrencyVersion } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface PeriodBreakdownViewProps {
@@ -23,6 +23,7 @@ function fmt(metricId: string, n: number) {
 type ViewMode = "table" | "chart";
 
 export function PeriodBreakdownView({ periods, granularity, totalPl, onClose, onMinimize }: PeriodBreakdownViewProps) {
+  useCurrencyVersion();
   const [viewMode, setViewMode] = useState<ViewMode>("chart");
   const [selectedMetric, setSelectedMetric] = useState("net_income");
 

@@ -2,7 +2,7 @@
 
 import { useUiStore } from "@/stores/uiStore";
 import type { DimensionalResultBlock } from "@/lib/api";
-import { getCurrencySymbol } from "@/lib/metrics";
+import { getCurrencySymbol, useCurrencyVersion } from "@/lib/metrics";
 import { getMemberName, setPovMember } from "@/lib/dimensionalPov";
 
 interface Props {
@@ -16,6 +16,7 @@ interface Props {
  * Drives breakdown display from store POV state.
  */
 export function DimensionPovControls({ dimensional, onPovChange, loading }: Props) {
+  useCurrencyVersion();
   const { dimensionalPov, setDimensionalPov, dimensionalMetric, setDimensionalMetric } = useUiStore();
 
   const metrics = Object.keys(dimensional.breakdowns);

@@ -7,7 +7,7 @@ import { compareScenarios } from "../services/comparisonService.js";
 import {
   generateNarrative,
   extractSinglePeriodPl,
-  resolveScenarioCurrencySymbol,
+  resolveScenarioCurrency,
 } from "../services/narrativeService.js";
 import { generateBusinessAnalysis, regenerateWithFeedback, regenerateForGrounding, verifyEvidence } from "../services/businessAnalysisAgent.js";
 import {
@@ -1442,7 +1442,7 @@ async function buildNarrativeForScenario(
     "SELECT extracted_name as name, mapped_variable_id, scenario_value FROM scenario_parameters WHERE scenario_id = $1 AND status != 'rejected'",
     [sid],
   );
-  const currency_symbol = await resolveScenarioCurrencySymbol(sid);
+  const { symbol: currency_symbol, unit: currency_unit } = await resolveScenarioCurrency(sid);
   const narrative = await generateNarrative({
     scenario_name: sRes.rows[0].name,
     nl_input: sRes.rows[0].nl_input,
@@ -1456,6 +1456,7 @@ async function buildNarrativeForScenario(
     })),
     audience,
     currency_symbol,
+    currency_unit,
   });
   await pool.query(
     "UPDATE scenario_outputs SET narrative_summary = $1 WHERE scenario_id = $2 AND output_type = 'pl'",

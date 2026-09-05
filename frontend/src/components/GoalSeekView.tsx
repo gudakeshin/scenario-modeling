@@ -3,7 +3,7 @@
 import { useState, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { runGoalSeek, getActiveModel, applyLeverValue, type GoalSeekResult } from "@/lib/api";
-import { fmtCurrency, pickDefaultTargetMetric } from "@/lib/metrics";
+import { fmtCurrency, pickDefaultTargetMetric, useCurrencyVersion } from "@/lib/metrics";
 
 interface GoalSeekViewProps {
   scenarioId: string;
@@ -12,6 +12,7 @@ interface GoalSeekViewProps {
 }
 
 export function GoalSeekView({ scenarioId, onClose, onMinimize }: GoalSeekViewProps) {
+  useCurrencyVersion();
   const [result, setResult] = useState<GoalSeekResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [applying, setApplying] = useState(false);

@@ -8,7 +8,7 @@ import {
   previewScenario,
   type StoredParameter,
 } from "@/lib/api";
-import { fmtMetric, metricLabel } from "@/lib/metrics";
+import { fmtMetric, metricLabel, useCurrencyVersion } from "@/lib/metrics";
 
 interface LiveWhatIfPanelProps {
   scenarioId: string;
@@ -56,6 +56,7 @@ function scoreLever(id: string, name: string): number {
 }
 
 export function LiveWhatIfPanel({ scenarioId, onClose, onMinimize }: LiveWhatIfPanelProps) {
+  useCurrencyVersion();
   const [levers, setLevers] = useState<WhatIfLever[]>([]);
   const [previewPl, setPreviewPl] = useState<Record<string, number> | null>(null);
   const [basePl, setBasePl] = useState<Record<string, number> | null>(null);

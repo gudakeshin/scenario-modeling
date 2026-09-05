@@ -10,6 +10,8 @@ export interface NarrativeInput {
   audience?: "board" | "internal";
   /** Display symbol (₹, $, €, …) — never hardcode USD. */
   currency_symbol?: string;
+  /** e.g. "Crore" — every figure in `pl` is already expressed in this scale. */
+  currency_unit?: string;
 }
 
 const narrativeSchema = z.object({
@@ -47,7 +49,15 @@ export function extractSinglePeriodPl(rawPl: unknown): Record<string, number> {
   return out;
 }
 
-export async function resolveScenarioCurrencySymbol(scenarioId: string): Promise<string> {
+/**
+ * The workbook's scale (e.g. "Crore") must travel with every figure handed
+ * to the narrative LLM — without it, a bare "₹28,488.46" gets its own
+ * invented scale word in the write-up (typically "Million"), silently
+ * understating the real figure by 100x.
+ */
+export async function resolveScenarioCurrency(
+  scenarioId: string,
+): Promise<{ symbol: string; unit: string }> {
   try {
     const r = await pool.query(
       `SELECT cc.context_data FROM company_context cc
@@ -56,17 +66,20 @@ export async function resolveScenarioCurrencySymbol(scenarioId: string): Promise
        WHERE s.scenario_id = $1 LIMIT 1`,
       [scenarioId],
     );
-    const code = (r.rows[0]?.context_data as Record<string, unknown>)?.currency as string | undefined;
-    if (!code) return "$";
-    return CURRENCY_SYMBOLS[code] || code || "$";
+    const data = r.rows[0]?.context_data as Record<string, unknown> | undefined;
+    const code = data?.currency as string | undefined;
+    const unit = (data?.currency_unit as string) || "";
+    if (!code) return { symbol: "$", unit };
+    return { symbol: CURRENCY_SYMBOLS[code] || code || "$", unit };
   } catch {
-    return "$";
+    return { symbol: "$", unit: "" };
   }
 }
 
 function generateFallbackNarrative(input: NarrativeInput): string {
   const { scenario_name, nl_input, pl, parameters, audience } = input;
   const c = input.currency_symbol || "$";
+  const u = input.currency_unit ? ` ${input.currency_unit}` : "";
   const title = scenario_name || "Scenario Analysis";
   const topImpacts = Object.entries(pl)
     .map(([k, v]) => ({ metric: k, value: v }))
@@ -83,7 +96,7 @@ function generateFallbackNarrative(input: NarrativeInput): string {
       : `**${title}** — Scenario: "${nl_input}".`;
 
   const body = `Key assumptions: ${paramSummary || "none specified"}. ` +
-    `The top P&L impacts are: ${topImpacts.map((t) => `**${t.metric}**: ${c}${t.value.toLocaleString()}`).join(", ")}.`;
+    `The top P&L impacts are: ${topImpacts.map((t) => `**${t.metric}**: ${c}${t.value.toLocaleString()}${u}`).join(", ")}.`;
 
   const risk =
     audience === "board"
@@ -97,16 +110,19 @@ export async function generateNarrative(input: NarrativeInput): Promise<string> 
   if (!getApiKey()) return generateFallbackNarrative(input);
 
   const c = input.currency_symbol || "$";
+  const unitNote = input.currency_unit
+    ? `\nEvery figure below is already in ${input.currency_unit} — cite it with that exact unit (e.g. "${c}1,234 ${input.currency_unit}"). Never append or infer a different scale word (Million/Billion/Lakh) and never convert the number.`
+    : "";
   const tone = input.audience === "board" ? "formal, concise, suitable for a board presentation" : "professional, detailed, suitable for internal FP&A review";
   try {
     const parsed = await callClaudeStructured({
       system: `You are an FP&A analyst writing a 2-3 paragraph executive summary. Tone: ${tone}.
-Use the currency symbol "${c}" for all monetary figures — never invent a different currency.
+Use the currency symbol "${c}" for all monetary figures — never invent a different currency.${unitNote}
 P&L figures are for a single period (or the first period of a multi-period run), not a multi-period aggregate.
 Always end the narrative with: "AI-generated draft — review required."`,
       userMessage: `Scenario: "${input.nl_input}"
 Parameters: ${JSON.stringify(input.parameters)}
-P&L results (${c}): ${JSON.stringify(input.pl)}
+P&L results (${c}${input.currency_unit ? `, in ${input.currency_unit}` : ""}): ${JSON.stringify(input.pl)}
 Write a 2-3 paragraph executive summary describing assumptions, key impacts, and risks.`,
       schema: narrativeSchema,
       toolName: "submit_narrative",

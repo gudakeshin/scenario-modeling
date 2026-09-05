@@ -84,7 +84,8 @@ ABSURDITY CHECK (CRITICAL — do this FIRST) — STANDARD MODE:
 
 Dimensions: completeness, specificity, actionability, consistency, business_relevance, risk_coverage.
 
-Keep feedback strings SHORT (under 100 chars each). Submit scores and guidance via the structured tool.`;
+Keep feedback strings SHORT (under 100 chars each). Submit scores and guidance via the structured tool.
+If you cite a figure in your feedback, keep the unit the scenario context gave it (e.g. Crore) — never convert it to Million/Billion/Lakh.`;
 
 const QA_SYSTEM_PROMPT_INTEGRITY = `You are a QA analyst reviewing business scenario analysis in INTEGRITY MODE (zero/missing baseline or uninterpretable % deltas).
 
@@ -96,7 +97,8 @@ Score each dimension 1-10. CONSISTENCY RULES FOR INTEGRITY MODE (do these FIRST)
 
 Dimensions: completeness, specificity, actionability, consistency, business_relevance, risk_coverage.
 
-Keep feedback strings SHORT (under 100 chars each). Submit scores and guidance via the structured tool.`;
+Keep feedback strings SHORT (under 100 chars each). Submit scores and guidance via the structured tool.
+If you cite a figure in your feedback, keep the unit the scenario context gave it (e.g. Crore) — never convert it to Million/Billion/Lakh.`;
 
 function qaSystemPrompt(mode: AnalysisModeResult["mode"]): string {
   return mode === "integrity" ? QA_SYSTEM_PROMPT_INTEGRITY : QA_SYSTEM_PROMPT_STANDARD;
@@ -131,6 +133,19 @@ export async function buildScenarioContext(scenarioId: string): Promise<string> 
     "SELECT extracted_name, scenario_value FROM scenario_parameters WHERE scenario_id = $1 AND status != 'rejected'",
     [scenarioId]
   );
+  // Every figure below is already in the workbook's own scale (e.g. Crore).
+  // Without stating that, an LLM handed a bare number like "28,488.46"
+  // invents its own unit when it writes up findings — this is what produced
+  // a QA finding that read "revenue (₹26,000M)" for a ₹26,000 Crore figure.
+  const unitRes = await pool.query(
+    `SELECT cc.context_data->>'currency' AS currency, cc.context_data->>'currency_unit' AS currency_unit
+     FROM company_context cc
+     JOIN user_models um ON um.source_context_id = cc.context_id
+     JOIN scenarios s ON s.model_version_hash = um.model_id::text
+     WHERE s.scenario_id = $1 LIMIT 1`,
+    [scenarioId],
+  );
+  const currencyUnit = unitRes.rows[0]?.currency_unit as string | undefined;
 
   const rawPl = plRes.rows[0]?.output_data ?? {};
   const periods = rawPl.periods ?? [];
@@ -147,10 +162,14 @@ export async function buildScenarioContext(scenarioId: string): Promise<string> 
   const base_pl = await resolveBasePl(rawPl, model, scenarioId);
   const mode = detectAnalysisMode({ pl, base_pl, absurdity_warnings });
 
+  const u = currencyUnit ? ` ${currencyUnit}` : "";
   const lines = [
     `Scenario: "${sRes.rows[0]?.nl_input || ""}"`,
     `ANALYSIS_MODE: ${mode.mode}`,
     ...(mode.reasons.length > 0 ? mode.reasons.map((r) => `MODE_REASON: ${r}`) : []),
+    ...(currencyUnit
+      ? [`All figures below are already in ${currencyUnit} — cite them with that exact unit, never as Million/Billion/Lakh or any other scale.`]
+      : []),
     "",
     "Parameters:",
     ...pRes.rows.map((r: { extracted_name: string; scenario_value: number }) =>
@@ -164,7 +183,7 @@ export async function buildScenarioContext(scenarioId: string): Promise<string> 
     const delta = v - base;
     if (Math.abs(delta) > 0.01 || Math.abs(v) > 0.01) {
       const pct = Math.abs(base) > 0.01 ? ((delta / base) * 100).toFixed(1) : "n/a";
-      lines.push(`  - ${k}: ${base.toLocaleString()} → ${v.toLocaleString()} (${delta >= 0 ? "+" : ""}${delta.toLocaleString()}, ${pct}%)`);
+      lines.push(`  - ${k}: ${base.toLocaleString()}${u} → ${v.toLocaleString()}${u} (${delta >= 0 ? "+" : ""}${delta.toLocaleString()}${u}, ${pct}%)`);
     }
   }
   return lines.join("\n");

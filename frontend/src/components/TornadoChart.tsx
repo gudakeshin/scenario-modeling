@@ -14,7 +14,7 @@ import {
 import { runSensitivity, runTwoWaySensitivity, getActiveModel, type SensitivityResult, type TornadoBar, type TwoWayGridResult } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
 import { ChartDataTable } from "./ChartDataTable";
-import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol, pickDefaultTargetMetric, metricLabel } from "@/lib/metrics";
+import { fmtCurrency, fmtCurrencySigned, getCurrencySymbol, pickDefaultTargetMetric, metricLabel, useCurrencyVersion } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface TornadoChartProps {
@@ -57,6 +57,7 @@ function TornadoTooltip({ active, payload }: { active?: boolean; payload?: Array
 }
 
 export function TornadoChart({ scenarioId, onClose, onMinimize }: TornadoChartProps) {
+  useCurrencyVersion();
   const [result, setResult] = useState<SensitivityResult | null>(null);
   const [twoWay, setTwoWay] = useState<TwoWayGridResult | null>(null);
   const [mode, setMode] = useState<"tornado" | "two-way">("tornado");

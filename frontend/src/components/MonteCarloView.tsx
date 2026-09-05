@@ -15,7 +15,7 @@ import {
 import { PanelHeader } from "./PanelHeader";
 import { ChartDataTable } from "./ChartDataTable";
 import { runMonteCarlo, type MonteCarloResult, type PercentileResult } from "@/lib/api";
-import { METRIC_LABELS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import { METRIC_LABELS, fmtCurrency, getCurrencySymbol, useCurrencyVersion } from "@/lib/metrics";
 import { formatCompactCurrency } from "@/lib/chartTheme";
 
 interface MonteCarloViewProps {
@@ -220,6 +220,7 @@ function RiskStats({ metric, data }: { metric: string; data: PercentileResult })
 }
 
 export function MonteCarloView({ scenarioId, onClose, onMinimize }: MonteCarloViewProps) {
+  useCurrencyVersion();
   const [result, setResult] = useState<MonteCarloResult | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
