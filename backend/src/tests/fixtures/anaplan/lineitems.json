@@ -1,0 +1,1 @@
+{"items":[{"id":"amount-id","name":"Amount","format":{"dataType":"NUMBER","currencyCode":"USD"},"summary":"Sum","appliesTo":[{"id":"account-list","name":"Account"}],"timeScale":"Month","versions":true}]}

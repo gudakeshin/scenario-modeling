@@ -14,11 +14,65 @@
  *   6. Always returns structured ParsedParameter[] + optional clarification + search context
  */
 
-import { getApiKey, callClaude } from "./llmClient.js";
-import { getUserModelDefinition, describeModelForLLM, type ModelDefinition } from "../models/registry.js";
+import { z } from "zod";
+import { getApiKey, callClaudeStructured } from "./llmClient.js";
+import {
+  getWorkspaceModelDefinition,
+  describeModelForLLM,
+  describeDimensionalModelForLLM,
+  type ModelDefinition,
+} from "../models/registry.js";
+import { isDimensionalModelDefinition, type DimensionalModelDefinition } from "../models/dimensions.js";
+import { pool } from "../db/index.js";
 import { describeContextForLLM } from "./contextEngine.js";
-import { needsExternalSearch, searchPerplexity, type SearchResult } from "./searchService.js";
+import type { Scope } from "../middleware/workspace.js";
+import { needsExternalSearch, searchPerplexity, isOpenEndedQuestion, isExplicitLeverChange, type SearchResult } from "./searchService.js";
 import { reflect, type ReflectionResult } from "./reflectionService.js";
+import { logger } from "../logger.js";
+import { config } from "../config.js";
+import {
+  describeContextForLLM as describeScenarioContextForLLM,
+  getScenarioContext,
+  hydrateScenarioContext,
+} from "./scenarioContextService.js";
+import { runScenarioReasoning } from "./scenarioReasoningAgent.js";
+import type { AgentTraceStep } from "./scenarioReasoningAgent.js";
+import { searchDocumentChunksInDb } from "./documentService.js";
+import {
+  followUpQuestionSchema,
+  normalizeFollowUpQuestions,
+  describeDriverDependencies,
+  type FollowUpQuestion,
+} from "./followUpQuestions.js";
+
+export {
+  RECOMMENDATION_MIN_CONFIDENCE,
+  recommendationEvidenceSchema,
+  followUpRecommendationSchema,
+  followUpQuestionSchema,
+  normalizeFollowUpQuestions,
+  describeDriverDependencies,
+  type RecommendationEvidence,
+  type FollowUpRecommendation,
+  type FollowUpQuestion,
+} from "./followUpQuestions.js";
+
+const llmParseResponseSchema = z.object({
+  parameters: z.array(z.object({
+    name: z.string(),
+    variable_type: z.string(),
+    direction: z.string(),
+    magnitude: z.number().default(0),
+    unit: z.string().default("percent"),
+    scope: z.record(z.string()).default({}),
+    /** Dimension id → member id for dimensional models (e.g. { region: "emea" }). */
+    member_scope: z.record(z.string()).optional(),
+    confidence: z.number().min(0).max(1).default(0.5),
+    suggested_variable_id: z.string().optional(),
+  })).default([]),
+  clarification_needed: z.string().nullable().optional(),
+  follow_up_questions: z.array(followUpQuestionSchema).nullable().optional(),
+});
 
 export interface ParsedParameter {
   name: string;
@@ -27,15 +81,75 @@ export interface ParsedParameter {
   magnitude: number;
   unit: string;
   scope: Record<string, string>;
+  member_scope?: Record<string, string>;
   confidence: number;
   suggested_variable_id?: string;
 }
 
-export interface FollowUpQuestion {
-  id: string;
-  question: string;
-  options: { label: string; value: string }[];
-  allow_custom?: boolean;
+export type DeltaType = "percent" | "absolute" | "additive";
+
+const DECREASE_DIRECTION_RE = /decreas|declin|drop|reduc|cut|lower|fall|shrink|delay|contract/i;
+const INCREASE_DIRECTION_RE = /increas|rais|grow|up|higher|expand|hike/i;
+const PERCENT_UNIT_RE = /^(percent|percentage|pct|pp|%|basis_points|bps)s?$/i;
+const ABSOLUTE_UNIT_RE = /^(absolute|currency|money|usd|inr|eur|gbp|amount|units?|count)$/i;
+
+/** True when the parsed unit denotes a relative percent (or basis-point) change. */
+export function isPercentUnit(unit: string | undefined | null): boolean {
+  const u = (unit || "").trim().toLowerCase();
+  if (!u) return false;
+  if (PERCENT_UNIT_RE.test(u)) return true;
+  if (u.startsWith("percent") || u.startsWith("pct")) return true;
+  return false;
+}
+
+function isBasisPoints(unit: string | undefined | null): boolean {
+  const u = (unit || "").trim().toLowerCase();
+  return u === "basis_points" || u === "bps" || u === "bp";
+}
+
+/**
+ * Convert a parsed parameter into a signed, typed delta for storage.
+ *  - direction "decrease"/"reduce"/... flips the sign (direction wins over LLM sign)
+ *  - "set" always means an absolute SET of the leaf
+ *  - percent-like units (%, pct, bps, …) are relative changes
+ *  - currency/absolute increases & decreases are additive (base + delta), not SET
+ *  - ambiguous unit on increase/decrease defaults to percent (schema default)
+ */
+export function toTypedDelta(p: ParsedParameter): { value: number; delta_type: DeltaType } {
+  const magnitude = p.magnitude != null && !isNaN(Number(p.magnitude)) ? Number(p.magnitude) : 0;
+  const direction = (p.direction || "").toLowerCase();
+  const unit = (p.unit || "").trim();
+
+  if (direction === "set") {
+    return { value: magnitude, delta_type: "absolute" };
+  }
+
+  const absMag = Math.abs(magnitude);
+  let signed = absMag;
+  if (DECREASE_DIRECTION_RE.test(direction)) signed = -absMag;
+  else if (INCREASE_DIRECTION_RE.test(direction)) signed = absMag;
+  else if (magnitude < 0) signed = -absMag;
+  else signed = magnitude;
+
+  if (isPercentUnit(unit) || (!unit && (DECREASE_DIRECTION_RE.test(direction) || INCREASE_DIRECTION_RE.test(direction)))) {
+    const value = isBasisPoints(unit) ? signed / 100 : signed;
+    return { value, delta_type: "percent" };
+  }
+
+  if (ABSOLUTE_UNIT_RE.test(unit) && (DECREASE_DIRECTION_RE.test(direction) || INCREASE_DIRECTION_RE.test(direction))) {
+    return { value: signed, delta_type: "additive" };
+  }
+
+  // Bare absolute / currency without increase/decrease → SET target
+  if (ABSOLUTE_UNIT_RE.test(unit)) {
+    return { value: magnitude, delta_type: "absolute" };
+  }
+
+  // Fallback: treat as percent for relative language, else absolute SET
+  if (DECREASE_DIRECTION_RE.test(direction) || INCREASE_DIRECTION_RE.test(direction)) {
+    return { value: signed, delta_type: "percent" };
+  }
+  return { value: magnitude, delta_type: "absolute" };
 }
 
 export interface ParseResult {
@@ -56,6 +170,31 @@ export interface ParseResult {
     sources: string[];
   };
   notices?: { type: "warning" | "info"; message: string }[];
+  /** Agentic reasoning trace (tool steps). */
+  agent_trace?: AgentTraceStep[];
+  /** Causal chain from the reasoning agent. */
+  causal_chain?: Array<{
+    step: string;
+    detail?: string;
+    kind?: "decomposition" | "research" | "levers" | "preview" | "other";
+  }>;
+  citations?: Array<{ source: string; snippet?: string; url?: string }>;
+  agent_confidence?: number;
+  /** Optional in-loop what-if P&L from the reasoning agent (not persisted as a run). */
+  preview_pl?: Record<string, number>;
+  preview_reconciliation?: {
+    reconciled: boolean;
+    max_abs_diff: number;
+    diffs?: Record<string, { preview: number; final: number; abs_diff: number }>;
+    message?: string;
+  };
+  constraint_violations?: Array<{ lever: string; reason: string }>;
+  agent_readiness?: {
+    enabled: boolean;
+    model_validated: boolean;
+    ready: boolean;
+    reasons: string[];
+  };
 }
 
 // ── LLM-powered parsing ──
@@ -96,32 +235,83 @@ FOLLOW-UP QUESTIONS:
     - "question": the question text
     - "options": array of {"label": display text, "value": a concise value string}
     - "allow_custom": true/false (whether user can type custom answer)
-11. ALWAYS generate follow_up_questions when:
+    - "question_type": "choice" (default) or "open" (free-form comment when you cannot recommend)
+    - "recommendation" (OPTIONAL): { "value", "label?", "rationale", "confidence" (0-1), "evidence": [{"kind":"model"|"document"|"context"|"web","source","snippet?"}] }
+11. For EACH follow-up question, first check whether the MODEL SCHEMA / DRIVER DEPENDENCIES or COMPANY CONTEXT above imply a most-likely answer. If so, include a recommendation where value matches one of your options and each evidence item cites its source. Recommend ONLY what the evidence supports — never invent quotes or model relationships. If dependencies are unclear, do NOT guess: either ask a probing question about the dependency itself, or set question_type to "open" with no recommendation.
+12. ALWAYS generate follow_up_questions when:
     - The scenario mentions a competitor action but not the expected impact magnitude
     - The scenario is qualitative and you're guessing at numbers
     - Multiple interpretations exist
     - Geography/product/timeline is unspecified for a scenario that would benefit from it
-12. Extract your BEST-GUESS parameters AND ask clarifying questions simultaneously.
-13. ALWAYS try to extract at least one parameter. Only return empty parameters if the input truly has no scenario content.
-14. Understand common business language and map to the ACTUAL model variables provided above.`;
+13. Extract your BEST-GUESS parameters AND ask clarifying questions simultaneously.
+14. ALWAYS try to extract at least one parameter. Only return empty parameters if the input truly has no scenario content.
+15. Understand common business language and map to the ACTUAL model variables provided above.`;
 
   return prompt;
 }
 
+async function loadActiveModelRaw(
+  workspaceId: string,
+): Promise<ModelDefinition | DimensionalModelDefinition | null> {
+  const r = await pool.query(
+    `SELECT model_definition FROM user_models
+     WHERE workspace_id = $1 AND is_active = true
+     ORDER BY created_at DESC LIMIT 1`,
+    [workspaceId],
+  );
+  if (r.rows.length === 0) return null;
+  return r.rows[0].model_definition as ModelDefinition | DimensionalModelDefinition;
+}
+
+function sanitizeMemberScope(
+  scope: Record<string, string> | undefined,
+  dimModel: DimensionalModelDefinition,
+): Record<string, string> | undefined {
+  if (!scope || Object.keys(scope).length === 0) return undefined;
+  const out: Record<string, string> = {};
+  for (const [dimId, memberId] of Object.entries(scope)) {
+    const dim = dimModel.dimensions.find((d) => d.id === dimId);
+    if (!dim) continue;
+    if (dim.members.some((m) => m.id === memberId)) {
+      out[dimId] = memberId;
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
+}
+
 async function llmParse(
   nlInput: string,
-  userId: string,
+  scope: Scope | undefined,
   searchContext?: SearchResult | null,
-  reflectionResult?: ReflectionResult | null
+  reflectionResult?: ReflectionResult | null,
+  scenarioId?: string,
 ): Promise<ParseResult> {
   if (!getApiKey()) throw new Error("No API key");
+  if (!scope) throw new Error("No user — authentication required");
 
-  const model = await getUserModelDefinition(userId);
-  if (!model) throw new Error("No model — onboarding needed");
+  const rawModel = await loadActiveModelRaw(scope.workspaceId);
+  if (!rawModel) throw new Error("No model — onboarding needed");
 
-  const modelDesc = describeModelForLLM(model);
-  const contextDesc = await describeContextForLLM(userId);
-  const systemPrompt = buildSystemPrompt(modelDesc, contextDesc);
+  const isDim = isDimensionalModelDefinition(rawModel);
+  const model = isDim ? null : (rawModel as ModelDefinition);
+  const modelDesc = isDim
+    ? describeDimensionalModelForLLM(rawModel)
+    : describeModelForLLM(rawModel as ModelDefinition);
+  const contextDesc = await describeContextForLLM(scope);
+
+  let scenarioContextDesc: string | null = null;
+  if (scenarioId) {
+    await hydrateScenarioContext(scenarioId);
+    scenarioContextDesc = describeScenarioContextForLLM(getScenarioContext(scenarioId));
+  }
+
+  let systemPrompt = buildSystemPrompt(modelDesc, contextDesc);
+  if (scenarioContextDesc) {
+    systemPrompt += `\n\nACTIVE SCENARIO CONTEXT (additive — do not re-extract locked/touched levers unless the user changes them):\n${scenarioContextDesc}`;
+  }
+  if (isDim) {
+    systemPrompt += `\n\nDIMENSIONAL SCOPE: When the user mentions a geography, product, account, or time member (e.g. "EMEA revenue +10%"), set member_scope to {dimension_id: member_id} using ONLY ids from the catalog above. Map the variable to the measure/input id. Unknown members must be omitted.`;
+  }
 
   let userContent = `Scenario input: "${nlInput}"`;
 
@@ -148,56 +338,26 @@ async function llmParse(
 IMPORTANT: Use the research data above to derive SPECIFIC, QUANTITATIVE parameters.
 Do NOT use generic estimates — use the actual numbers from the research.`;
   }
-  userContent += "\n\nExtract ALL parameters. For each, suggest which model variable it maps to (suggested_variable_id). Return JSON only — no markdown, no code fences.";
+  userContent += "\n\nExtract ALL parameters. For each, suggest which model variable it maps to (suggested_variable_id).";
 
-  const rawText = await callClaude({
+  const raw = await callClaudeStructured({
     system: systemPrompt,
     userMessage: userContent,
+    schema: llmParseResponseSchema,
+    toolName: "submit_scenario_parameters",
+    toolDescription: "Submit the extracted scenario parameters and any follow-up questions",
     maxTokens: 4000,
     temperature: 0.2,
+    purpose: "parse",
   });
 
-  let text = rawText.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-  if (!text) throw new Error("Empty LLM response");
-
-  // Repair truncated JSON
-  if (!text.endsWith("}")) {
-    const lastBrace = text.lastIndexOf("}");
-    if (lastBrace > 0) {
-      text = text.slice(0, lastBrace + 1);
-      const opens = (text.match(/{/g) || []).length;
-      const closes = (text.match(/}/g) || []).length;
-      for (let i = 0; i < opens - closes; i++) text += "}";
-      const openBrackets = (text.match(/\[/g) || []).length;
-      const closeBrackets = (text.match(/]/g) || []).length;
-      for (let i = 0; i < openBrackets - closeBrackets; i++) {
-        text = text.replace(/,\s*$/, "") + "]";
-      }
-    }
-  }
-
-  let raw: ParseResult & { follow_up_questions?: FollowUpQuestion[] };
-  try {
-    raw = JSON.parse(text);
-  } catch {
-    const jsonMatch = text.match(/\{[\s\S]*\}/);
-    if (jsonMatch) {
-      raw = JSON.parse(jsonMatch[0]);
-    } else {
-      throw new Error("Could not parse LLM response as JSON");
-    }
-  }
   const parsed: ParseResult = {
     parameters: Array.isArray(raw.parameters) ? raw.parameters : [],
     clarification_needed: raw.clarification_needed ?? undefined,
-    follow_up_questions: Array.isArray(raw.follow_up_questions) && raw.follow_up_questions.length > 0
-      ? raw.follow_up_questions.map((q) => ({
-          id: q.id || `q_${Math.random().toString(36).slice(2, 8)}`,
-          question: q.question,
-          options: Array.isArray(q.options) ? q.options : [],
-          allow_custom: q.allow_custom !== false,
-        }))
-      : undefined,
+    follow_up_questions: (() => {
+      const qs = normalizeFollowUpQuestions(raw.follow_up_questions ?? []);
+      return qs.length > 0 ? qs : undefined;
+    })(),
   };
 
   if (searchContext) {
@@ -209,21 +369,29 @@ Do NOT use generic estimates — use the actual numbers from the research.`;
     };
   }
 
+  if (isDim) {
+    for (const p of parsed.parameters) {
+      p.member_scope = sanitizeMemberScope(p.member_scope, rawModel);
+    }
+  }
+
   // Filter out parameters targeting calculated/output variables — only input vars should be overridden
-  if (model && parsed.parameters.length > 0) {
+  if (parsed.parameters.length > 0) {
     const outputVarIds = new Set(
-      model.variables.filter((v) => v.tags?.includes("output")).map((v) => v.id)
+      (isDim ? rawModel.variables : model!.variables)
+        .filter((v) => v.tags?.includes("output"))
+        .map((v) => v.id),
     );
     const before = parsed.parameters.length;
     parsed.parameters = parsed.parameters.filter((p) => {
       if (p.suggested_variable_id && outputVarIds.has(p.suggested_variable_id)) {
-        console.log(`[Parser] Filtered out parameter for calculated variable: ${p.suggested_variable_id}`);
+        logger.info(`[Parser] Filtered out parameter for calculated variable: ${p.suggested_variable_id}`);
         return false;
       }
       return true;
     });
     if (before > parsed.parameters.length) {
-      console.log(`[Parser] Removed ${before - parsed.parameters.length} parameters targeting calculated variables`);
+      logger.info(`[Parser] Removed ${before - parsed.parameters.length} parameters targeting calculated variables`);
     }
   }
 
@@ -232,7 +400,141 @@ Do NOT use generic estimates — use the actual numbers from the research.`;
       "I couldn't extract clear parameters. Could you be more specific? For example: 'raw materials increase 8%' or 'delay APAC launch by one quarter'.";
   }
 
+  // Guarantee structured probing questions for ambiguous prompts
+  const dependencyDesc = model
+    ? describeDriverDependencies(model)
+    : isDim
+      ? describeDriverDependencies(rawModel)
+      : undefined;
+  parsed.follow_up_questions = await ensureProbingQuestions(nlInput, parsed, {
+    scope,
+    modelDesc,
+    dependencyDesc,
+    contextDesc,
+  });
+
   return parsed;
+}
+
+const probingQuestionsSchema = z.object({
+  questions: z.array(followUpQuestionSchema).min(1).max(5),
+});
+
+export type ProbingGrounding = {
+  scope?: Scope;
+  modelDesc?: string;
+  dependencyDesc?: string;
+  contextDesc?: string | null;
+};
+
+const PROBING_SYSTEM_PROMPT = `Ask concise FP&A probing questions to turn an ambiguous scenario into
+measurable lever changes. Return 1–3 questions with optional multiple-choice options.
+Focus on magnitude, which P&L drivers, geography/segment scope, and timing.
+
+For EACH question, first check whether the MODEL DRIVERS, COMPANY CONTEXT, or DOCUMENT EVIDENCE
+below imply a most-likely answer. If so, include recommendation: {value, rationale, confidence, evidence[]}
+where value matches one of your options and each evidence item cites its source (kind: model|document|context|web).
+Recommend ONLY what the evidence supports — never invent quotes or model relationships.
+If the dependencies are unclear from the model and documents, do NOT guess: either ask a probing
+question about the dependency itself, or set question_type to "open" with no recommendation so the
+user can answer freely.`;
+
+function looksAmbiguous(nlInput: string, parsed: ParseResult): boolean {
+  if (isExplicitLeverChange(nlInput)) return false;
+  if (isOpenEndedQuestion(nlInput)) return true;
+  if (parsed.parameters.length === 0) return true;
+  if (parsed.parameters.every((p) => p.confidence < 0.75)) return true;
+  // Qualitative language without a clear magnitude
+  if (
+    /\b(tougher|softer|weaker|stronger|pressure|headwind|tailwind|uncertain|maybe|somewhat)\b/i.test(
+      nlInput,
+    ) &&
+    !/\d+(?:\.\d+)?\s*%/.test(nlInput)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+function synthesizeFallbackQuestion(nlInput: string): FollowUpQuestion {
+  return {
+    id: `q_clarify_${Math.random().toString(36).slice(2, 8)}`,
+    question:
+      "Which drivers should we stress for this scenario (e.g. volume, price, raw materials, OpEx), and by roughly how much?",
+    options: [
+      { label: "Volume down 5%", value: "volume_down_5" },
+      { label: "Price down 3%", value: "price_down_3" },
+      { label: "Raw materials up 8%", value: "materials_up_8" },
+      { label: "OpEx up 5%", value: "opex_up_5" },
+    ],
+    allow_custom: true,
+    question_type: "choice",
+  };
+}
+
+/**
+ * Analysis-tier clarifying questions when the prompt is ambiguous and the
+ * Haiku parse returned none. Guarantees ≥1 structured question.
+ */
+async function ensureProbingQuestions(
+  nlInput: string,
+  parsed: ParseResult,
+  grounding?: ProbingGrounding,
+): Promise<FollowUpQuestion[] | undefined> {
+  if (parsed.follow_up_questions && parsed.follow_up_questions.length > 0) {
+    const normalized = normalizeFollowUpQuestions(parsed.follow_up_questions);
+    return normalized.length > 0 ? normalized : undefined;
+  }
+  if (!looksAmbiguous(nlInput, parsed)) {
+    return parsed.follow_up_questions;
+  }
+
+  if (getApiKey()) {
+    try {
+      let documentEvidence = "";
+      if (grounding?.scope?.workspaceId) {
+        try {
+          const chunks = await searchDocumentChunksInDb(nlInput, grounding.scope.workspaceId, 5);
+          if (chunks.length > 0) {
+            documentEvidence = chunks
+              .map((c) => `• [${c.document_name}] ${c.text.slice(0, 500)}`)
+              .join("\n");
+          }
+        } catch (e) {
+          logger.warn(`[Parser] Document RAG for probing failed: ${(e as Error).message}`);
+        }
+      }
+
+      const userParts: Record<string, unknown> = {
+        prompt: nlInput,
+        extracted_parameters: parsed.parameters,
+        clarification_needed: parsed.clarification_needed,
+      };
+      if (grounding?.dependencyDesc) userParts.MODEL_DRIVERS = grounding.dependencyDesc;
+      else if (grounding?.modelDesc) userParts.MODEL_SCHEMA = grounding.modelDesc;
+      if (grounding?.contextDesc) userParts.COMPANY_CONTEXT = grounding.contextDesc;
+      if (documentEvidence) userParts.DOCUMENT_EVIDENCE = documentEvidence;
+
+      const raw = await callClaudeStructured({
+        purpose: "business_analysis",
+        toolName: "submit_probing_questions",
+        toolDescription: "Submit clarifying questions for an ambiguous scenario prompt",
+        schema: probingQuestionsSchema,
+        maxTokens: 2000,
+        temperature: 0.3,
+        system: PROBING_SYSTEM_PROMPT,
+        userMessage: JSON.stringify(userParts),
+      });
+      if (raw.questions?.length) {
+        const normalized = normalizeFollowUpQuestions(raw.questions);
+        if (normalized.length > 0) return normalized;
+      }
+    } catch (e) {
+      logger.warn(`[Parser] Probing-question generation failed: ${(e as Error).message}`);
+    }
+  }
+
+  return [synthesizeFallbackQuestion(nlInput)];
 }
 
 // ── Minimal heuristic fallback (no hardcoded business scenarios) ──
@@ -308,20 +610,23 @@ function heuristicParse(nlInput: string, model: ModelDefinition | null): ParseRe
 
 // ── Main entry point ──
 
-export async function parseScenario(nlInput: string, userId?: string): Promise<ParseResult> {
+export async function parseScenario(
+  nlInput: string,
+  scope?: Scope,
+  scenarioId?: string,
+): Promise<ParseResult> {
   const apiKey = getApiKey();
   const trimmed = nlInput.trim();
   const notices: { type: "warning" | "info"; message: string }[] = [];
 
-  // Resolve userId for model lookup
-  const effectiveUserId = userId || "system";
-
-  // Load user's model for context
+  // Load the workspace's model for context (skip when no authenticated scope)
   let userModel: ModelDefinition | null = null;
-  try {
-    userModel = await getUserModelDefinition(effectiveUserId);
-  } catch {
-    // If model lookup fails, continue — heuristic will guide user
+  if (scope) {
+    try {
+      userModel = await getWorkspaceModelDefinition(scope.workspaceId);
+    } catch {
+      // If model lookup fails, continue — heuristic will guide user
+    }
   }
 
   if (!userModel) {
@@ -329,7 +634,70 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
       type: "info",
       message: "No financial model found. Please upload documents and build your company context to enable scenario modeling.",
     });
-    return { parameters: [], notices, clarification_needed: "Please upload your financial documents and build context first." };
+  }
+
+  // Agentic path for open-ended questions (when enabled); keep fast path for explicit % levers
+  const agentProfileOn =
+    config.DEPLOYMENT_PROFILE === "showcase" || config.DEPLOYMENT_PROFILE === "enterprise";
+  const useAgent =
+    !!scope &&
+    !!apiKey &&
+    (!!config.SHOWCASE_AGENT_ENABLED || agentProfileOn) &&
+    isOpenEndedQuestion(trimmed) &&
+    !isExplicitLeverChange(trimmed);
+
+  if (useAgent) {
+    logger.info("[Parser] Routing to agentic scenario reasoning...");
+    const agentResult = await runScenarioReasoning(trimmed, scope!, scenarioId);
+    const result: ParseResult = {
+      parameters: agentResult.parameters,
+      clarification_needed: agentResult.clarification_needed,
+      follow_up_questions: agentResult.follow_up_questions,
+      agent_trace: agentResult.agent_trace,
+      causal_chain: agentResult.causal_chain,
+      citations: agentResult.citations,
+      agent_confidence: agentResult.confidence,
+      preview_pl: agentResult.final_preview_pl ?? agentResult.preview_pl,
+      preview_reconciliation: agentResult.preview_reconciliation,
+      constraint_violations: agentResult.constraint_violations,
+      agent_readiness: agentResult.readiness
+        ? {
+            enabled: agentResult.readiness.enabled,
+            model_validated: agentResult.readiness.model_validated,
+            ready: agentResult.readiness.ready,
+            reasons: agentResult.readiness.reasons,
+          }
+        : undefined,
+    };
+    if (agentResult.error) {
+      notices.push({ type: "warning", message: agentResult.error });
+    }
+    if (notices.length > 0) result.notices = notices;
+
+    let agentGrounding: ProbingGrounding | undefined;
+    if (scope) {
+      try {
+        const ctxDesc = await describeContextForLLM(scope);
+        agentGrounding = {
+          scope,
+          modelDesc: userModel ? describeModelForLLM(userModel) : undefined,
+          dependencyDesc: userModel ? describeDriverDependencies(userModel) : undefined,
+          contextDesc: ctxDesc,
+        };
+      } catch {
+        agentGrounding = { scope };
+      }
+    }
+    result.follow_up_questions = await ensureProbingQuestions(trimmed, result, agentGrounding);
+
+    // If agent produced parameters (or a clear clarification), return; else fall through
+    if (result.parameters.length > 0 || result.clarification_needed || result.follow_up_questions?.length) {
+      return result;
+    }
+    notices.push({
+      type: "info",
+      message: "Agentic analysis did not yield parameters — falling back to standard parser.",
+    });
   }
 
   const searchNeeded = needsExternalSearch(trimmed);
@@ -339,20 +707,20 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
   if (searchNeeded) {
     const perplexityKey = process.env.PERPLEXITY_API_KEY;
     if (!perplexityKey) {
-      console.warn("[Parser] Perplexity key missing — search skipped");
+      logger.warn("[Parser] Perplexity key missing — search skipped");
       notices.push({
         type: "warning",
         message: "Real-time news/macro search is unavailable — PERPLEXITY_API_KEY is not configured. The system will use its built-in knowledge instead.",
       });
     } else {
       try {
-        console.log("[Parser] External research needed — calling Perplexity...");
+        logger.info("[Parser] External research needed — calling Perplexity...");
         searchContext = await searchPerplexity(trimmed);
         if (searchContext) {
-          console.log(`[Parser] Perplexity returned ${searchContext.data_points.length} data points`);
+          logger.info(`[Parser] Perplexity returned ${searchContext.data_points.length} data points`);
         }
       } catch (e) {
-        console.warn("[Parser] Perplexity search failed:", (e as Error).message);
+        logger.warn({ detail: (e as Error).message }, "[Parser] Perplexity search failed:");
         notices.push({
           type: "warning",
           message: "Real-time search failed — proceeding with built-in knowledge.",
@@ -366,15 +734,15 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
   let llmAvailable = false;
   if (apiKey && trimmed.length >= 5) {
     try {
-      console.log("[Parser] Running reflection loop...");
-      reflectionResult = await reflect(trimmed, searchContext, effectiveUserId);
+      logger.info("[Parser] Running reflection loop...");
+      reflectionResult = await reflect(trimmed, searchContext, scope);
       if (reflectionResult) {
         llmAvailable = true;
-        console.log(`[Parser] Reflection complete (${reflectionResult.duration_ms}ms)`);
+        logger.info(`[Parser] Reflection complete (${reflectionResult.duration_ms}ms)`);
       }
     } catch (e) {
       const errMsg = (e as Error).message;
-      console.warn("[Parser] Reflection failed:", errMsg);
+      logger.warn({ detail: errMsg }, "[Parser] Reflection failed:");
       if (errMsg.includes("401") || errMsg.includes("invalid") || errMsg.includes("API key") || errMsg.includes("authentication")) {
         notices.push({
           type: "warning",
@@ -389,10 +757,10 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
     });
   }
 
-  // Step 3: LLM parse (enriched with reflection + search context)
+  // Step 3: LLM parse (enriched with reflection + search context + scenario context)
   if (apiKey && trimmed.length >= 5) {
     try {
-      const result = await llmParse(trimmed, effectiveUserId, searchContext, reflectionResult);
+      const result = await llmParse(trimmed, scope, searchContext, reflectionResult, scenarioId);
       llmAvailable = true;
 
       if (reflectionResult) {
@@ -407,12 +775,12 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
 
       if (notices.length > 0) result.notices = notices;
 
-      if (result.parameters.length > 0 || result.clarification_needed) {
+      if (result.parameters.length > 0 || result.clarification_needed || result.follow_up_questions?.length) {
         return result;
       }
     } catch (e) {
       const errMsg = (e as Error).message;
-      console.warn("[Parser] LLM parse failed, falling back to heuristic:", errMsg);
+      logger.warn({ detail: errMsg }, "[Parser] LLM parse failed, falling back to heuristic:");
       if ((errMsg.includes("401") || errMsg.includes("invalid") || errMsg.includes("API key") || errMsg.includes("authentication")) && !notices.some((n) => n.message.includes("Anthropic API key"))) {
         notices.push({
           type: "warning",
@@ -450,10 +818,25 @@ export async function parseScenario(nlInput: string, userId?: string): Promise<P
       "1. Add specific numbers based on your model variables\n" +
       "2. Configure API keys for full AI + real-time search capabilities\n\n" +
       "**The rule-based parser works with explicit inputs like:**\n" +
-      `- "${userModel.variables[0]?.name || "Revenue"} increase 10%"\n` +
-      `- "${userModel.variables.find(v => v.tags?.includes("input"))?.name || "Costs"} decrease 5%"`;
+      `- "${userModel?.variables[0]?.name || "Revenue"} increase 10%"\n` +
+      `- "${userModel?.variables.find(v => v.tags?.includes("input"))?.name || "Costs"} decrease 5%"`;
   }
 
   if (notices.length > 0) heuristic.notices = notices;
+  let heuristicGrounding: ProbingGrounding | undefined;
+  if (scope) {
+    try {
+      const ctxDesc = await describeContextForLLM(scope);
+      heuristicGrounding = {
+        scope,
+        modelDesc: userModel ? describeModelForLLM(userModel) : undefined,
+        dependencyDesc: userModel ? describeDriverDependencies(userModel) : undefined,
+        contextDesc: ctxDesc,
+      };
+    } catch {
+      heuristicGrounding = { scope };
+    }
+  }
+  heuristic.follow_up_questions = await ensureProbingQuestions(trimmed, heuristic, heuristicGrounding);
   return heuristic;
 }

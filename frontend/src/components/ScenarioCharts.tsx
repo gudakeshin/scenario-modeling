@@ -1,64 +1,114 @@
 "use client";
 
-import { useState, useRef, useCallback } from "react";
+import { useEffect, useState, useRef, useCallback } from "react";
+import { toast } from "sonner";
 import { WaterfallChart } from "./WaterfallChart";
 import { PanelHeader } from "./PanelHeader";
 import { TrendLineChart } from "./TrendLineChart";
-import type { PeriodResult } from "@/lib/api";
+import { getPovSlice, type PeriodResult, type DimensionalResultBlock } from "@/lib/api";
+import { applyPovSlice } from "@/lib/dimensionalPov";
+import { DimensionPovControls } from "./DimensionPovControls";
 
 interface ScenarioChartsProps {
   pl: Record<string, number>;
   basePl?: Record<string, number>;
   periods?: PeriodResult[];
   granularity?: "monthly" | "quarterly";
+  dimensional?: DimensionalResultBlock;
+  scenarioId?: string | null;
   onClose: () => void;
   onMinimize?: () => void;
 }
 
 type Tab = "waterfall" | "trends";
 
-export function ScenarioCharts({ pl, basePl, periods, granularity, onClose, onMinimize }: ScenarioChartsProps) {
+function chartExportBackground(): string {
+  if (typeof window === "undefined") return "#FFFFFF";
+  const styles = getComputedStyle(document.documentElement);
+  return (
+    styles.getPropertyValue("--card-bg").trim() ||
+    styles.getPropertyValue("--background").trim() ||
+    "#FFFFFF"
+  );
+}
+
+export function ScenarioCharts({ pl, basePl, periods, granularity, dimensional, scenarioId, onClose, onMinimize }: ScenarioChartsProps) {
   const [activeTab, setActiveTab] = useState<Tab>("waterfall");
+  const [displayData, setDisplayData] = useState({ pl, periods });
+  const [displayDimensional, setDisplayDimensional] = useState(dimensional);
+  const [povLoading, setPovLoading] = useState(false);
   const chartRef = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    setDisplayData({ pl, periods });
+    setDisplayDimensional(dimensional);
+  }, [pl, periods, dimensional]);
+
+  const handlePovChange = useCallback(async (pov: Record<string, string>, metrics?: string[]) => {
+    if (!scenarioId) return;
+    setPovLoading(true);
+    try {
+      const slice = await getPovSlice(scenarioId, pov, metrics);
+      setDisplayData((current) => applyPovSlice(current, slice));
+      if (slice.dimensional) setDisplayDimensional(slice.dimensional);
+    } catch (error) {
+      toast.error((error as Error).message);
+    } finally {
+      setPovLoading(false);
+    }
+  }, [scenarioId]);
 
   const exportPNG = useCallback(async () => {
     if (!chartRef.current) return;
     try {
-      // Find the SVG inside the chart container
       const svg = chartRef.current.querySelector("svg");
-      if (!svg) return;
+      if (!svg) {
+        toast.error("No chart available to export");
+        return;
+      }
 
       const svgData = new XMLSerializer().serializeToString(svg);
       const canvas = document.createElement("canvas");
       const ctx = canvas.getContext("2d");
-      if (!ctx) return;
+      if (!ctx) {
+        toast.error("Could not create export canvas");
+        return;
+      }
 
       const img = new Image();
       const svgBlob = new Blob([svgData], { type: "image/svg+xml;charset=utf-8" });
       const url = URL.createObjectURL(svgBlob);
 
       img.onload = () => {
-        canvas.width = img.width * 2;
-        canvas.height = img.height * 2;
-        ctx.scale(2, 2);
-        ctx.fillStyle = "#FFFFFF";
-        ctx.fillRect(0, 0, canvas.width, canvas.height);
-        ctx.drawImage(img, 0, 0);
-        URL.revokeObjectURL(url);
+        try {
+          canvas.width = img.width * 2;
+          canvas.height = img.height * 2;
+          ctx.scale(2, 2);
+          ctx.fillStyle = chartExportBackground();
+          ctx.fillRect(0, 0, canvas.width, canvas.height);
+          ctx.drawImage(img, 0, 0);
+          URL.revokeObjectURL(url);
 
-        const pngUrl = canvas.toDataURL("image/png");
-        const link = document.createElement("a");
-        link.download = `scenario-${activeTab}-chart.png`;
-        link.href = pngUrl;
-        link.click();
+          const pngUrl = canvas.toDataURL("image/png");
+          const link = document.createElement("a");
+          link.download = `scenario-${activeTab}-chart.png`;
+          link.href = pngUrl;
+          link.click();
+        } catch {
+          toast.error("Failed to export chart as PNG");
+        }
+      };
+      img.onerror = () => {
+        URL.revokeObjectURL(url);
+        toast.error("Failed to export chart as PNG");
       };
       img.src = url;
     } catch {
-      // Silent fail for export
+      toast.error("Failed to export chart as PNG");
     }
   }, [activeTab]);
 
-  const hasPeriods = periods && periods.length > 1;
+  const hasPeriods = displayData.periods && displayData.periods.length > 1;
 
   return (
     <div className="border border-[var(--panel-border)] rounded-2xl bg-[var(--card-bg)] p-4 mx-4 mb-3 overflow-auto max-h-[65vh] shadow-panel">
@@ -108,12 +158,20 @@ export function ScenarioCharts({ pl, basePl, periods, granularity, onClose, onMi
       {/* Chart content */}
       <div ref={chartRef}>
         {activeTab === "waterfall" && (
-          <WaterfallChart pl={pl} basePl={basePl} />
+          <WaterfallChart pl={displayData.pl} basePl={basePl} />
         )}
-        {activeTab === "trends" && hasPeriods && (
-          <TrendLineChart periods={periods} granularity={granularity || "quarterly"} />
+        {activeTab === "trends" && hasPeriods && displayData.periods && (
+          <TrendLineChart periods={displayData.periods} granularity={granularity || "quarterly"} />
         )}
       </div>
+
+      {displayDimensional && (
+        <DimensionPovControls
+          dimensional={displayDimensional}
+          onPovChange={scenarioId ? handlePovChange : undefined}
+          loading={povLoading}
+        />
+      )}
     </div>
   );
 }

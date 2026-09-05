@@ -10,6 +10,17 @@ CREATE TABLE IF NOT EXISTS users (
     created_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Workspaces: per-user containers isolating documents, context/model, scenarios
+CREATE TABLE IF NOT EXISTS workspaces (
+    workspace_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    owner_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    name VARCHAR(255) NOT NULL,
+    is_default BOOLEAN NOT NULL DEFAULT FALSE,
+    status VARCHAR(20) NOT NULL DEFAULT 'active', -- active | deleted
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
 CREATE TABLE IF NOT EXISTS scenarios (
     scenario_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255),
@@ -17,6 +28,7 @@ CREATE TABLE IF NOT EXISTS scenarios (
     nl_input TEXT NOT NULL,
     status VARCHAR(50) NOT NULL,
     creator_id UUID NOT NULL REFERENCES users(user_id),
+    workspace_id UUID REFERENCES workspaces(workspace_id),
     model_version_hash VARCHAR(64) NOT NULL DEFAULT 'v0',
     base_case_id UUID REFERENCES scenarios(scenario_id),
     created_at TIMESTAMP DEFAULT NOW(),
@@ -54,6 +66,7 @@ CREATE TABLE IF NOT EXISTS audit_trail (
     action_type VARCHAR(50) NOT NULL,
     user_id UUID NOT NULL REFERENCES users(user_id),
     action_details JSONB,
+    touched_levers_snapshot JSONB,
     timestamp TIMESTAMP DEFAULT NOW(),
     ip_address INET,
     user_agent TEXT
@@ -112,6 +125,7 @@ CREATE TABLE IF NOT EXISTS parameter_override_history (
 CREATE TABLE IF NOT EXISTS company_context (
     context_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_by UUID REFERENCES users(user_id),
+    workspace_id UUID REFERENCES workspaces(workspace_id),
     company_name TEXT,
     industry TEXT,
     context_data JSONB NOT NULL,
@@ -125,6 +139,7 @@ CREATE TABLE IF NOT EXISTS company_context (
 CREATE TABLE IF NOT EXISTS user_models (
     model_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     created_by UUID REFERENCES users(user_id),
+    workspace_id UUID REFERENCES workspaces(workspace_id),
     name TEXT NOT NULL,
     model_definition JSONB NOT NULL,
     source_context_id UUID REFERENCES company_context(context_id),
@@ -133,20 +148,148 @@ CREATE TABLE IF NOT EXISTS user_models (
     updated_at TIMESTAMP DEFAULT NOW()
 );
 
+-- Planning-system connections (SAP SAC / Anaplan / Oracle PBCS)
+CREATE TABLE IF NOT EXISTS planning_connections (
+    connection_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    created_by UUID NOT NULL REFERENCES users(user_id),
+    provider VARCHAR(30) NOT NULL CHECK (provider IN ('sap_sac', 'anaplan', 'oracle_pbcs', 'mock')),
+    name TEXT NOT NULL,
+    base_url TEXT NOT NULL,
+    auth_kind VARCHAR(40) NOT NULL CHECK (auth_kind IN ('oauth2_client_credentials', 'api_key')),
+    auth_public JSONB NOT NULL DEFAULT '{}'::jsonb,
+    secret_ciphertext TEXT NOT NULL,
+    status VARCHAR(20) NOT NULL DEFAULT 'active' CHECK (status IN ('active', 'disabled')),
+    last_test_at TIMESTAMP,
+    last_test_ok BOOLEAN,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS integration_events (
+    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    connection_id UUID REFERENCES planning_connections(connection_id) ON DELETE SET NULL,
+    user_id UUID REFERENCES users(user_id),
+    event_type VARCHAR(80) NOT NULL,
+    details JSONB NOT NULL DEFAULT '{}'::jsonb,
+    request_id TEXT,
+    ip_address INET,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS external_model_snapshots (
+    snapshot_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    connection_id UUID NOT NULL REFERENCES planning_connections(connection_id),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    provider VARCHAR(30) NOT NULL,
+    external_model_id TEXT NOT NULL,
+    external_model_name TEXT NOT NULL,
+    snapshot_version INTEGER NOT NULL DEFAULT 1,
+    status VARCHAR(20) NOT NULL DEFAULT 'importing'
+        CHECK (status IN ('importing', 'ready', 'failed', 'superseded')),
+    error TEXT,
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    stats JSONB NOT NULL DEFAULT '{}'::jsonb,
+    fact_query JSONB,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS external_model_facts (
+    snapshot_id UUID NOT NULL REFERENCES external_model_snapshots(snapshot_id) ON DELETE CASCADE,
+    measure_id TEXT NOT NULL,
+    member_key TEXT NOT NULL,
+    value NUMERIC NOT NULL,
+    PRIMARY KEY (snapshot_id, measure_id, member_key)
+);
+
 -- Documents (for RAG / talk-to-document feature)
 CREATE TABLE IF NOT EXISTS documents (
     document_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     name VARCHAR(255) NOT NULL,
     original_filename VARCHAR(500) NOT NULL,
-    file_type VARCHAR(50) NOT NULL,
+    file_type VARCHAR(255) NOT NULL,
     file_size_bytes INTEGER,
     chunk_count INTEGER DEFAULT 0,
     status VARCHAR(50) DEFAULT 'processing',
+    document_kind VARCHAR(50) DEFAULT 'document_text',
+    validation_status VARCHAR(50) DEFAULT 'processing',
+    workbook_graph JSONB,
+    model_schema JSONB,
     qdrant_collection VARCHAR(255),
     created_by UUID REFERENCES users(user_id),
+    workspace_id UUID REFERENCES workspaces(workspace_id),
     created_at TIMESTAMP DEFAULT NOW(),
     updated_at TIMESTAMP DEFAULT NOW()
 );
+
+-- Conversational sessions (persistent companion to in-memory cache)
+CREATE TABLE IF NOT EXISTS sessions (
+    session_id VARCHAR(255) PRIMARY KEY,
+    scenario_id UUID NOT NULL REFERENCES scenarios(scenario_id) ON DELETE CASCADE,
+    user_id UUID REFERENCES users(user_id),
+    scenario_context JSONB,
+    turns JSONB DEFAULT '[]'::jsonb,
+    expires_at TIMESTAMP NOT NULL,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+-- Backward-compatible column migrations
+ALTER TABLE audit_trail
+  ADD COLUMN IF NOT EXISTS touched_levers_snapshot JSONB;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS document_kind VARCHAR(50) DEFAULT 'document_text';
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS validation_status VARCHAR(50) DEFAULT 'processing';
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS workbook_graph JSONB;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS model_schema JSONB;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS artifact_version INTEGER DEFAULT 1;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS ingestion_report JSONB;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS tabular_artifact JSONB;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS workbook_snapshot JSONB;
+
+ALTER TABLE sessions
+  ADD COLUMN IF NOT EXISTS scenario_context JSONB;
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
+
+ALTER TABLE company_context
+  ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
+
+ALTER TABLE user_models
+  ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
+
+ALTER TABLE user_models
+  ADD COLUMN IF NOT EXISTS source_kind VARCHAR(30) NOT NULL DEFAULT 'documents';
+
+ALTER TABLE user_models
+  ADD COLUMN IF NOT EXISTS snapshot_id UUID REFERENCES external_model_snapshots(snapshot_id);
+
+ALTER TABLE scenario_parameters
+  ADD COLUMN IF NOT EXISTS member_scope JSONB;
+
+ALTER TABLE scenario_parameters
+  ADD COLUMN IF NOT EXISTS delta_type VARCHAR(16) NOT NULL DEFAULT 'absolute';
+
+ALTER TABLE scenarios
+  ADD COLUMN IF NOT EXISTS workspace_id UUID REFERENCES workspaces(workspace_id);
 
 -- Indexes
 CREATE INDEX IF NOT EXISTS idx_scenarios_creator ON scenarios(creator_id);
@@ -157,6 +300,131 @@ CREATE INDEX IF NOT EXISTS idx_audit_scenario ON audit_trail(scenario_id);
 CREATE INDEX IF NOT EXISTS idx_audit_timestamp ON audit_trail(timestamp);
 CREATE INDEX IF NOT EXISTS idx_mappings_term ON model_mappings(business_term);
 CREATE INDEX IF NOT EXISTS idx_mappings_variable ON model_mappings(model_variable_id);
+CREATE INDEX IF NOT EXISTS idx_documents_kind ON documents(document_kind);
+CREATE INDEX IF NOT EXISTS idx_documents_validation_status ON documents(validation_status);
+CREATE INDEX IF NOT EXISTS idx_sessions_scenario ON sessions(scenario_id);
+CREATE INDEX IF NOT EXISTS idx_workspaces_owner ON workspaces(owner_id);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_workspaces_owner_default
+    ON workspaces(owner_id) WHERE is_default AND status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_workspaces_owner_name
+    ON workspaces(owner_id, lower(name)) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_company_context_active_ws
+    ON company_context(workspace_id) WHERE status = 'active';
+CREATE UNIQUE INDEX IF NOT EXISTS uq_user_models_active_ws
+    ON user_models(workspace_id) WHERE is_active;
+CREATE INDEX IF NOT EXISTS idx_documents_workspace
+    ON documents(workspace_id, status, document_kind, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_scenarios_workspace
+    ON scenarios(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_company_context_workspace
+    ON company_context(workspace_id, status);
+CREATE INDEX IF NOT EXISTS idx_user_models_workspace
+    ON user_models(workspace_id, is_active);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_planning_connections_ws_name
+    ON planning_connections(workspace_id, lower(name))
+    WHERE status = 'active';
+CREATE INDEX IF NOT EXISTS idx_planning_connections_workspace
+    ON planning_connections(workspace_id, status);
+CREATE INDEX IF NOT EXISTS idx_integration_events_workspace
+    ON integration_events(workspace_id, created_at DESC);
+CREATE UNIQUE INDEX IF NOT EXISTS uq_external_model_snapshots_version
+    ON external_model_snapshots(connection_id, external_model_id, snapshot_version);
+CREATE INDEX IF NOT EXISTS idx_external_model_snapshots_workspace
+    ON external_model_snapshots(workspace_id, created_at DESC);
+CREATE INDEX IF NOT EXISTS idx_external_model_facts_snapshot
+    ON external_model_facts(snapshot_id);
+CREATE INDEX IF NOT EXISTS idx_user_models_snapshot
+    ON user_models(snapshot_id)
+    WHERE snapshot_id IS NOT NULL;
+
+-- Hybrid RAG: portable embeddings + document conversation memory
+ALTER TABLE document_chunks ADD COLUMN IF NOT EXISTS embedding JSONB;
+
+CREATE TABLE IF NOT EXISTS document_conversations (
+    conversation_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    document_id UUID REFERENCES documents(document_id) ON DELETE SET NULL,
+    user_id UUID REFERENCES users(user_id) ON DELETE SET NULL,
+    title VARCHAR(255),
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS document_conversation_messages (
+    message_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    conversation_id UUID NOT NULL REFERENCES document_conversations(conversation_id) ON DELETE CASCADE,
+    role VARCHAR(20) NOT NULL,
+    content TEXT NOT NULL,
+    sources JSONB,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+
+CREATE INDEX IF NOT EXISTS idx_document_conversation_messages
+    ON document_conversation_messages(conversation_id, created_at);
+
+-- Wave 5/6 enterprise foundation (kept in sync with migrations)
+CREATE TABLE IF NOT EXISTS scenario_versions (
+    version_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    scenario_id UUID NOT NULL REFERENCES scenarios(scenario_id) ON DELETE CASCADE,
+    workspace_id UUID REFERENCES workspaces(workspace_id) ON DELETE SET NULL,
+    label VARCHAR(255) NOT NULL,
+    version_number INTEGER NOT NULL DEFAULT 1,
+    touched_levers JSONB NOT NULL DEFAULT '[]'::jsonb,
+    parameters_snapshot JSONB NOT NULL DEFAULT '[]'::jsonb,
+    outputs JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_by UUID REFERENCES users(user_id),
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (scenario_id, version_number)
+);
+CREATE INDEX IF NOT EXISTS idx_scenario_versions_scenario
+    ON scenario_versions(scenario_id, version_number DESC);
+
+CREATE TABLE IF NOT EXISTS organizations (
+    organization_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    name VARCHAR(255) NOT NULL,
+    slug VARCHAR(100) UNIQUE,
+    created_at TIMESTAMP DEFAULT NOW(),
+    updated_at TIMESTAMP DEFAULT NOW()
+);
+CREATE TABLE IF NOT EXISTS organization_members (
+    membership_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    organization_id UUID NOT NULL REFERENCES organizations(organization_id) ON DELETE CASCADE,
+    user_id UUID NOT NULL REFERENCES users(user_id) ON DELETE CASCADE,
+    org_role VARCHAR(50) NOT NULL DEFAULT 'member',
+    created_at TIMESTAMP DEFAULT NOW(),
+    UNIQUE (organization_id, user_id)
+);
+ALTER TABLE workspaces
+  ADD COLUMN IF NOT EXISTS organization_id UUID REFERENCES organizations(organization_id) ON DELETE SET NULL;
+CREATE INDEX IF NOT EXISTS idx_workspaces_organization
+    ON workspaces(organization_id) WHERE organization_id IS NOT NULL;
+
+CREATE TABLE IF NOT EXISTS actuals_facts (
+    fact_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    workspace_id UUID NOT NULL REFERENCES workspaces(workspace_id) ON DELETE CASCADE,
+    source_kind VARCHAR(40) NOT NULL DEFAULT 'upload'
+        CHECK (source_kind IN ('upload', 'sac', 'anaplan', 'manual')),
+    measure_id TEXT NOT NULL,
+    period TEXT NOT NULL,
+    version_lane VARCHAR(40) NOT NULL DEFAULT 'actual'
+        CHECK (version_lane IN ('actual', 'budget', 'forecast')),
+    entity_key TEXT,
+    value NUMERIC NOT NULL,
+    currency VARCHAR(16),
+    unit VARCHAR(32),
+    metadata JSONB NOT NULL DEFAULT '{}'::jsonb,
+    created_at TIMESTAMP DEFAULT NOW()
+);
+CREATE INDEX IF NOT EXISTS idx_actuals_facts_workspace
+    ON actuals_facts(workspace_id, version_lane, period);
+
+ALTER TABLE documents
+  ADD COLUMN IF NOT EXISTS storage_key TEXT,
+  ADD COLUMN IF NOT EXISTS storage_backend VARCHAR(20) DEFAULT 'postgres';
+
+ALTER TABLE llm_usage
+  ADD COLUMN IF NOT EXISTS cache_read_input_tokens INTEGER NOT NULL DEFAULT 0,
+  ADD COLUMN IF NOT EXISTS cache_creation_input_tokens INTEGER NOT NULL DEFAULT 0;
 
 -- Seed default user for local dev / testing only.
 -- In production, users should be created via the application or SSO.

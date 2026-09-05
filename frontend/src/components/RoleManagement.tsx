@@ -2,7 +2,7 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
-import { listUsers, updateUserRole, type UserProfile } from "@/lib/api";
+import { listUsers, updateUserRole, getRoles, type UserProfile, type RoleDescriptor } from "@/lib/api";
 
 interface RoleManagementProps {
   onClose: () => void;
@@ -16,25 +16,22 @@ const ROLE_COLORS: Record<string, string> = {
   viewer: "border-[var(--info)]/20 bg-[var(--info-bg)] text-[var(--info)]",
 };
 
-const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:4000";
+const FALLBACK_ROLES: RoleDescriptor[] = [
+  { id: "viewer", label: "Viewer", description: "Can view scenarios and reports" },
+  { id: "analyst", label: "Analyst", description: "Can create, edit, and share scenarios" },
+  { id: "approver", label: "Approver", description: "Can approve scenarios for simulation" },
+  { id: "admin", label: "Admin", description: "Full access including user management" },
+];
 
 export function RoleManagement({ onClose, onMinimize }: RoleManagementProps) {
   const [users, setUsers] = useState<UserProfile[]>([]);
   const [loading, setLoading] = useState(true);
-  const [roles, setRoles] = useState<{ id: string; label: string; description: string }[]>([]);
+  const [roles, setRoles] = useState<RoleDescriptor[]>([]);
 
   useEffect(() => {
-    fetch(`${API_BASE}/api/v1/users/roles`)
-      .then((r) => r.json())
-      .then((d) => { if (d.roles) setRoles(d.roles); })
-      .catch(() => {
-        setRoles([
-          { id: "viewer", label: "Viewer", description: "Can view scenarios and reports" },
-          { id: "analyst", label: "Analyst", description: "Can create, edit, and share scenarios" },
-          { id: "approver", label: "Approver", description: "Can approve scenarios for simulation" },
-          { id: "admin", label: "Admin", description: "Full access including user management" },
-        ]);
-      });
+    getRoles()
+      .then((r) => setRoles(r.length > 0 ? r : FALLBACK_ROLES))
+      .catch(() => setRoles(FALLBACK_ROLES));
   }, []);
   const [error, setError] = useState<string | null>(null);
   const [editingUser, setEditingUser] = useState<string | null>(null);

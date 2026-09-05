@@ -1,0 +1,6 @@
+{
+  "value": [
+    { "ProviderID": "BusinessPlanning", "Name": "Business Planning", "Description": "Classic account model" },
+    { "ProviderID": "RevenueModel", "Name": "Revenue Model", "Description": "Multi-measure model" }
+  ]
+}

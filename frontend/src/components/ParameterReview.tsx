@@ -2,7 +2,18 @@
 
 import { useEffect, useState, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
-import { getParameters, updateParameter, approveScenario, type StoredParameter } from "@/lib/api";
+import {
+  getParameters,
+  updateParameter,
+  approveScenario,
+  getScenarioContext,
+  lockScenarioLever,
+  resetScenarioUnlockedLevers,
+  type StoredParameter,
+  type TouchedLever,
+} from "@/lib/api";
+import type { MemberCatalog } from "@/lib/api";
+import { getMemberName } from "@/lib/dimensionalPov";
 
 interface ParameterReviewProps {
   scenarioId: string;
@@ -11,16 +22,44 @@ interface ParameterReviewProps {
   onMinimize?: () => void;
 }
 
+export function ScopeBadge({
+  memberScope,
+  memberCatalog,
+}: {
+  memberScope?: Record<string, string> | null;
+  memberCatalog?: MemberCatalog;
+}) {
+  if (!memberScope || Object.keys(memberScope).length === 0) return null;
+  return (
+    <div className="mt-1 flex flex-wrap gap-1" aria-label="Member scope">
+      {Object.entries(memberScope).map(([dimensionId, memberId]) => (
+        <span
+          key={dimensionId}
+          className="rounded-full border border-accent/20 bg-accent/10 px-2 py-0.5 text-[10px] text-accent"
+          title={`${dimensionId}: ${memberId}`}
+        >
+          {dimensionId}: {getMemberName(memberCatalog, dimensionId, memberId)}
+        </span>
+      ))}
+    </div>
+  );
+}
+
 export function ParameterReview({ scenarioId, onApproved, onClose, onMinimize }: ParameterReviewProps) {
   const [params, setParams] = useState<StoredParameter[]>([]);
+  const [touchedLevers, setTouchedLevers] = useState<TouchedLever[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
-      const p = await getParameters(scenarioId);
+      const [p, ctx] = await Promise.all([
+        getParameters(scenarioId),
+        getScenarioContext(scenarioId).catch(() => null),
+      ]);
       setParams(p);
+      setTouchedLevers(ctx?.context?.touchedLevers ?? []);
     } catch (e) {
       setError((e as Error).message);
     }
@@ -42,6 +81,37 @@ export function ParameterReview({ scenarioId, onApproved, onClose, onMinimize }:
   const handleValueChange = async (paramId: string, value: number) => {
     await updateParameter(scenarioId, paramId, { scenario_value: value, status: "modified" });
     load();
+  };
+
+  const handleAssumptionChange = async (
+    paramId: string,
+    updates: Parameters<typeof updateParameter>[2],
+  ) => {
+    try {
+      await updateParameter(scenarioId, paramId, updates);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const handleLockToggle = async (leverId: string, locked: boolean) => {
+    try {
+      const res = await lockScenarioLever(scenarioId, leverId, locked);
+      setTouchedLevers(res.context.touchedLevers);
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  };
+
+  const handleResetUnlocked = async () => {
+    try {
+      const res = await resetScenarioUnlockedLevers(scenarioId);
+      setTouchedLevers(res.context.touchedLevers);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    }
   };
 
   const handleApprove = async () => {
@@ -90,14 +160,79 @@ export function ParameterReview({ scenarioId, onApproved, onClose, onMinimize }:
         isMinimized={false}
       />
       {error && <p className="text-xs text-[var(--danger)] mb-2 bg-[var(--danger-bg)] px-3 py-1.5 rounded-lg">{error}</p>}
+
+      {touchedLevers.length > 0 && (
+        <div className="mb-3 rounded-xl border border-[var(--border-light)] bg-[var(--panel-bg)] p-3">
+          <div className="mb-2 flex items-center justify-between">
+            <p className="text-xs font-semibold uppercase tracking-wider text-[var(--text-secondary)]">
+              Touched levers ({touchedLevers.length})
+            </p>
+            <button
+              type="button"
+              onClick={handleResetUnlocked}
+              className="text-[11px] text-[var(--text-faint)] hover:text-[var(--danger)]"
+              title="Clear unlocked levers"
+            >
+              Reset unlocked
+            </button>
+          </div>
+          <ul className="space-y-1.5">
+            {touchedLevers.map((lever) => (
+              <li
+                key={lever.id}
+                className="flex items-center gap-2 text-xs text-[var(--text-primary)]"
+              >
+                <span className="min-w-0 flex-1 truncate font-medium">{lever.id}</span>
+                <span className="font-mono text-[var(--text-secondary)]">{lever.userValue}</span>
+                <button
+                  type="button"
+                  onClick={() => handleLockToggle(lever.id, !lever.locked)}
+                  className={`rounded px-2 py-0.5 text-[10px] font-medium ${
+                    lever.locked
+                      ? "bg-accent/15 text-accent"
+                      : "bg-[var(--border-light)] text-[var(--text-faint)] hover:text-[var(--text-secondary)]"
+                  }`}
+                  title={lever.locked ? "Unlock lever" : "Lock lever (survives reset)"}
+                >
+                  {lever.locked ? "Locked" : "Lock"}
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <div className="space-y-2">
         {params.map((p) => (
-          <div key={p.parameter_id} className="flex items-center gap-3 text-sm border-b border-[var(--border-light)] pb-2 last:border-0">
-            <div className="flex-1 min-w-0">
+          <div key={p.parameter_id} className="text-sm border-b border-[var(--border-light)] pb-3 last:border-0">
+            <div className="flex items-center gap-3">
+              <div className="flex-1 min-w-0">
               <p className="font-medium truncate text-[var(--text-primary)]">{p.extracted_name}</p>
               <p className="text-xs text-[var(--text-faint)]">{p.mapped_variable_id}</p>
-            </div>
-            <input
+              <ScopeBadge memberScope={p.member_scope} memberCatalog={p.member_catalog} />
+              {p.binding_evidence && (
+                <p className="mt-1 text-[11px] text-[var(--text-secondary)] leading-snug">
+                  {p.extracted_name} → &apos;{p.binding_evidence.rowLabel}&apos; at{" "}
+                  {p.binding_evidence.sheet}!{p.binding_evidence.cell}, base{" "}
+                  {p.binding_evidence.base}
+                  {p.binding_evidence.affectedOutputs?.length
+                    ? ` · moves ${p.binding_evidence.affectedOutputs
+                        .slice(0, 3)
+                        .map((o) => `${o.label} (${o.direction})`)
+                        .join(", ")}`
+                    : ""}
+                  {(p.needs_review || p.binding_evidence.needsReview) && (
+                    <span className="ml-1 text-[var(--warning)]">
+                      · needs review
+                      {p.binding_evidence.reviewReason
+                        ? ` (${p.binding_evidence.reviewReason})`
+                        : ""}
+                    </span>
+                  )}
+                </p>
+              )}
+              </div>
+              <input
               type="number"
               defaultValue={p.scenario_value}
               onBlur={(e) => {
@@ -106,16 +241,84 @@ export function ParameterReview({ scenarioId, onApproved, onClose, onMinimize }:
               }}
               className="w-20 rounded-lg border border-[var(--input-border)] bg-[var(--input-bg)] px-2 py-1 text-xs text-center focus:outline-none focus:border-[var(--input-focus-border)] focus:ring-1 focus:ring-accent/20 transition-colors"
             />
-            <span className={`text-xs font-mono ${confidenceColor(p.confidence_score)}`}>
+              <span className={`text-xs font-mono ${confidenceColor(p.confidence_score)}`}>
               {(p.confidence_score * 100).toFixed(0)}%
             </span>
-            {statusBadge(p.status)}
-            {p.status !== "accepted" && p.status !== "rejected" && (
-              <>
+              {statusBadge(p.status)}
+              {p.status !== "accepted" && p.status !== "rejected" && (
+                <>
                 <button type="button" onClick={() => handleAccept(p.parameter_id)} className="text-xs px-2.5 py-1 rounded-lg bg-[var(--success)] text-white hover:opacity-90 transition-opacity shadow-sm">Accept</button>
                 <button type="button" onClick={() => handleReject(p.parameter_id)} className="text-xs px-2.5 py-1 rounded-lg bg-[var(--danger)] text-white hover:opacity-90 transition-opacity shadow-sm">Reject</button>
-              </>
-            )}
+                </>
+              )}
+            </div>
+            <details className="mt-2">
+              <summary className="cursor-pointer text-[11px] font-medium text-[var(--text-secondary)]">
+                Assumption sign-off details
+              </summary>
+              <div className="mt-2 grid gap-2 md:grid-cols-2">
+                <input
+                  aria-label="Assumption owner user ID"
+                  defaultValue={p.owner_user_id ?? ""}
+                  placeholder="Owner user UUID"
+                  onBlur={(e) =>
+                    handleAssumptionChange(p.parameter_id, {
+                      owner_user_id: e.target.value.trim() || null,
+                    })
+                  }
+                  className="rounded-lg border border-[var(--input-border)] bg-[var(--input-bg)] px-2 py-1.5 text-xs"
+                />
+                <input
+                  type="date"
+                  aria-label="Effective date"
+                  defaultValue={p.effective_from?.slice(0, 10) ?? ""}
+                  onBlur={(e) =>
+                    handleAssumptionChange(p.parameter_id, {
+                      effective_from: e.target.value || null,
+                    })
+                  }
+                  className="rounded-lg border border-[var(--input-border)] bg-[var(--input-bg)] px-2 py-1.5 text-xs"
+                />
+                <input
+                  aria-label="Source citation"
+                  defaultValue={p.source_citation ?? ""}
+                  placeholder="Source / citation"
+                  onBlur={(e) =>
+                    handleAssumptionChange(p.parameter_id, {
+                      source_citation: e.target.value.trim() || null,
+                    })
+                  }
+                  className="rounded-lg border border-[var(--input-border)] bg-[var(--input-bg)] px-2 py-1.5 text-xs"
+                />
+                <select
+                  aria-label="Review status"
+                  defaultValue={p.review_status ?? "draft"}
+                  onChange={(e) =>
+                    handleAssumptionChange(p.parameter_id, {
+                      review_status: e.target.value as NonNullable<StoredParameter["review_status"]>,
+                    })
+                  }
+                  className="rounded-lg border border-[var(--input-border)] bg-[var(--input-bg)] px-2 py-1.5 text-xs"
+                >
+                  <option value="draft">Draft</option>
+                  <option value="reviewed">Reviewed</option>
+                  <option value="approved">Approved</option>
+                  <option value="rejected">Rejected</option>
+                </select>
+                <textarea
+                  aria-label="Assumption rationale"
+                  defaultValue={p.rationale ?? ""}
+                  placeholder="Rationale"
+                  rows={2}
+                  onBlur={(e) =>
+                    handleAssumptionChange(p.parameter_id, {
+                      rationale: e.target.value.trim() || null,
+                    })
+                  }
+                  className="rounded-lg border border-[var(--input-border)] bg-[var(--input-bg)] px-2 py-1.5 text-xs md:col-span-2"
+                />
+              </div>
+            </details>
           </div>
         ))}
       </div>

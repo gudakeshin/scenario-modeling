@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useEffect, useCallback } from "react";
+import { toast } from "sonner";
 import { listTemplates, saveAsTemplate, cloneTemplate, type Template } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
 
@@ -30,14 +31,16 @@ export function TemplateGallery({ scenarioId, onCloned, onClose, onMinimize }: T
   const [saveDesc, setSaveDesc] = useState("");
   const [saveShared, setSaveShared] = useState(false);
   const [scope, setScope] = useState<string>("all");
+  const [loadError, setLoadError] = useState<string | null>(null);
 
   const load = useCallback(async () => {
     setLoading(true);
     try {
       const data = await listTemplates(scope === "all" ? undefined : scope);
       setTemplates(data);
-    } catch {
-      // ignore
+      setLoadError(null);
+    } catch (e) {
+      setLoadError((e as Error).message || "Could not load templates.");
     }
     setLoading(false);
   }, [scope]);
@@ -53,8 +56,9 @@ export function TemplateGallery({ scenarioId, onCloned, onClose, onMinimize }: T
       setSaveName("");
       setSaveDesc("");
       load();
-    } catch {
-      // ignore
+      toast.success("Saved as template");
+    } catch (e) {
+      toast.error("Could not save template", { description: (e as Error).message });
     }
     setSaving(false);
   }, [scenarioId, saveName, saveDesc, saveShared, load]);
@@ -63,8 +67,8 @@ export function TemplateGallery({ scenarioId, onCloned, onClose, onMinimize }: T
     try {
       const { scenario_id } = await cloneTemplate(templateId);
       onCloned?.(scenario_id);
-    } catch {
-      // ignore
+    } catch (e) {
+      toast.error("Could not use template", { description: (e as Error).message });
     }
   }, [onCloned]);
 
@@ -87,6 +91,19 @@ export function TemplateGallery({ scenarioId, onCloned, onClose, onMinimize }: T
           ) : undefined
         }
       />
+
+      {loadError && (
+        <div role="alert" className="mb-3 flex items-center justify-between gap-3 rounded-lg bg-[var(--danger-bg)] px-3 py-2 text-sm text-[var(--danger)]">
+          <span>{loadError}</span>
+          <button
+            type="button"
+            onClick={() => void load()}
+            className="shrink-0 rounded-lg border border-[var(--danger)]/30 px-2.5 py-1 text-xs font-medium hover:bg-[var(--danger-bg)]"
+          >
+            Retry
+          </button>
+        </div>
+      )}
 
       {/* Save form */}
       {showSave && (
@@ -159,7 +176,7 @@ export function TemplateGallery({ scenarioId, onCloned, onClose, onMinimize }: T
                   <p className="text-[11px] text-[var(--text-muted)] truncate mt-0.5">{t.description}</p>
                 )}
                 <p className="text-[10px] text-[var(--text-faint)] mt-0.5">
-                  {t.parameter_set.length} params \u00B7 {timeAgo(t.created_at)}
+                  {t.parameter_set.length} params · {timeAgo(t.created_at)}
                 </p>
               </div>
               <button

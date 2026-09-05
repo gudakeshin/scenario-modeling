@@ -6,10 +6,24 @@
  * company context and model definition.
  */
 
-import { getApiKey, callClaude } from "./llmClient.js";
-import { getUserModelDefinition, describeModelForLLM } from "../models/registry.js";
+import { z } from "zod";
+import { getApiKey, callClaudeStructured } from "./llmClient.js";
+import { getWorkspaceModelDefinition, describeModelForLLM } from "../models/registry.js";
 import { describeContextForLLM } from "./contextEngine.js";
 import type { SearchResult } from "./searchService.js";
+import type { Scope } from "../middleware/workspace.js";
+import { logger } from "../logger.js";
+
+const reflectionSchema = z.object({
+  thinking: z.string(),
+  summary: z.object({
+    intent: z.string(),
+    affected_areas: z.array(z.string()).default([]),
+    assumptions: z.array(z.string()).default([]),
+    second_order_effects: z.array(z.string()).default([]),
+    suggested_variables: z.array(z.string()).default([]),
+  }),
+});
 
 export interface ReflectionResult {
   thinking: string;
@@ -30,19 +44,20 @@ export interface ReflectionResult {
 export async function reflect(
   nlInput: string,
   searchContext?: SearchResult | null,
-  userId?: string
+  scope?: Scope
 ): Promise<ReflectionResult | null> {
   if (!getApiKey()) return null;
 
   const startTime = Date.now();
 
   try {
-    // Load user's model and company context
-    const model = userId ? await getUserModelDefinition(userId) : null;
+    // Load the workspace's model and company context
+    if (!scope) return null;
+    const model = await getWorkspaceModelDefinition(scope.workspaceId);
     if (!model) return null; // No model = can't reflect meaningfully
 
     const modelDesc = describeModelForLLM(model);
-    const contextDesc = await describeContextForLLM(userId);
+    const contextDesc = await describeContextForLLM(scope);
 
     let contextBlock = "";
     if (contextDesc) {
@@ -76,30 +91,25 @@ OUTPUT FORMAT — return ONLY valid JSON (no markdown, no code fences):
 
 Be analytical, specific, and concise. Use the model variable IDs when referring to variables.`;
 
-    const text = await callClaude({
+    const parsed = await callClaudeStructured({
       system: systemPrompt,
-      userMessage: `Scenario: "${nlInput}"\n\nThink through this scenario step by step. Return JSON only.`,
+      userMessage: `Scenario: "${nlInput}"\n\nThink through this scenario step by step.`,
+      schema: reflectionSchema,
+      toolName: "submit_reflection",
+      toolDescription: "Submit the step-by-step reasoning about this scenario",
       maxTokens: 800,
       temperature: 0.3,
+      purpose: "reflection",
     });
-
-    const cleaned = text.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/i, "").trim();
-    const parsed = JSON.parse(cleaned);
     const duration = Date.now() - startTime;
 
     return {
-      thinking: parsed.thinking || "",
-      summary: {
-        intent: parsed.summary?.intent || "",
-        affected_areas: Array.isArray(parsed.summary?.affected_areas) ? parsed.summary.affected_areas : [],
-        assumptions: Array.isArray(parsed.summary?.assumptions) ? parsed.summary.assumptions : [],
-        second_order_effects: Array.isArray(parsed.summary?.second_order_effects) ? parsed.summary.second_order_effects : [],
-        suggested_variables: Array.isArray(parsed.summary?.suggested_variables) ? parsed.summary.suggested_variables : [],
-      },
+      thinking: parsed.thinking,
+      summary: parsed.summary,
       duration_ms: duration,
     };
   } catch (e) {
-    console.warn("[Reflection] Failed:", (e as Error).message);
+    logger.warn({ detail: (e as Error).message }, "[Reflection] Failed:");
     return null;
   }
 }

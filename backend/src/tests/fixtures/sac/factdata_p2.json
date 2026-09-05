@@ -1,0 +1,6 @@
+{
+  "value": [
+    { "Region": "DE", "Account": "COGS", "Time": "2024.01", "Version": "Actual", "SignedData": 20 },
+    { "Region": "US", "Account": "COGS", "Time": "2024.01", "Version": "Actual", "SignedData": 50 }
+  ]
+}

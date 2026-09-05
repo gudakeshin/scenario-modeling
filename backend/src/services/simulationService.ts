@@ -1,5 +1,39 @@
 import { pool } from "../db/index.js";
-import { getModelDefinition, getPLMetrics, getPercentDeltaVars, type ModelDefinition, type TimeHorizon } from "../models/registry.js";
+import { getModelDefinition, getPLMetrics } from "../models/registry.js";
+import { CompiledModel, generatePeriodLabels } from "./expression.js";
+import {
+  getEvaluableModelForScenario,
+  loadScenarioOverrides,
+  resolveOverridesToAbsolute,
+  toDimensionalOverrides,
+  type ResolvedModel,
+  type ScenarioOverride,
+} from "./modelResolver.js";
+import { DimensionalModel } from "./dimensionalModel.js";
+import { simulationsRun } from "../metrics.js";
+import { logger } from "../logger.js";
+import { config } from "../config.js";
+import { canonicalMetricId, withCanonicalMetrics } from "./metricTypes.js";
+import {
+  aggregatePeriodPlDetailed,
+  aggregateXlsxPeriodPl,
+  detectPeriodOutliers,
+  hasPeriodGrowth,
+  periodOverrides,
+} from "./simulationAggregation.js";
+import {
+  hydrateScenarioContext,
+  getScenarioContext,
+  validateAgainstConstraints,
+} from "./scenarioContextService.js";
+import {
+  attemptDeterministicNormalization,
+  buildFidelityBlock,
+  fidelityNotices,
+  type FidelityBlock,
+  type InvariantViolation,
+} from "./financialInvariants.js";
+import { reviewModelFidelity } from "./accountingFidelityAgent.js";
 
 export interface ScenarioParameterRow {
   mapped_variable_id: string;
@@ -9,298 +43,1056 @@ export interface ScenarioParameterRow {
 
 /** Single-period P&L snapshot */
 export interface PeriodResult {
-  period: string;         // e.g. "2024-Q1", "2024-01"
+  period: string;
   pl: Record<string, number>;
   variables: Record<string, number>;
+}
+
+export interface FormulaErrorMetric {
+  metric_id: string;
+  raw_value: unknown;
+  reason: string;
 }
 
 export interface SimulationOutput {
-  /** Aggregate (total) P&L across all periods */
   pl: Record<string, number>;
-  /** Aggregate variable values (from final period for rates, sum for absolutes) */
+  base_pl?: Record<string, number>;
   variables: Record<string, number>;
-  /** Per-period breakdown (quarterly or monthly) */
   periods: PeriodResult[];
-  /** Metadata */
   period_count: number;
   granularity: "monthly" | "quarterly";
+  simulation_mode: "formula_dag" | "xlsx_cell_graph" | "external_model";
   absurdity_warnings?: string[];
+  notices?: string[];
+  formula_error_metrics?: FormulaErrorMetric[];
+  status?: "completed" | "failed";
+  failure_reason?: string;
+  fidelity?: FidelityBlock;
+  /** Bound input levers available for what-if (preview only). */
+  levers?: Array<{ id: string; name: string; base: number }>;
+  ignored_overrides?: string[];
+  dimensional?: {
+    dimensions: Array<{ id: string; name: string; type: string }>;
+    member_catalog: Record<string, Record<string, string>>;
+    breakdowns: Record<string, Record<string, Record<string, number>>>;
+  };
 }
 
-function topologicalSort(variables: { id: string; dependencies: string[] }[]): string[] {
-  const order: string[] = [];
-  const visited = new Set<string>();
-  const visiting = new Set<string>();
-  const byId = new Map(variables.map((v) => [v.id, v]));
-
-  function visit(id: string) {
-    if (visited.has(id)) return;
-    if (visiting.has(id)) throw new Error(`Circular dependency involving ${id}`);
-    visiting.add(id);
-    const v = byId.get(id);
-    if (v) for (const d of v.dependencies) visit(d);
-    visiting.delete(id);
-    visited.add(id);
-    order.push(id);
-  }
-
-  for (const v of variables) visit(v.id);
-  return order; // DFS post-order: dependencies are pushed before dependents
-}
-
-/** Simple formula eval: numbers, + - * / ( ), and variable refs. */
-function evaluateFormula(formula: string, ctx: Record<string, number>): number {
-  let expr = formula.trim();
-  for (const [k, v] of Object.entries(ctx)) {
-    expr = expr.replace(new RegExp(`\\b${k.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}\\b`, "g"), String(v));
-  }
-  if (!/^[\d\s+\-*/().]+$/.test(expr)) {
-    const missing = expr.match(/\b[a-zA-Z_][a-zA-Z0-9_]*\b/g);
-    throw new Error(`Unknown variable(s) in formula: ${missing?.join(", ") || formula}`);
-  }
-  try {
-    return new Function(`return (${expr})`)();
-  } catch (e) {
-    throw new Error(`Formula error: ${(e as Error).message}`);
-  }
-}
-
-// ── Time horizon helpers ──
-
-function generatePeriodLabels(horizon: TimeHorizon): string[] {
-  const labels: string[] = [];
-  if (horizon.granularity === "quarterly") {
-    // Parse "2024-Q1" format
-    const startMatch = horizon.start.match(/(\d{4})-Q(\d)/);
-    const endMatch = horizon.end.match(/(\d{4})-Q(\d)/);
-    if (!startMatch || !endMatch) return [horizon.start]; // fallback single period
-    let year = parseInt(startMatch[1]);
-    let quarter = parseInt(startMatch[2]);
-    const endYear = parseInt(endMatch[1]);
-    const endQuarter = parseInt(endMatch[2]);
-    while (year < endYear || (year === endYear && quarter <= endQuarter)) {
-      labels.push(`${year}-Q${quarter}`);
-      quarter++;
-      if (quarter > 4) { quarter = 1; year++; }
-    }
-  } else {
-    // Monthly: parse "2024-01" or "2024-Q1" -> expand to months
-    const startMatch = horizon.start.match(/(\d{4})-Q(\d)/);
-    const endMatch = horizon.end.match(/(\d{4})-Q(\d)/);
-    if (startMatch && endMatch) {
-      // Convert quarters to months
-      let year = parseInt(startMatch[1]);
-      let month = (parseInt(startMatch[2]) - 1) * 3 + 1;
-      const endYear = parseInt(endMatch[1]);
-      const endMonth = parseInt(endMatch[2]) * 3;
-      while (year < endYear || (year === endYear && month <= endMonth)) {
-        labels.push(`${year}-${String(month).padStart(2, "0")}`);
-        month++;
-        if (month > 12) { month = 1; year++; }
-      }
-    } else {
-      // Try "2024-01" to "2024-12" format
-      const sMatch = horizon.start.match(/(\d{4})-(\d{2})/);
-      const eMatch = horizon.end.match(/(\d{4})-(\d{2})/);
-      if (sMatch && eMatch) {
-        let year = parseInt(sMatch[1]);
-        let month = parseInt(sMatch[2]);
-        const endYear = parseInt(eMatch[1]);
-        const endMonth = parseInt(eMatch[2]);
-        while (year < endYear || (year === endYear && month <= endMonth)) {
-          labels.push(`${year}-${String(month).padStart(2, "0")}`);
-          month++;
-          if (month > 12) { month = 1; year++; }
-        }
-      } else {
-        labels.push(horizon.start);
-      }
-    }
-  }
-  return labels.length > 0 ? labels : [horizon.start];
-}
-
-// ── Simulation core ──
+/** Core P&L metrics that must be finite for a successful run. */
+export const CORE_OUTPUT_IDS = new Set([
+  "revenue",
+  "net_income",
+  "net_profit",
+  "ebitda",
+  "ebit",
+  "gross_profit",
+]);
 
 /**
- * Evaluate a single period of the model with given overrides.
- * Returns the full variable context for that period.
+ * True when a model-specific id stands for a core P&L metric.
+ * Matching on the literal id alone let "gross_revenue" through unguarded.
  */
-function evaluatePeriod(
-  model: ModelDefinition,
-  order: string[],
-  overrides: Map<string, number>,
-  percentDeltaVars: Set<string>,
-  periodIndex: number,
-  prevCtx: Record<string, number> | null,
-): Record<string, number> {
-  // Base pass
-  const baseCtx: Record<string, number> = {};
-  for (const id of order) {
-    const v = model.variables.find((x) => x.id === id);
-    if (!v) continue;
-    try {
-      const val = evaluateFormula(v.formula, baseCtx);
-      baseCtx[id] = Number.isFinite(val) ? val : 0;
-    } catch {
-      baseCtx[id] = 0;
+function isCoreOutput(id: string): boolean {
+  if (CORE_OUTPUT_IDS.has(id)) return true;
+  const canonical = canonicalMetricId(id);
+  return canonical != null && CORE_OUTPUT_IDS.has(canonical);
+}
+
+export class SimulationFiniteError extends Error {
+  constructor(
+    message: string,
+    public formula_error_metrics: FormulaErrorMetric[],
+  ) {
+    super(message);
+    this.name = "SimulationFiniteError";
+  }
+}
+
+export class ConstraintViolationError extends Error {
+  constructor(
+    message: string,
+    public violations: Array<{ lever: string; reason: string }>,
+  ) {
+    super(message);
+    this.name = "ConstraintViolationError";
+  }
+}
+
+function isFiniteNumber(n: unknown): n is number {
+  return typeof n === "number" && Number.isFinite(n);
+}
+
+const MONTH_HEADER = /\b(?:jan|feb|mar|apr|may|jun|jul|aug|sep|sept|oct|nov|dec)[a-z]*/i;
+const QUARTER_HEADER = /\bq[1-4]\b/i;
+
+/**
+ * Name the calendar from the axis labels themselves.
+ *
+ * Counting columns alone mislabels anything that is neither monthly nor
+ * quarterly — a six-column half-year axis would be reported as monthly. Read
+ * the labels first and only fall back to the count when they say nothing.
+ */
+export function inferAxisGranularity(columns: string[]): "monthly" | "quarterly" {
+  const months = columns.filter((c) => MONTH_HEADER.test(c)).length;
+  const quarters = columns.filter((c) => QUARTER_HEADER.test(c)).length;
+  if (quarters > months) return "quarterly";
+  if (months > 0) return "monthly";
+  return columns.length > 6 ? "monthly" : "quarterly";
+}
+
+/**
+ * Copy finite metrics into `out`, listing non-finite ones in `errors`.
+ * Persists full float64 — round only at display/serialization edges.
+ */
+export function collectFiniteMetrics(
+  source: Record<string, number | undefined | null>,
+  out: Record<string, number>,
+  errors: FormulaErrorMetric[],
+): { coreFailed: boolean } {
+  let coreFailed = false;
+  for (const [id, raw] of Object.entries(source)) {
+    if (isFiniteNumber(raw)) {
+      out[id] = raw;
+    } else if (raw !== undefined) {
+      errors.push({
+        metric_id: id,
+        raw_value: raw,
+        reason: raw == null ? "missing" : Number.isNaN(raw as number) ? "NaN" : "non_finite",
+      });
+      if (isCoreOutput(id)) coreFailed = true;
     }
   }
-
-  // Apply overrides on top of base values.
-  // Each period applies the same delta to the ORIGINAL base — no compounding.
-  const ctx: Record<string, number> = { ...baseCtx };
-
-  for (const [id, scenarioValue] of overrides) {
-    if (!Number.isFinite(scenarioValue)) continue;
-    if (percentDeltaVars.has(id) && scenarioValue >= 0 && scenarioValue <= 100 && baseCtx[id] != null) {
-      // Apply % delta to the ORIGINAL base value — same adjustment each period, no compounding
-      ctx[id] = Math.round(baseCtx[id] * (1 + scenarioValue / 100) * 100) / 100;
-    } else {
-      ctx[id] = scenarioValue;
+  // Also flag missing core outputs that were expected in source keys
+  for (const id of CORE_OUTPUT_IDS) {
+    if (id in source && !isFiniteNumber(source[id]) && !errors.some((e) => e.metric_id === id)) {
+      errors.push({ metric_id: id, raw_value: source[id], reason: "non_finite" });
+      coreFailed = true;
     }
   }
+  return { coreFailed };
+}
 
-  // Re-evaluate all dependent (calculated) variables using the adjusted input values
-  for (const id of order) {
-    if (overrides.has(id)) continue;
-    const v = model.variables.find((x) => x.id === id);
-    if (!v) continue;
-    if (v.dependencies.length === 0) continue; // Input vars keep their overridden or base values
-    try {
-      const val = evaluateFormula(v.formula, ctx);
-      ctx[id] = Number.isFinite(val) ? val : 0;
-    } catch {
-      ctx[id] = 0;
-    }
-  }
-
-  return ctx;
+async function storeFailed(
+  scenarioId: string,
+  outputData: Record<string, unknown>,
+): Promise<void> {
+  await pool.query(
+    `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
+    [scenarioId, JSON.stringify({ ...outputData, status: "failed" })],
+  );
+  await pool.query(
+    `UPDATE scenarios SET status = 'failed', updated_at = NOW() WHERE scenario_id = $1`,
+    [scenarioId],
+  );
 }
 
 const SIMULATION_TIMEOUT_MS = Number(process.env.SIMULATION_TIMEOUT_MS) || 60_000;
 
-/** Wraps a promise with a timeout. */
 function withTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
   return new Promise((resolve, reject) => {
     const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms / 1000}s`)), ms);
     promise.then(
-      (v) => { clearTimeout(timer); resolve(v); },
-      (e) => { clearTimeout(timer); reject(e); }
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (e) => {
+        clearTimeout(timer);
+        reject(e);
+      },
     );
   });
 }
 
-export async function runSimulation(scenarioId: string): Promise<SimulationOutput> {
-  return withTimeout(_runSimulation(scenarioId), SIMULATION_TIMEOUT_MS, "Simulation");
+function absurdityWarnings(
+  basePl: Record<string, number>,
+  scenarioPl: Record<string, number>,
+  overrides: Array<{ variableId: string; value: number; delta_type: string }> = [],
+): string[] {
+  const threshold = config.ABSURDITY_THRESHOLD_PCT ?? 200;
+  const warnings: string[] = [];
+  for (const [metric, scenarioVal] of Object.entries(scenarioPl)) {
+    const baseVal = basePl[metric];
+    if (baseVal == null || Math.abs(baseVal) <= 0.01) continue;
+    const changePct = ((scenarioVal - baseVal) / Math.abs(baseVal)) * 100;
+    if (Math.abs(changePct) > threshold) {
+      warnings.push(
+        `${metric} changed by ${changePct.toFixed(0)}% — this seems disproportionate to the scenario inputs. ` +
+          `Base: ${baseVal.toLocaleString()}, Scenario: ${scenarioVal.toLocaleString()}`,
+      );
+    }
+  }
+  warnings.push(...economicConsistencyWarnings(basePl, scenarioPl, overrides));
+  return warnings;
 }
 
-async function _runSimulation(scenarioId: string): Promise<SimulationOutput> {
+/**
+ * Deterministic fidelity guard — always runs. Optionally invokes the LLM
+ * accounting agent when residual violations remain and FIDELITY_AGENT_ENABLED.
+ */
+async function applyFidelityGuard(
+  pl: Record<string, number>,
+  basePl: Record<string, number>,
+  notices: string[],
+  context?: {
+    scenarioId?: string;
+    modelSummary?: string;
+    /**
+     * Report invariant findings without rewriting any value.
+     *
+     * Required on the XLSX path: those numbers are the workbook's own
+     * arithmetic, and Excel parity is the contract. Repairing a value there
+     * substitutes our formula for the model's — it silently replaced a
+     * workbook-computed margin of 0.349 (a fraction) with a recomputed 35.25
+     * (a percent), which then read as a +8,858% move against the base.
+     * Repairs remain appropriate for LLM-assembled formula models.
+     */
+    reportOnly?: boolean;
+  },
+): Promise<{ pl: Record<string, number>; fidelity: FidelityBlock; agentFindings?: InvariantViolation[] }> {
+  // Invariants are written against canonical ids (revenue, cogs, ebitda…). A
+  // workbook that reports "gross_revenue" and "material_vehicle_cost" matched
+  // none of them, so every ordering and margin check silently passed. Check the
+  // canonical projection instead.
+  const canonicalView = withCanonicalMetrics(pl);
+  const { pl: normalized, applied, residualViolations } =
+    attemptDeterministicNormalization(canonicalView);
+  // Only write back ids the model itself reports. Canonical aliases exist to
+  // make the checks fire, not to rewrite the workbook's own vocabulary — and on
+  // the XLSX path the workbook's arithmetic is the contract.
+  if (!context?.reportOnly) {
+    for (const [id, value] of Object.entries(normalized)) {
+      if (id in pl && Number.isFinite(value)) pl[id] = value;
+    }
+  }
+  notices.push(
+    ...fidelityNotices(context?.reportOnly ? [] : applied, residualViolations),
+  );
+
+  let residual = residualViolations;
+  if (residual.length > 0 && config.FIDELITY_AGENT_ENABLED) {
+    try {
+      const agentResult = await reviewModelFidelity(
+        { pl: normalized, basePl, residualViolations: residual, modelSummary: context?.modelSummary },
+        { applyGatedFixes: true },
+      );
+      if (agentResult.appliedPl) {
+        Object.assign(pl, agentResult.appliedPl);
+        residual = agentResult.residualViolations;
+        notices.push(...agentResult.notices);
+      } else if (agentResult.notices.length) {
+        notices.push(...agentResult.notices);
+      }
+    } catch (e) {
+      logger.warn(
+        `[Simulation] Fidelity agent skipped: ${(e as Error).message}`,
+      );
+    }
+  }
+
+  return {
+    pl,
+    fidelity: buildFidelityBlock(context?.reportOnly ? [] : applied, residual),
+    agentFindings: residual,
+  };
+}
+
+const COST_LEVER_RE = /cost|cogs|raw_material|materials|opex|expense|overhead|labour|labor/i;
+const MARGIN_OR_PROFIT_RE = /margin|gross_profit|ebitda$|^ebit$|operating_income|operating_profit|net_income|net_profit|profit_before_tax/i;
+
+/**
+ * Soft accounting check: cost levers moving up should not lift margins/profits
+ * (and cost cuts should not compress them). Catches wrong-sign / absolute-SET bugs.
+ */
+export function economicConsistencyWarnings(
+  basePl: Record<string, number>,
+  scenarioPl: Record<string, number>,
+  overrides: Array<{ variableId: string; value: number; delta_type: string }>,
+): string[] {
+  const costUp = overrides.filter(
+    (o) => COST_LEVER_RE.test(o.variableId) && o.delta_type !== "absolute" && o.value > 0,
+  );
+  const costDown = overrides.filter(
+    (o) => COST_LEVER_RE.test(o.variableId) && o.delta_type !== "absolute" && o.value < 0,
+  );
+  // Absolute SET above typical "small mistaken percent" is harder; still flag when
+  // a cost-like absolute SET is tiny vs a large base margin move later via heuristics below.
+  if (costUp.length === 0 && costDown.length === 0) {
+    // Absolute SET of a cost leaf to a small number often inverts economics — detect via
+    // cost-like ids with absolute delta_type when profits/margins rise sharply.
+    const absCostSets = overrides.filter(
+      (o) => COST_LEVER_RE.test(o.variableId) && o.delta_type === "absolute",
+    );
+    if (absCostSets.length === 0) return [];
+  }
+
+  const warnings: string[] = [];
+  const eps = 1e-6;
+
+  const risingOutcomes = Object.keys(scenarioPl).filter((id) => {
+    if (!MARGIN_OR_PROFIT_RE.test(id)) return false;
+    const base = basePl[id];
+    const scen = scenarioPl[id];
+    if (base == null || scen == null) return false;
+    return scen > base + Math.max(eps, Math.abs(base) * 0.001);
+  });
+  const fallingOutcomes = Object.keys(scenarioPl).filter((id) => {
+    if (!MARGIN_OR_PROFIT_RE.test(id)) return false;
+    const base = basePl[id];
+    const scen = scenarioPl[id];
+    if (base == null || scen == null) return false;
+    return scen < base - Math.max(eps, Math.abs(base) * 0.001);
+  });
+
+  if (costUp.length > 0 && risingOutcomes.length > 0) {
+    warnings.push(
+      `Accounting check: cost lever(s) ${costUp.map((o) => o.variableId).join(", ")} increased, ` +
+        `but ${risingOutcomes.join(", ")} rose vs base — expected margins/profits to fall. ` +
+        `Verify the lever mapping and whether the change was applied as percent vs absolute SET.`,
+    );
+  }
+  if (costDown.length > 0 && fallingOutcomes.length > 0) {
+    warnings.push(
+      `Accounting check: cost lever(s) ${costDown.map((o) => o.variableId).join(", ")} decreased, ` +
+        `but ${fallingOutcomes.join(", ")} fell vs base — expected margins/profits to rise.`,
+    );
+  }
+
+  // Absolute SET on a cost line that collapses the leaf (common %→absolute bug)
+  for (const o of overrides) {
+    if (!COST_LEVER_RE.test(o.variableId) || o.delta_type !== "absolute") continue;
+    if (!(o.value >= 0 && o.value <= 100) || risingOutcomes.length === 0) continue;
+    warnings.push(
+      `Accounting check: ${o.variableId} was applied as an absolute SET to ${o.value} ` +
+        `(not a percent change). If you meant +${o.value}%, remapping as percent; ` +
+        `a small absolute SET typically collapses costs and inflates margins.`,
+    );
+  }
+
+  return warnings;
+}
+
+/**
+ * Report overrides that bound to a lever but moved no output.
+ *
+ * Without this the run reports success and the metric is simply unchanged,
+ * which reads as "the lever had no material impact" rather than "the lever was
+ * never wired to anything".
+ */
+function inertOverrideNotices(
+  runtime: unknown,
+  absolute: Record<string, number>,
+): string[] {
+  const finder = (runtime as {
+    findInertOverrides?: (o: Record<string, number>) => Array<{ id: string; sheet: string; cell: string }>;
+  }).findInertOverrides;
+  if (typeof finder !== "function") return [];
+  let inert: Array<{ id: string; sheet: string; cell: string }>;
+  try {
+    inert = finder.call(runtime, absolute);
+  } catch {
+    return [];
+  }
+  if (inert.length === 0) return [];
+  return [
+    `These parameters changed a model cell but moved no output metric: ` +
+      `${inert.map((i) => `${i.id} (${i.sheet}!${i.cell})`).join(", ")}. ` +
+      `The result below does not reflect them — re-map them to a driver the P&L depends on.`,
+  ];
+}
+
+function unresolvedNotices(unresolved: string[]): string[] {
+  if (unresolved.length === 0) return [];
+  return [
+    `Percent changes for ${unresolved.join(", ")} could not be applied — the model has no non-zero base value for them.`,
+  ];
+}
+
+async function storeAndComplete(scenarioId: string, outputData: Record<string, unknown>): Promise<void> {
+  await pool.query(
+    `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
+    [scenarioId, JSON.stringify(outputData)],
+  );
+  await pool.query(
+    `UPDATE scenarios SET status = 'completed', updated_at = NOW() WHERE scenario_id = $1`,
+    [scenarioId],
+  );
+}
+
+export interface RunSimulationOptions {
+  /** When true, caller persists outputs/status/version/audit atomically. */
+  skipPersist?: boolean;
+}
+
+async function enforceConstraints(scenarioId: string, absolute: Record<string, number>): Promise<void> {
+  const ctx = (await hydrateScenarioContext(scenarioId)) ?? getScenarioContext(scenarioId);
+  const result = validateAgainstConstraints(absolute, ctx?.constraints ?? []);
+  if (!result.ok) {
+    throw new ConstraintViolationError(
+      `Scenario violates constraints: ${result.violations.map((v) => v.reason).join("; ")}`,
+      result.violations,
+    );
+  }
+}
+
+// ── Entry point ──
+
+export async function runSimulation(
+  scenarioId: string,
+  options?: RunSimulationOptions,
+): Promise<SimulationOutput> {
+  return withTimeout(
+    _runSimulationDispatcher(scenarioId, options),
+    SIMULATION_TIMEOUT_MS,
+    "Simulation",
+  );
+}
+
+/**
+ * Preview simulation without persisting outputs or changing scenario status.
+ * Uses the same EvaluableModel path as production runs.
+ */
+export async function previewSimulationForScenario(
+  scenarioId: string,
+  overrideParams?: ScenarioOverride[],
+): Promise<SimulationOutput> {
+  const resolved = await getEvaluableModelForScenario(scenarioId);
+  const overrides = overrideParams ?? (await loadScenarioOverrides(scenarioId));
+  const { absolute, unresolved } = resolveOverridesToAbsolute(resolved.model, overrides);
+  await enforceConstraints(scenarioId, absolute);
+
+  const leverList = (() => {
+    const seen = new Set<string>();
+    const out: Array<{ id: string; name: string; base: number }> = [];
+    for (const i of resolved.model.inputs) {
+      if (seen.has(i.id)) continue;
+      seen.add(i.id);
+      out.push({ id: i.id, name: i.name, base: i.base });
+    }
+    return out;
+  })();
+  const inputIds = new Set(leverList.map((l) => l.id));
+  const notices: string[] = [...unresolvedNotices(unresolved)];
+
+  const unknownOverrides = overrides
+    .map((o) => o.variableId)
+    .filter((id) => id && !inputIds.has(id));
+  if (unknownOverrides.length > 0) {
+    notices.push(
+      `These overrides are not model input levers and will not affect the preview: ${[...new Set(unknownOverrides)].join(", ")}. ` +
+        `Map parameters to input levers (e.g. material_cost_of_nsp), not calculated outputs.`,
+    );
+  }
+
+  if (resolved.source === "external_model") {
+    const model = resolved.model as DimensionalModel;
+    const dimOverrides = toDimensionalOverrides(overrides);
+    const baseResult = model.evaluateDimensional([]);
+    const scenarioResult = model.evaluateDimensional(dimOverrides);
+    const pl: Record<string, number> = {};
+    const basePl: Record<string, number> = {};
+    const errors: FormulaErrorMetric[] = [];
+    collectFiniteMetrics(scenarioResult.totals, pl, errors);
+    collectFiniteMetrics(baseResult.totals, basePl, errors);
+    return {
+      pl,
+      variables: { ...pl },
+      periods: [{ period: "Total", pl, variables: { ...pl } }],
+      period_count: 1,
+      granularity: "quarterly",
+      simulation_mode: "external_model",
+      levers: leverList,
+      ...(notices.length ? { notices } : {}),
+      ...(errors.length ? { formula_error_metrics: errors } : {}),
+      status: "completed",
+    };
+  }
+
+  if (resolved.source === "xlsx_cell_graph") {
+    const runtime = resolved.model;
+    const baseOut = runtime.evaluate({});
+    const scenarioOut = runtime.evaluate(absolute);
+    const ignored =
+      "lastIgnoredOverrides" in runtime &&
+      Array.isArray((runtime as { lastIgnoredOverrides: string[] }).lastIgnoredOverrides)
+        ? (runtime as { lastIgnoredOverrides: string[] }).lastIgnoredOverrides
+        : unknownOverrides;
+    if (ignored.length > 0) {
+      notices.push(
+        `Ignored non-lever overrides (XLSX only applies bound input cells): ${[...new Set(ignored)].join(", ")}`,
+      );
+    }
+    const runtimeErrors =
+      "lastEvaluationErrors" in runtime &&
+      Array.isArray((runtime as { lastEvaluationErrors: string[] }).lastEvaluationErrors)
+        ? (runtime as { lastEvaluationErrors: string[] }).lastEvaluationErrors
+        : [];
+    if (runtimeErrors.length > 0) notices.push(...runtimeErrors);
+    notices.push(...inertOverrideNotices(runtime, absolute));
+
+    const pl: Record<string, number> = {};
+    const errors: FormulaErrorMetric[] = [];
+    const { coreFailed } = collectFiniteMetrics(
+      Object.fromEntries(runtime.outputIds.map((id) => [id, scenarioOut[id]])),
+      pl,
+      errors,
+    );
+    if (coreFailed) {
+      throw new SimulationFiniteError("Preview failed: core metrics non-finite", errors);
+    }
+    // Return the base rather than discarding it: the What-If panel needs deltas
+    // and was issuing a second empty-override preview purely to recover this.
+    const basePl: Record<string, number> = {};
+    collectFiniteMetrics(
+      Object.fromEntries(runtime.outputIds.map((id) => [id, baseOut[id]])),
+      basePl,
+      [],
+    );
+    const previewAxis =
+      (runtime as { timeAxisRef?: { columns?: string[] } | null }).timeAxisRef?.columns ?? [];
+    return {
+      pl,
+      base_pl: basePl,
+      variables: { ...pl },
+      periods: [{ period: "FY", pl, variables: { ...pl } }],
+      period_count: 1,
+      granularity: inferAxisGranularity(previewAxis),
+      simulation_mode: "xlsx_cell_graph",
+      levers: leverList,
+      ignored_overrides: [...new Set(ignored)],
+      ...(notices.length ? { notices } : {}),
+      ...(errors.length ? { formula_error_metrics: errors } : {}),
+      status: "completed",
+    };
+  }
+
+  // formula path
+  const model = resolved.model as CompiledModel;
+  const out = model.evaluate(absolute);
+  const base = model.baseValues();
+  const pl: Record<string, number> = {};
+  const basePl: Record<string, number> = {};
+  const errors: FormulaErrorMetric[] = [];
+  collectFiniteMetrics(out, pl, errors);
+  collectFiniteMetrics(base, basePl, []);
+  return {
+    pl,
+    base_pl: basePl,
+    variables: { ...out },
+    periods: [{ period: "Total", pl, variables: { ...out } }],
+    period_count: 1,
+    granularity: "quarterly",
+    simulation_mode: "formula_dag",
+    levers: leverList,
+    ...(notices.length ? { notices } : {}),
+    ...(errors.length ? { formula_error_metrics: errors } : {}),
+    status: "completed",
+  };
+}
+
+async function _runSimulationDispatcher(
+  scenarioId: string,
+  options?: RunSimulationOptions,
+): Promise<SimulationOutput> {
+  const resolved = await getEvaluableModelForScenario(scenarioId);
+  const overrides = await loadScenarioOverrides(scenarioId);
+  const { absolute } = resolveOverridesToAbsolute(resolved.model, overrides);
+  await enforceConstraints(scenarioId, absolute);
+
+  if (resolved.source === "external_model") {
+    simulationsRun.inc({ engine: "dimensional" });
+    return _runDimensionalSimulation(scenarioId, resolved, overrides, options);
+  }
+  if (resolved.source === "xlsx_cell_graph") {
+    simulationsRun.inc({ engine: "xlsx" });
+    return _runXlsxSimulation(scenarioId, resolved, overrides, options);
+  }
+  simulationsRun.inc({ engine: "formula" });
+  return _runFormulaSimulation(scenarioId, overrides, options);
+}
+
+// ── External dimensional model path ──
+
+async function _runDimensionalSimulation(
+  scenarioId: string,
+  resolved: ResolvedModel,
+  overrides: ScenarioOverride[],
+  options?: RunSimulationOptions,
+): Promise<SimulationOutput> {
+  const model = resolved.model as DimensionalModel;
+  const def = resolved.dimensionalDef!;
+  const dimOverrides = toDimensionalOverrides(overrides);
+
+  const baseResult = model.evaluateDimensional([]);
+  const scenarioResult = model.evaluateDimensional(dimOverrides);
+
+  const pl: Record<string, number> = {};
+  const basePl: Record<string, number> = {};
+  const formulaErrors: FormulaErrorMetric[] = [];
+  const scenarioCollect = collectFiniteMetrics(
+    Object.fromEntries(model.outputIds.map((id) => [id, scenarioResult.totals[id]])),
+    pl,
+    formulaErrors,
+  );
+  collectFiniteMetrics(
+    Object.fromEntries(model.outputIds.map((id) => [id, baseResult.totals[id]])),
+    basePl,
+    formulaErrors,
+  );
+
+  const variables: Record<string, number> = {};
+  for (const input of model.inputs) {
+    const v = scenarioResult.totals[input.id] ?? input.base;
+    if (isFiniteNumber(v)) variables[input.id] = v;
+  }
+
+  const timeDimId = def.time_dimension_id;
+  const timeDim = timeDimId ? def.dimensions.find((d) => d.id === timeDimId) : undefined;
+  const timeLeaves = timeDim
+    ? timeDim.members.filter((m) => m.isLeaf).sort((a, b) => a.ordinal - b.ordinal)
+    : [];
+
+  const periods: PeriodResult[] = [];
+  if (timeLeaves.length > 0) {
+    for (const leaf of timeLeaves) {
+      const periodPl: Record<string, number> = {};
+      for (const id of model.outputIds) {
+        const v = scenarioResult.valueAt(id, { [timeDimId!]: leaf.id });
+        if (isFiniteNumber(v)) periodPl[id] = v;
+      }
+      periods.push({
+        period: leaf.name,
+        pl: periodPl,
+        variables: { ...periodPl },
+      });
+    }
+  } else {
+    periods.push({ period: "Total", pl, variables: { ...variables } });
+  }
+
+  const breakdowns: Record<string, Record<string, Record<string, number>>> = {};
+  for (const metricId of model.outputIds) {
+    breakdowns[metricId] = {};
+    for (const dim of def.dimensions) {
+      if (dim.type === "version") continue;
+      const slice: Record<string, number> = {};
+      const roots = dim.members.filter((m) => !m.parentId);
+      const level1 =
+        roots.length > 0
+          ? dim.members.filter((m) => roots.some((r) => m.parentId === r.id) || roots.includes(m))
+          : dim.members.filter((m) => m.isLeaf);
+      for (const m of level1) {
+        const v = scenarioResult.valueAt(metricId, { [dim.id]: m.id });
+        if (isFiniteNumber(v)) slice[m.id] = v;
+      }
+      if (Object.keys(slice).length > 0) breakdowns[metricId][dim.id] = slice;
+    }
+  }
+
+  const dimensional = {
+    dimensions: def.dimensions.map((d) => ({ id: d.id, name: d.name, type: d.type })),
+    member_catalog: Object.fromEntries(
+      def.dimensions.map((dimension) => [
+        dimension.id,
+        Object.fromEntries(dimension.members.map((member) => [member.id, member.name])),
+      ]),
+    ),
+    breakdowns,
+  };
+
+  const warnings = absurdityWarnings(basePl, pl, overrides);
+  const notices: string[] = [];
+  if (def.build_warnings?.length) notices.push(...def.build_warnings);
+
+  const fidelityResult = await applyFidelityGuard(pl, basePl, notices, {
+    scenarioId,
+    modelSummary: `external_model ${def.model_version}`,
+  });
+
+  if (scenarioCollect.coreFailed) {
+    const outputData = {
+      aggregate: pl,
+      base_pl: basePl,
+      periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
+      simulation_mode: "external_model",
+      formula_error_metrics: formulaErrors,
+      status: "failed",
+      failure_reason: "core_metrics_non_finite",
+      fidelity: fidelityResult.fidelity,
+    };
+    await storeFailed(scenarioId, outputData);
+    throw new SimulationFiniteError("Simulation failed: core P&L metrics are non-finite", formulaErrors);
+  }
+
+  const outputData: Record<string, unknown> = {
+    aggregate: pl,
+    base_pl: basePl,
+    periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
+    granularity: def.time_horizon.granularity,
+    period_count: periods.length,
+    simulation_mode: "external_model",
+    dimensional,
+    fidelity: fidelityResult.fidelity,
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+    ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
+  };
+  if (!options?.skipPersist) {
+    await storeAndComplete(scenarioId, outputData);
+  }
+
+  return {
+    pl,
+    base_pl: basePl,
+    variables,
+    periods,
+    period_count: periods.length,
+    granularity: def.time_horizon.granularity,
+    simulation_mode: "external_model",
+    dimensional,
+    fidelity: fidelityResult.fidelity,
+    status: "completed",
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+    ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
+  };
+}
+
+// ── XLSX path ──
+
+async function _runXlsxSimulation(
+  scenarioId: string,
+  resolved: ResolvedModel,
+  overrides: ScenarioOverride[],
+  options?: RunSimulationOptions,
+): Promise<SimulationOutput> {
+  const runtime = resolved.model;
+  const { absolute, unresolved } = resolveOverridesToAbsolute(runtime, overrides);
+
+  // Prefer multi-period evaluation when the runtime supports it
+  const evaluatePeriods =
+    (() => {
+      const maybe = (runtime as { evaluatePeriods?: unknown }).evaluatePeriods;
+      if (typeof maybe !== "function") return null;
+      const typed = maybe as (
+        o: Record<string, number>,
+      ) => Array<{ period: string; values: Record<string, number> }>;
+      return typed.bind(runtime);
+    })();
+
+  const baseOut = runtime.evaluate({});
+  const scenarioOut = runtime.evaluate(absolute);
+  // Report the calendar the model actually has. "quarterly" was hardcoded here
+  // while the axis carried twelve monthly columns.
+  const axisColumns =
+    (runtime as { timeAxisRef?: { columns?: string[] } | null }).timeAxisRef?.columns ?? [];
+  const xlsxGranularity = inferAxisGranularity(axisColumns);
+  const workbookTotalIds =
+    "outputsWithWorkbookTotal" in runtime
+      ? (runtime as { outputsWithWorkbookTotal: Set<string> }).outputsWithWorkbookTotal
+      : new Set<string>();
+
+  const pl: Record<string, number> = {};
+  const basePl: Record<string, number> = {};
+  const formulaErrors: FormulaErrorMetric[] = [];
+  const scenarioCollect = collectFiniteMetrics(
+    Object.fromEntries(runtime.outputIds.map((id) => [id, scenarioOut[id]])),
+    pl,
+    formulaErrors,
+  );
+  collectFiniteMetrics(
+    Object.fromEntries(runtime.outputIds.map((id) => [id, baseOut[id]])),
+    basePl,
+    formulaErrors,
+  );
+
+  const variables: Record<string, number> = {};
+  for (const input of runtime.inputs) {
+    const v = scenarioOut[input.id] ?? input.base;
+    if (isFiniteNumber(v)) variables[input.id] = v;
+    else {
+      formulaErrors.push({
+        metric_id: input.id,
+        raw_value: v,
+        reason: "non_finite",
+      });
+    }
+  }
+
+  const warnings = absurdityWarnings(basePl, pl, overrides);
+  const notices = unresolvedNotices(unresolved);
+  notices.push(...inertOverrideNotices(runtime, absolute));
+  const runtimeErrors =
+    "lastEvaluationErrors" in runtime &&
+    Array.isArray((runtime as { lastEvaluationErrors: string[] }).lastEvaluationErrors)
+      ? (runtime as { lastEvaluationErrors: string[] }).lastEvaluationErrors
+      : [];
+  if (runtimeErrors.length > 0) {
+    notices.push(...runtimeErrors.map((e) => `Formula error: ${e}`));
+    for (const e of runtimeErrors) {
+      formulaErrors.push({ metric_id: "_runtime", raw_value: e, reason: "formula_error" });
+    }
+  }
+
+  let periods: PeriodResult[] = [{ period: "FY", pl, variables }];
+  let basePeriods: PeriodResult[] | undefined;
+  if (evaluatePeriods) {
+    try {
+      const periodSlices = evaluatePeriods(absolute);
+      if (periodSlices.length > 0) {
+        periods = periodSlices.map((s) => {
+          const periodPl: Record<string, number> = {};
+          const pe: FormulaErrorMetric[] = [];
+          collectFiniteMetrics(s.values, periodPl, pe);
+          formulaErrors.push(...pe);
+          return { period: s.period, pl: periodPl, variables: { ...periodPl } };
+        });
+        // Ratio-aware aggregate (margins/rates never summed across periods).
+        // When multi-period, also aggregate base from evaluatePeriods({}) so
+        // base_pl and scenario aggregate share the same column granularity.
+        if (periods.length > 1) {
+          const reportableIds =
+            "reportableOutputIds" in runtime
+              ? (runtime as { reportableOutputIds: string[] }).reportableOutputIds
+              : runtime.outputIds;
+          notices.push(...detectPeriodOutliers(periods, reportableIds));
+          const { aggregate: agg, warnings: aggWarnings } = aggregateXlsxPeriodPl(
+            periods,
+            runtime.outputIds,
+          );
+          notices.push(...aggWarnings);
+          // Keep the workbook's own total where it has one; re-summing periods
+          // would substitute our arithmetic for Excel's. Outputs without a total
+          // column still need the period aggregate, otherwise the headline stays
+          // stuck on whichever single column the row was bound to.
+          for (const [id, value] of Object.entries(agg)) {
+            if (!workbookTotalIds.has(id)) pl[id] = value;
+          }
+
+          const basePeriodSlices = evaluatePeriods({});
+          if (basePeriodSlices.length > 1) {
+            basePeriods = basePeriodSlices.map((s) => {
+              const periodPl: Record<string, number> = {};
+              const pe: FormulaErrorMetric[] = [];
+              collectFiniteMetrics(s.values, periodPl, pe);
+              formulaErrors.push(...pe);
+              return { period: s.period, pl: periodPl, variables: { ...periodPl } };
+            });
+            const { aggregate: baseAgg, warnings: baseAggWarnings } = aggregateXlsxPeriodPl(
+              basePeriods,
+              runtime.outputIds,
+            );
+            notices.push(...baseAggWarnings);
+            for (const [id, value] of Object.entries(baseAgg)) {
+              if (!workbookTotalIds.has(id)) basePl[id] = value;
+            }
+          }
+        }
+      }
+    } catch (e) {
+      notices.push(`Multi-period evaluation failed: ${(e as Error).message}`);
+    }
+  }
+
+  if (scenarioCollect.coreFailed) {
+    const outputData = {
+      aggregate: pl,
+      base_pl: basePl,
+      periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
+      ...(basePeriods ? { base_periods: basePeriods.map((p) => ({ period: p.period, pl: p.pl })) } : {}),
+      simulation_mode: "xlsx_cell_graph",
+      formula_error_metrics: formulaErrors,
+      notices,
+      status: "failed",
+      failure_reason: "core_metrics_non_finite",
+    };
+    await storeFailed(scenarioId, outputData);
+    throw new SimulationFiniteError("Simulation failed: core P&L metrics are non-finite", formulaErrors);
+  }
+
+  // Repeat the accepted data issues on every run. A number built on data
+  // somebody waved through should say so wherever it is read, not only in the
+  // panel where the decision was made.
+  if (resolved.documentId) {
+    try {
+      const { listFindings } = await import("./dataQuality.js");
+      const accepted = (await listFindings(resolved.documentId)).filter(
+        (f) => f.status === "acknowledged",
+      );
+      for (const f of accepted) {
+        notices.push(
+          `Accepted data issue — ${f.title} (${f.sheet}${f.cells.length ? `!${f.cells.join(", ")}` : ""})` +
+            `${f.note ? `: "${f.note}"` : ""}`,
+        );
+      }
+    } catch (e) {
+      logger.warn({ err: e }, "[Simulation] data-quality notices skipped");
+    }
+  }
+
+  const fidelityResult = await applyFidelityGuard(pl, basePl, notices, {
+    scenarioId,
+    modelSummary: "xlsx_cell_graph",
+    reportOnly: true,
+  });
+
+  const dedupedNotices = [...new Set(notices)];
+  notices.length = 0;
+  notices.push(...dedupedNotices);
+
+  const outputData: Record<string, unknown> = {
+    aggregate: pl,
+    base_pl: basePl,
+    periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
+    ...(basePeriods ? { base_periods: basePeriods.map((p) => ({ period: p.period, pl: p.pl })) } : {}),
+    granularity: xlsxGranularity,
+    period_count: periods.length,
+    simulation_mode: "xlsx_cell_graph",
+    fidelity: fidelityResult.fidelity,
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+    ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
+  };
+  if (!options?.skipPersist) {
+    await storeAndComplete(scenarioId, outputData);
+  }
+
+  return {
+    pl,
+    base_pl: basePl,
+    variables,
+    periods,
+    period_count: periods.length,
+    granularity: xlsxGranularity,
+    simulation_mode: "xlsx_cell_graph",
+    fidelity: fidelityResult.fidelity,
+    status: "completed",
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+    ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
+  };
+}
+
+// ── Formula-DAG path ──
+
+async function _runFormulaSimulation(
+  scenarioId: string,
+  overrides: ScenarioOverride[],
+  options?: RunSimulationOptions,
+): Promise<SimulationOutput> {
   const scenarioRes = await pool.query(
     "SELECT model_version_hash FROM scenarios WHERE scenario_id = $1",
-    [scenarioId]
+    [scenarioId],
   );
   if (scenarioRes.rows.length === 0) throw new Error("Scenario not found");
   const modelVersion = scenarioRes.rows[0].model_version_hash;
 
-  const paramsRes = await pool.query<ScenarioParameterRow & { confidence_score?: number }>(
-    `SELECT mapped_variable_id, scenario_value, status, confidence_score FROM scenario_parameters WHERE scenario_id = $1 AND status IN ('pending', 'accepted', 'modified')`,
-    [scenarioId]
-  );
-  const overrides = new Map<string, number>();
-  for (const row of paramsRes.rows) {
-    overrides.set(row.mapped_variable_id, Number(row.scenario_value));
-  }
+  const modelDef = await getModelDefinition(modelVersion);
+  if (!modelDef) throw new Error("No model found. Please build a model from your documents first.");
+  const model = new CompiledModel(modelDef);
+  const plMetricIds = getPLMetrics(modelDef);
 
-  const model = await getModelDefinition(modelVersion);
-  if (!model) throw new Error("No model found. Please build a model from your documents first.");
-  const order = topologicalSort(model.variables);
-  const percentDeltaVars = getPercentDeltaVars(model);
-  const plMetricIds = getPLMetrics(model);
+  const { absolute, unresolved } = resolveOverridesToAbsolute(model, overrides);
 
-  // ── Multi-period evaluation ──
-  const periodLabels = generatePeriodLabels(model.time_horizon);
-  const periods: PeriodResult[] = [];
-  let prevCtx: Record<string, number> | null = null;
+  const baseCtx = model.baseValues();
+  const periodLabels = generatePeriodLabels(modelDef.time_horizon);
+  const useGrowth = hasPeriodGrowth(modelDef);
 
-  for (let i = 0; i < periodLabels.length; i++) {
-    const ctx = evaluatePeriod(model, order, overrides, percentDeltaVars, i, prevCtx);
-
+  const formulaErrors: FormulaErrorMetric[] = [];
+  const periods: PeriodResult[] = periodLabels.map((label, t) => {
+    const absForPeriod = useGrowth ? periodOverrides(modelDef, absolute, t, baseCtx) : absolute;
+    const scenarioCtx = model.evaluate(absForPeriod);
     const periodPl: Record<string, number> = {};
     for (const id of plMetricIds) {
-      if (id in ctx) periodPl[id] = Math.round(ctx[id] * 100) / 100;
-    }
-
-    periods.push({
-      period: periodLabels[i],
-      pl: periodPl,
-      variables: { ...ctx },
-    });
-
-    prevCtx = ctx;
-  }
-
-  // ── Aggregate: sum P&L across all periods ──
-  const aggregatePl: Record<string, number> = {};
-  for (const id of plMetricIds) {
-    let total = 0;
-    for (const p of periods) {
-      total += p.pl[id] || 0;
-    }
-    aggregatePl[id] = Math.round(total * 100) / 100;
-  }
-
-  // Aggregate variables: use last period values (most representative for rates)
-  const lastPeriodVars = periods.length > 0 ? periods[periods.length - 1].variables : {};
-
-  // ── Absurdity check: validate that results are reasonable ──
-  const baseCase = evaluatePeriod(model, order, new Map(), percentDeltaVars, 0, null);
-  const warnings: string[] = [];
-  const KEY_METRICS = ["revenue", "ebitda", "ebit", "net_income", "gross_profit", "profit_before_tax"];
-  const MAX_REASONABLE_CHANGE_PCT = 200;
-
-  for (const metric of KEY_METRICS) {
-    const singlePeriodVal = periods[0]?.pl[metric];
-    const baseVal = baseCase[metric];
-    if (baseVal != null && Math.abs(baseVal) > 0.01 && singlePeriodVal != null) {
-      const changePct = ((singlePeriodVal - baseVal) / Math.abs(baseVal)) * 100;
-      if (Math.abs(changePct) > MAX_REASONABLE_CHANGE_PCT) {
-        warnings.push(
-          `${metric} changed by ${changePct.toFixed(0)}% — this seems disproportionate to the scenario inputs. ` +
-          `Base: ${baseVal.toLocaleString()}, Scenario: ${singlePeriodVal.toLocaleString()}`
-        );
-        console.warn(`[Simulation] Absurdity warning: ${metric} changed by ${changePct.toFixed(0)}%`);
+      const v = scenarioCtx[id];
+      if (isFiniteNumber(v)) periodPl[id] = v;
+      else if (id in scenarioCtx) {
+        formulaErrors.push({ metric_id: id, raw_value: v, reason: "non_finite" });
       }
     }
+    return { period: label, pl: periodPl, variables: { ...scenarioCtx } };
+  });
+
+  const { aggregate: aggregatePl, warnings: aggWarnings } = aggregatePeriodPlDetailed(
+    model,
+    modelDef,
+    periods,
+    absolute,
+  );
+  const lastPeriodVars = periods.length > 0 ? periods[periods.length - 1].variables : {};
+
+  const basePl: Record<string, number> = {};
+  for (const id of plMetricIds) {
+    const v = baseCtx[id];
+    if (isFiniteNumber(v)) basePl[id] = v;
+  }
+  const singlePeriodPl: Record<string, number> = periods[0]?.pl ?? {};
+  const warnings = absurdityWarnings(basePl, singlePeriodPl, overrides);
+  const notices = unresolvedNotices(unresolved);
+  notices.push(...aggWarnings);
+
+  const assumed = modelDef.variables.filter((v) => v.provenance === "assumed").map((v) => v.id);
+  if (assumed.length > 0) {
+    notices.push(
+      `Model includes assumed-0 variables (not extracted from documents): ${assumed.join(", ")}. Review before relying on dependent metrics.`,
+    );
   }
 
-  // Store both aggregate and period breakdown
+  const coreFailed = [...CORE_OUTPUT_IDS].some(
+    (id) => plMetricIds.includes(id) && !isFiniteNumber(aggregatePl[id]),
+  );
+  if (coreFailed) {
+    for (const id of CORE_OUTPUT_IDS) {
+      if (plMetricIds.includes(id) && !isFiniteNumber(aggregatePl[id])) {
+        formulaErrors.push({ metric_id: id, raw_value: aggregatePl[id], reason: "non_finite" });
+      }
+    }
+    await storeFailed(scenarioId, {
+      aggregate: aggregatePl,
+      base_pl: basePl,
+      formula_error_metrics: formulaErrors,
+      status: "failed",
+      failure_reason: "core_metrics_non_finite",
+    });
+    throw new SimulationFiniteError("Simulation failed: core P&L metrics are non-finite", formulaErrors);
+  }
+
+  const fidelityResult = await applyFidelityGuard(aggregatePl, basePl, notices, {
+    scenarioId,
+    modelSummary: `formula_dag ${modelVersion}`,
+  });
+
   const outputData: Record<string, unknown> = {
     aggregate: aggregatePl,
+    base_pl: basePl,
     periods: periods.map((p) => ({ period: p.period, pl: p.pl })),
-    granularity: model.time_horizon.granularity,
+    granularity: modelDef.time_horizon.granularity,
     period_count: periods.length,
+    simulation_mode: "formula_dag",
+    fidelity: fidelityResult.fidelity,
+    ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+    ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
   };
   if (warnings.length > 0) {
-    outputData.absurdity_warnings = warnings;
-    console.warn(`[Simulation] ${warnings.length} absurdity warning(s) generated`);
+    logger.warn(`[Simulation] ${warnings.length} absurdity warning(s) generated`);
   }
-
-  await pool.query(
-    `INSERT INTO scenario_outputs (scenario_id, output_type, output_data) VALUES ($1, 'pl', $2)`,
-    [scenarioId, JSON.stringify(outputData)]
-  );
-  await pool.query(
-    `UPDATE scenarios SET status = 'completed', updated_at = NOW() WHERE scenario_id = $1`,
-    [scenarioId]
-  );
+  if (!options?.skipPersist) {
+    await storeAndComplete(scenarioId, outputData);
+  }
 
   return {
     pl: aggregatePl,
+    base_pl: basePl,
     variables: lastPeriodVars,
     periods,
     period_count: periods.length,
-    granularity: model.time_horizon.granularity,
+    granularity: modelDef.time_horizon.granularity,
+    simulation_mode: "formula_dag",
+    fidelity: fidelityResult.fidelity,
+    status: "completed",
     ...(warnings.length > 0 ? { absurdity_warnings: warnings } : {}),
+    ...(notices.length > 0 ? { notices } : {}),
+    ...(formulaErrors.length > 0 ? { formula_error_metrics: formulaErrors } : {}),
   };
 }

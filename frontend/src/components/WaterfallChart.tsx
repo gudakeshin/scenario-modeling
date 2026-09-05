@@ -13,7 +13,16 @@ import {
   ReferenceLine,
 } from "recharts";
 
-import { METRIC_ORDER, METRIC_LABELS, fmtCurrency, getCurrencySymbol } from "@/lib/metrics";
+import {
+  METRIC_ORDER,
+  METRIC_LABELS,
+  fmtCurrency,
+  getCurrencySymbol,
+  withCanonicalMetrics,
+  useCurrencyVersion,
+} from "@/lib/metrics";
+import { chartColors, formatCompactCurrency } from "@/lib/chartTheme";
+import { ChartDataTable } from "./ChartDataTable";
 
 interface WaterfallChartProps {
   pl: Record<string, number>;
@@ -21,12 +30,11 @@ interface WaterfallChartProps {
   title?: string;
 }
 
-// Colors from Deloitte palette
 const COLORS = {
-  positive: "#86BC25",
-  negative: "#DA291C",
-  total: "#1D1D1B",
-  base: "#97999B",
+  positive: chartColors.positive,
+  negative: chartColors.negative,
+  total: "var(--text-primary)",
+  base: "var(--text-faint)",
 };
 
 interface WaterfallItem {
@@ -39,13 +47,20 @@ interface WaterfallItem {
 }
 
 export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: WaterfallChartProps) {
+  useCurrencyVersion();
+  // Models name their lines however the source workbook does. Project onto the
+  // canonical ids the bridge is defined in, or a P&L that says "gross_revenue"
+  // and "total_opex" renders as a single EBITDA bar.
+  const canonicalPl = useMemo(() => withCanonicalMetrics(pl), [pl]);
+  const canonicalBasePl = useMemo(() => withCanonicalMetrics(basePl), [basePl]);
+
   const data = useMemo(() => {
     const items: WaterfallItem[] = [];
     let running = 0;
 
     for (const metric of METRIC_ORDER) {
-      if (!(metric in pl)) continue;
-      const val = pl[metric];
+      if (!(metric in canonicalPl)) continue;
+      const val = canonicalPl[metric];
 
       if (metric === "revenue") {
         // Revenue is the starting bar
@@ -69,8 +84,12 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
           isTotal: true,
         });
       } else {
-        // Intermediate items (COGS, OpEx subtracted from running)
-        const delta = metric === "gross_margin" ? val - running : val;
+        // Intermediate items (COGS, OpEx subtracted from running). Gross
+        // Profit is an absolute level, not a subtraction amount — when a
+        // model has no separate COGS line, this recovers COGS implicitly
+        // as (gross_profit - running), landing `running` at the reported
+        // gross profit instead of double-counting or skipping the step.
+        const delta = metric === "gross_profit" ? val - running : val;
         const isSubtraction = metric === "cogs" || metric === "opex";
         const amount = isSubtraction ? -val : delta;
         const start = running;
@@ -87,15 +106,22 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
     }
 
     return items;
-  }, [pl]);
+  }, [canonicalPl]);
+
+  // A model whose P&L uses ids outside the canonical set entirely (e.g. a
+  // bare dimensional "amount"/"units" pair with no Revenue/COGS/OpEx/EBITDA
+  // breakdown) intersects METRIC_ORDER at nothing, so `data` is empty. An
+  // empty Recharts <BarChart> renders as a blank box with no explanation —
+  // tell the user why instead of silently showing nothing.
+  const availableMetrics = useMemo(() => Object.keys(canonicalPl), [canonicalPl]);
 
   // Delta waterfall (if base provided)
   const deltaData = useMemo(() => {
     if (!basePl) return null;
     const items: WaterfallItem[] = [];
     for (const metric of METRIC_ORDER) {
-      if (!(metric in pl) || !(metric in basePl)) continue;
-      const delta = pl[metric] - basePl[metric];
+      if (!(metric in canonicalPl) || !(metric in canonicalBasePl)) continue;
+      const delta = canonicalPl[metric] - canonicalBasePl[metric];
       items.push({
         name: METRIC_LABELS[metric] || metric,
         value: delta,
@@ -106,7 +132,7 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
       });
     }
     return items;
-  }, [pl, basePl]);
+  }, [canonicalPl, canonicalBasePl, basePl]);
 
   const CustomTooltip = ({ active, payload }: { active?: boolean; payload?: Array<{ payload: WaterfallItem }> }) => {
     if (!active || !payload?.length) return null;
@@ -120,6 +146,23 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
       </div>
     );
   };
+
+  if (data.length === 0) {
+    return (
+      <div>
+        <p className="text-[11px] font-semibold text-[var(--text-muted)] uppercase tracking-wider mb-2">{title}</p>
+        <div className="h-52 flex items-center justify-center text-center px-6">
+          <p className="text-xs text-[var(--text-muted)]">
+            No standard P&L bridge (Revenue → COGS → Gross Profit → OpEx → EBITDA → Net Income) found in this model.
+            {availableMetrics.length > 0 && (
+              <> This model reports: {availableMetrics.slice(0, 6).join(", ")}
+              {availableMetrics.length > 6 ? ", …" : ""}. Try the Trend Lines tab instead.</>
+            )}
+          </p>
+        </div>
+      </div>
+    );
+  }
 
   return (
     <div>
@@ -136,7 +179,7 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
             />
             <YAxis
               tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-              tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
+              tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
               axisLine={false}
               tickLine={false}
             />
@@ -152,6 +195,11 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
             </Bar>
           </BarChart>
         </ResponsiveContainer>
+        <ChartDataTable
+          caption={title}
+          columns={["Metric", "Value", "Start", "End"]}
+          rows={data.map((d) => [d.name, d.value, d.start, d.end])}
+        />
       </div>
 
       {/* Delta waterfall */}
@@ -170,7 +218,7 @@ export function WaterfallChart({ pl, basePl, title = "P&L Waterfall" }: Waterfal
                 />
                 <YAxis
                   tick={{ fontSize: 10, fill: "var(--text-faint)" }}
-              tickFormatter={(v: number) => `${getCurrencySymbol()}${(v / 1000).toFixed(0)}k`}
+              tickFormatter={(v: number) => formatCompactCurrency(v, getCurrencySymbol())}
               axisLine={false}
               tickLine={false}
             />

@@ -1,0 +1,113 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  backend:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: scenario_modeling
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres -d scenario_modeling"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
+    defaults:
+      run:
+        working-directory: backend
+    env:
+      NODE_ENV: test
+      DATABASE_URL: postgresql://postgres:postgres@localhost:5432/scenario_modeling
+      REDIS_URL: redis://localhost:6379
+      JWT_SECRET: ci-test-jwt-secret-at-least-32-characters-long
+      SEED_ADMIN_PASSWORD: ci-seed-admin-password
+      FRONTEND_ORIGIN: http://localhost:3000
+      # Intentionally unset — unit tests must pass without Anthropic
+      DEMO_MODE: "false"
+      EMBEDDING_PROVIDER: none
+      INGESTION_ASYNC_ENABLED: "false"
+      # Keep legacy refresh_token-in-body for integration tests.
+      AUTH_REFRESH_BODY_FALLBACK: "true"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: backend/package-lock.json
+      - run: npm ci
+      - name: Block high-severity production vulnerabilities
+        run: npm audit --omit=dev --audit-level=high
+      - run: npx node-pg-migrate up
+      - name: Verify Redis
+        run: redis-cli -u "$REDIS_URL" ping | grep -q PONG
+      - run: npm run lint
+      - run: npm run db:seed
+      - run: npm run test:coverage
+      - run: npm run test:e2e
+      - name: Install k6
+        uses: grafana/setup-k6-action@v1
+      - name: Run upload-to-simulation load smoke
+        env:
+          ANALYST_EMAIL: dev@example.com
+          ANALYST_PASSWORD: ci-seed-admin-password
+          APPROVER_EMAIL: ci-load-approver@example.com
+          APPROVER_PASSWORD: ci-load-approver-password
+          VUS: "1"
+          ITERATIONS: "1"
+        run: |
+          npm start > "$RUNNER_TEMP/scenario-modeling-api.log" 2>&1 &
+          server_pid=$!
+          trap 'kill "$server_pid" 2>/dev/null || true' EXIT
+          ready=false
+          for attempt in {1..30}; do
+            if curl --fail --silent http://localhost:4000/health >/dev/null; then
+              ready=true
+              break
+            fi
+            sleep 1
+          done
+          if [ "$ready" != "true" ]; then
+            awk '{print}' "$RUNNER_TEMP/scenario-modeling-api.log"
+            exit 1
+          fi
+          k6 run ../docs/load/k6-smoke.js
+  frontend:
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: frontend
+    env:
+      NEXT_PUBLIC_API_URL: http://localhost:4000
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: frontend/package-lock.json
+      - run: npm ci
+      - name: Block high-severity production vulnerabilities
+        run: npm audit --omit=dev --audit-level=high
+      - run: npm run lint
+      - run: npm test
+      - run: npm run build

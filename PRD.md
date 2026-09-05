@@ -2,10 +2,12 @@
 
 ## Product Requirements Document (PRD)
 
+> **Historical note (July 2026):** Parts of this PRD still describe earlier design choices (e.g. Qdrant vector DB, header-based auth). Current product truth — local JWT auth, Postgres document search (optional embeddings), HyperFormula XLSX runtime, audit hash chain — is documented in **README.md** and `docs/adr/`. Prefer README when this PRD conflicts.
+
 **Status:** Engineering-Ready Spec — Active Development
 **Owner:** FP&A Product Team
 **Last Updated:** February 22, 2026
-**Stack:** Next.js (frontend), Node.js/Express (backend), PostgreSQL, Qdrant (vector DB), Anthropic Claude (LLM), Perplexity (web search)
+**Stack:** Next.js (frontend), Node.js/Express (backend), PostgreSQL (document search; optional embeddings), Anthropic Claude (LLM), Perplexity (web search). ~~Qdrant~~ — removed; see README.
 
 ---
 
@@ -117,12 +119,12 @@ Additionally, analysts often need to reference internal documents (reports, stra
 **Acceptance Criteria:**
 - Given a PDF, TXT, MD, or CSV document
 - When uploaded
-- Then the system extracts text, chunks it, generates vector embeddings, and stores them in Qdrant
+- Then the system extracts text, chunks it, and stores chunks in Postgres (optional embeddings when `EMBEDDING_PROVIDER=openai`)
 - And I can ask natural language questions about the document
 - And the system retrieves relevant passages via vector search and generates grounded answers with source citations
 - And I can query across all uploaded documents or a specific one
 
-**Implementation Status:** ✅ Complete — Document upload (PDF/TXT/MD/CSV), Qdrant vector storage, RAG pipeline with Claude, source citations with relevance scores.
+**Implementation Status:** ✅ Complete — Document upload (PDF/TXT/MD/CSV/XLSX), Postgres keyword search (optional OpenAI-compatible embeddings), RAG pipeline with Claude, source citations. ~~Qdrant~~ aspirational / removed.
 
 **US-11 (NEW):** As an FP&A analyst, I want the system to use real-time web research when I describe a macroeconomic scenario or competitor action, so the parameters are grounded in current data rather than my guesses.
 
@@ -318,7 +320,7 @@ Control who can create, view, approve, and share scenarios based on organization
 - [x] All access events logged for compliance
 - [x] Role assignments manageable by org Admin via settings UI
 
-**Technical Implementation:** RBAC middleware with `x-user-id` header, `requireRole()` guard, RoleManagement and SharingPanel UI components.
+**Technical Implementation:** Local JWT auth + RBAC middleware (`requireRole()`), RoleManagement and SharingPanel UI components. (`x-user-id` header auth was removed — see ADR 0001.)
 
 ---
 
@@ -449,20 +451,29 @@ Time-horizon-aware simulation with period-by-period breakdown.
 
 ---
 
-#### P1-10: Document RAG — Talk to Documents (Qdrant Integration)
-Upload documents, vectorize with Qdrant, and chat with document content via RAG.
+#### P1-10: Document RAG — Talk to Documents (Postgres search)
+Upload documents and chat with document content via RAG.
+
+**Status note:** Qdrant is **not** in the current stack (see README). Retrieval is Postgres keyword search; optional vector embeddings via `EMBEDDING_PROVIDER=openai`.
+
+- [x] Storage in Postgres `document_chunks`
+- [ ] Optional pgvector hybrid retrieval (Wave 3)
+- [x] Graceful error handling (empty files, unsupported types)
+
+**Implementation Status:** ✅ Keyword RAG complete — `embeddingService.ts` (optional), `documentService.ts`, `ragService.ts`, DocumentPanel UI. Qdrant removed.
 
 **Acceptance Criteria:**
 - [x] Upload PDF, TXT, MD, CSV (max 20MB) via drag-and-drop or file browser
-- [x] Text extraction, chunking (500-word, 100-word overlap), vector embedding
-- [x] Storage in Qdrant Cloud vector database
-- [x] RAG query: vector similarity search → top-K retrieval → Claude-grounded answer
+- [x] Text extraction, chunking (500-word, 100-word overlap)
+- [x] Storage in Postgres `document_chunks` (optional OpenAI-compatible embeddings via `EMBEDDING_PROVIDER`)
+- [x] RAG query: keyword search (optional hybrid vector) → top-K retrieval → Claude-grounded answer
 - [x] Source citations with relevance scores and expandable excerpts
 - [x] Query single document or search across all documents
 - [x] Document list with status indicators, delete capability
-- [x] Graceful error handling (empty files, unsupported types, Qdrant disconnected)
+- [x] Graceful error handling (empty files, unsupported types)
+- [ ] ~~Qdrant Cloud~~ — removed from stack (see README)
 
-**Implementation Status:** ✅ Complete — `embeddingService.ts`, `qdrantService.ts`, `documentService.ts`, `ragService.ts`, DocumentPanel UI.
+**Implementation Status:** ✅ Complete — `embeddingService.ts`, `documentService.ts`, `ragService.ts`, DocumentPanel UI. Qdrant removed.
 
 ---
 
@@ -491,7 +502,7 @@ Automatically builds financial models from uploaded documents using RAG and LLM 
 - [x] Builds model with proper input/output variable classification and formula relationships
 - [x] Auto-repairs broken formulas using KNOWN_CALCULATED_FORMULAS lookup
 - [x] cost_of_revenue properly calculated from sub-items (employee_benefits + subcontracting + etc.)
-- [x] Full document text reconstruction from Qdrant chunks for accurate LLM extraction
+- [x] Full document text reconstruction from Postgres chunks for accurate LLM extraction
 - [x] Document Manager UI showing extracted metrics, currency, and context
 
 **Implementation Status:** ✅ Complete — `contextEngine.ts`, context routes, DocumentManager component, centralized currency utilities.
@@ -507,7 +518,7 @@ These are out of scope for V1 but should inform architectural decisions now.
 | P2-01 | **Structured Market Data Feeds** — Auto-populate commodity prices, FX rates, and interest rates from structured data providers | Design model input layer to accept external data sources; build parameter interface that can be populated programmatically (Perplexity search partially addresses this) |
 | P2-02 | **Cross-Scenario Optimization** — Given a target metric ("Maximize EBITDA while keeping cash > $50M"), agent suggests optimal parameter combinations | Model interface should support bidirectional computation (forward simulation + inverse optimization); consider constraint solver integration |
 | P2-03 | **SSO / Enterprise Authentication** — Full SSO integration with SAML/OIDC | Current RBAC middleware supports header-based auth; SSO adapter layer needed |
-| P2-04 | **Document-Informed Scenario Generation** — Automatically generate scenario parameters from uploaded documents | RAG infrastructure (Qdrant) is in place; needs LLM agent to generate structured parameters from document excerpts |
+| P2-04 | **Document-Informed Scenario Generation** — Automatically generate scenario parameters from uploaded documents | RAG infrastructure (Postgres + optional embeddings) is in place; needs LLM agent to generate structured parameters from document excerpts |
 | P2-05 | **Collaborative Real-Time Editing** — Multiple users editing scenario parameters simultaneously | WebSocket infrastructure for real-time sync; CRDT or OT for conflict resolution |
 
 ---
@@ -611,13 +622,13 @@ These are out of scope for V1 but should inform architectural decisions now.
 - LLM reflection loop with visible thinking (P1-08)
 - Claude migration (replaced OpenAI with Anthropic Claude)
 - Card-strip + modal overlay UI refactor
-- Document RAG — Qdrant vector search integration (P1-10)
+- Document RAG — Postgres keyword search with optional embeddings (P1-10). ~~Qdrant~~ removed.
 
 #### Dynamic Context Engine, QA Agent & Simulation Accuracy ✅ COMPLETED
 
 **Dynamic Context Engine:**
-- [x] `contextEngine.ts`: Builds company context + financial model from uploaded documents via Claude + Qdrant RAG
-- [x] Full document text reconstruction from ordered Qdrant chunks (not fragmented semantic search)
+- [x] `contextEngine.ts`: Builds company context + financial model from uploaded documents via Claude + Postgres document chunks
+- [x] Full document text reconstruction from ordered Postgres chunks (not fragmented semantic search)
 - [x] LLM prompt enforces exact P&L value extraction, respects currency unit, avoids summary tables
 - [x] KNOWN_CALCULATED_FORMULAS for cost_of_revenue, ebit, ebitda, gross_profit, net_income, etc.
 - [x] Auto-repair: converts input-tagged calculated variables to proper output formulas
@@ -671,7 +682,7 @@ These are out of scope for V1 but should inform architectural decisions now.
 | Financial model definitions (at least 1 model) | FP&A | Phase 1 testing ✅ |
 | Corporate export templates | Design + FP&A | Phase 2 (export) ✅ |
 | Security review scheduling | InfoSec | Phase 6 start |
-| Qdrant Cloud instance | Platform | Phase 5 (documents) ✅ |
+| Postgres document search | Platform | Phase 5 (documents) ✅ |
 
 ---
 
@@ -692,7 +703,7 @@ These are out of scope for V1 but should inform architectural decisions now.
                      │
 ┌────────────────────▼───────────────────────────────────────────┐
 │               API Gateway (Express.js, REST)                    │
-│  - Auth (x-user-id), RBAC middleware, Rate Limiting             │
+│  - Auth (local JWT), RBAC middleware, Rate Limiting             │
 │  - Input validation, compute timeout enforcement                │
 └────────────────────┬───────────────────────────────────────────┘
                      │
@@ -701,7 +712,7 @@ These are out of scope for V1 but should inform architectural decisions now.
 ┌───▼────┐┌──▼──────────┐┌───▼────┐┌────▼─────┐┌──▼──────────┐┌──▼──────────┐
 │Reflect ││ Perplexity   ││ NL     ││Simulation││ Document    ││ Context     │
 │Agent   ││ Search Agent ││ Parser ││ Engine   ││ RAG Service ││ Engine      │
-│(Claude)││ (Sonar API)  ││(Claude)││(Multi-P) ││(Qdrant+LLM)││(Qdrant+LLM) │
+│(Claude)││ (Sonar API)  ││(Claude)││(Multi-P) ││(Postgres+LLM)││(Postgres+LLM) │
 └───┬────┘└──────────────┘└───┬────┘└────┬─────┘└──────┬──────┘└──────┬──────┘
     │                          │          │             │              │
 ┌───▼──────────────────────────▼──────────▼─────────────┘──────────────┘
@@ -711,8 +722,8 @@ These are out of scope for V1 but should inform architectural decisions now.
 ┌───────────────────────▼────────────────────────────────┐
 │  Data Layer                                             │
 │  - PostgreSQL: scenarios, params, outputs, audit,       │
-│    users, templates, sharing, documents                 │
-│  - Qdrant Cloud: document chunk vectors                 │
+│    users, templates, sharing, documents + chunks        │
+│  - Optional embeddings (EMBEDDING_PROVIDER=openai)      │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -720,14 +731,14 @@ These are out of scope for V1 but should inform architectural decisions now.
 
 | Component | Technology | Rationale |
 |-----------|-----------|-----------|
-| LLM | Anthropic Claude Haiku 4.5 | Fast, cost-effective, structured output, reflection capability |
+| LLM | Anthropic Claude (Haiku parse / Sonnet analysis / Opus QA) | Tiered routing for cost vs quality |
 | Web Search | Perplexity Sonar API | Real-time web-grounded research, high-quality summarization |
-| Vector DB | Qdrant Cloud | Managed vector search, payload filtering, scalable |
-| Embeddings | Local hash-based (prototype) / API-based (production) | Zero-dependency prototype; upgrade path to OpenAI/Voyage embeddings |
+| Document search | Postgres keyword (+ optional embeddings) | Qdrant removed; hybrid RAG when embeddings enabled |
+| Embeddings | Optional OpenAI-compatible API | Keyword-only by default; upgrade via EMBEDDING_PROVIDER |
 | Frontend | Next.js 14, React, Tailwind CSS, Recharts | Modern SSR, component architecture, rich data visualization |
 | Backend | Node.js, Express, TypeScript | Type-safe, fast development, good LLM SDK support |
 | Database | PostgreSQL | ACID compliance, JSONB for flexible data, UUID support |
-| Context Engine | contextEngine.ts + Qdrant RAG | Document-driven model building with LLM extraction and formula repair |
+| Context Engine | contextEngine.ts + Postgres RAG | Document-driven model building with LLM extraction and formula repair |
 | QA Agent | qaAgent.ts + Claude | Quality assurance with multi-dimensional scoring and absurdity detection |
 
 ### Key Design Decisions
@@ -740,7 +751,7 @@ These are out of scope for V1 but should inform architectural decisions now.
 
 4. **LLM calls are centralized.** All Claude interactions go through `llmClient.ts`, making the provider swappable. Perplexity is kept separate for web search.
 
-5. **Graceful degradation.** When AI services (Claude, Perplexity, Qdrant) are unavailable, the system falls back to heuristic parsing and provides user-visible notices explaining limitations.
+5. **Graceful degradation.** When AI services (Claude, Perplexity, embeddings) are unavailable, the system falls back to heuristic parsing / keyword search and provides user-visible notices explaining limitations.
 
 6. **Card-strip + modal UI pattern.** Analysis panels appear as compact cards below the chat; clicking expands into a modal overlay. This keeps the chat visible while providing full panel functionality.
 
@@ -762,7 +773,7 @@ These are out of scope for V1 but should inform architectural decisions now.
 | Concurrent users running against same model | Simulations are isolated (each gets immutable model snapshot); no cross-contamination |
 | Anthropic API key missing/invalid | Heuristic parser fallback + user-visible notice: "AI service unavailable — using basic parsing" |
 | Perplexity API key missing | Search skipped silently; user receives notice that real-time research is unavailable |
-| Qdrant disconnected | Document upload fails gracefully with error message; RAG queries return fallback message |
+| Document store unavailable | Document upload fails gracefully with error message; RAG queries return fallback message |
 | Document has no extractable text | Upload recorded as "error" status; user sees: "No text could be extracted" |
 | Unsupported file type uploaded | JSON error response: "Unsupported file type. Allowed: PDF, TXT, MD, CSV" |
 | User ID is email instead of UUID | `resolveUserId()` automatically resolves email to UUID via database lookup |

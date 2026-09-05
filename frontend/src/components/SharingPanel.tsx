@@ -17,6 +17,7 @@ export function SharingPanel({ scenarioId, onClose, onMinimize }: SharingPanelPr
   const [permission, setPermission] = useState<"view" | "edit">("view");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
 
   const loadData = useCallback(async () => {
@@ -27,10 +28,13 @@ export function SharingPanel({ scenarioId, onClose, onMinimize }: SharingPanelPr
       ]);
       setShares(shareData);
       setUsers(userData);
+      setLoadError(null);
     } catch {
-      // Shares or users fetch failed — partial is ok
-      try { setShares(await getShares(scenarioId)); } catch { /* empty */ }
-      try { setUsers(await listUsers()); } catch { /* empty */ }
+      // One of the two failed — keep whichever still resolves and say so.
+      const problems: string[] = [];
+      try { setShares(await getShares(scenarioId)); } catch (e) { problems.push(`shares (${(e as Error).message})`); }
+      try { setUsers(await listUsers()); } catch (e) { problems.push(`users (${(e as Error).message})`); }
+      setLoadError(problems.length > 0 ? `Could not load ${problems.join(" and ")}.` : null);
     }
   }, [scenarioId]);
 
@@ -76,6 +80,19 @@ export function SharingPanel({ scenarioId, onClose, onMinimize }: SharingPanelPr
         onMinimize={onMinimize || onClose}
         isMinimized={false}
       />
+
+      {loadError && (
+        <div role="alert" className="mb-3 flex items-center justify-between gap-3 rounded-lg bg-[var(--danger-bg)] px-3 py-2 text-sm text-[var(--danger)]">
+          <span>{loadError}</span>
+          <button
+            type="button"
+            onClick={() => void loadData()}
+            className="shrink-0 rounded-lg border border-[var(--danger)]/30 px-2.5 py-1 text-xs font-medium hover:bg-[var(--danger-bg)]"
+          >
+            Retry
+          </button>
+        </div>
+      )}
       {/* Share form */}
       <div className="flex items-center gap-2 mb-4 bg-[var(--panel-bg)] rounded-xl border border-[var(--panel-border)] p-3">
         <select

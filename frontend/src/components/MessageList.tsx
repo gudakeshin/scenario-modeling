@@ -10,14 +10,24 @@ interface MessageListProps {
 }
 
 export function MessageList({ messages, isLoading }: MessageListProps) {
-  const bottomRef = useRef<HTMLDivElement>(null);
+  const listRef = useRef<HTMLDivElement>(null);
+  const lastMessageId = messages[messages.length - 1]?.id;
 
+  // Scroll inside the message pane only — avoid scrollIntoView, which can jump the page.
   useEffect(() => {
-    bottomRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages.length]);
+    const el = listRef.current;
+    if (!el) return;
+    const raf = requestAnimationFrame(() => {
+      el.scrollTo({
+        top: el.scrollHeight,
+        behavior: isLoading ? "auto" : "smooth",
+      });
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [lastMessageId, isLoading]);
 
   return (
-    <div className="chat-scroll flex-1 overflow-y-auto bg-background">
+    <div ref={listRef} className="chat-scroll flex-1 min-h-0 overflow-y-auto bg-background">
       <div className="mx-auto max-w-3xl pb-4">
         {messages.length === 0 && !isLoading && (
           <div className="px-4 pt-16 text-center">
@@ -41,16 +51,18 @@ export function MessageList({ messages, isLoading }: MessageListProps) {
         {messages.map((msg) => (
           <MessageBubble key={msg.id} message={msg} />
         ))}
-        {isLoading && (
-          <div className="flex justify-start px-4 py-2">
-            <div className="rounded-2xl bg-[var(--message-assistant-bg)] border border-[var(--border-light)] px-4 py-3 flex gap-1.5 shadow-card">
-              <span className="w-2 h-2 rounded-full bg-accent animate-bounce [animation-delay:-0.3s]" />
-              <span className="w-2 h-2 rounded-full bg-accent/70 animate-bounce [animation-delay:-0.15s]" />
-              <span className="w-2 h-2 rounded-full bg-accent/40 animate-bounce" />
+        <div aria-live="polite" aria-atomic="true" className="contents">
+          {isLoading && (
+            <div className="flex justify-start px-4 py-2" role="status">
+              <span className="sr-only">Assistant is thinking</span>
+              <div className="rounded-2xl bg-[var(--message-assistant-bg)] border border-[var(--border-light)] px-4 py-3 flex gap-1.5 shadow-card" aria-hidden="true">
+                <span className="w-2 h-2 rounded-full bg-accent animate-bounce [animation-delay:-0.3s]" />
+                <span className="w-2 h-2 rounded-full bg-accent/70 animate-bounce [animation-delay:-0.15s]" />
+                <span className="w-2 h-2 rounded-full bg-accent/40 animate-bounce" />
+              </div>
             </div>
-          </div>
-        )}
-        <div ref={bottomRef} />
+          )}
+        </div>
       </div>
     </div>
   );

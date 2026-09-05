@@ -9,6 +9,7 @@ import {
   importMappingsCsv,
   exportMappingsCsv,
 } from "../services/mappingService.js";
+import { logger } from "../logger.js";
 
 export const mappingsRouter = Router();
 
@@ -18,7 +19,7 @@ mappingsRouter.get("/", async (req, res) => {
     const mappings = await listMappings(activeOnly);
     return res.json({ mappings });
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to list mappings" });
   }
 });
@@ -30,7 +31,7 @@ mappingsRouter.get("/export", async (req, res) => {
     res.setHeader("Content-Disposition", "attachment; filename=mappings.csv");
     return res.send(csv);
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to export mappings" });
   }
 });
@@ -44,7 +45,7 @@ mappingsRouter.post("/import", async (req, res) => {
     const result = await importMappingsCsv(csv);
     return res.json(result);
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to import mappings" });
   }
 });
@@ -59,7 +60,7 @@ mappingsRouter.post("/suggest", async (req, res) => {
     const suggestions = await suggestMappings(term.trim(), limit);
     return res.json({ suggestions });
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to suggest mappings" });
   }
 });
@@ -70,7 +71,7 @@ mappingsRouter.get("/:id", async (req, res) => {
     if (!mapping) return res.status(404).json({ error: "Mapping not found" });
     return res.json(mapping);
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to get mapping" });
   }
 });
@@ -88,7 +89,7 @@ mappingsRouter.post("/", async (req, res) => {
     );
     return res.status(201).json(mapping);
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to create mapping" });
   }
 });
@@ -104,7 +105,7 @@ mappingsRouter.put("/:id", async (req, res) => {
     if (!mapping) return res.status(404).json({ error: "Mapping not found" });
     return res.json(mapping);
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to update mapping" });
   }
 });
@@ -115,7 +116,7 @@ mappingsRouter.delete("/:id", async (req, res) => {
     if (!ok) return res.status(404).json({ error: "Mapping not found" });
     return res.status(204).send();
   } catch (e) {
-    console.error(e);
+    logger.error({ err: e }, "Request failed");
     return res.status(500).json({ error: "Failed to delete mapping" });
   }
 });

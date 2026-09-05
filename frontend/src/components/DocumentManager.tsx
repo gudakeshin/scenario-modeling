@@ -2,6 +2,7 @@
 
 import { useState, useEffect, useCallback, useRef } from "react";
 import { PanelHeader } from "./PanelHeader";
+import { DataQualityFindings } from "./DataQualityPanel";
 import {
   uploadDocument,
   listDocuments,
@@ -11,11 +12,17 @@ import {
   deleteCompanyContext,
   getActiveModel,
   updateActiveModel,
+  validateModelSchema,
   type DocumentRecord,
   type CompanyContext,
   type UserModel,
+  type IngestionReport,
+  type FidelityReport,
 } from "@/lib/api";
-import { getCurrencySymbol } from "@/lib/metrics";
+import { getCurrencySymbol, useCurrencyVersion } from "@/lib/metrics";
+import { useUiStore } from "@/stores/uiStore";
+import { useConfirm } from "@/hooks/useConfirm";
+import { toast } from "sonner";
 
 type Tab = "documents" | "context" | "model";
 
@@ -25,27 +32,72 @@ interface Props {
   onContextBuilt?: () => void;
 }
 
+function kindLabel(kind?: string) {
+  if (kind === "spreadsheet_model") return "XLSX model";
+  if (kind === "tabular_data") return "Tabular data";
+  return "Document";
+}
+
+function ingestionSummary(doc: DocumentRecord): string | null {
+  const r = doc.ingestion_report as IngestionReport | null | undefined;
+  if (!r?.summary) {
+    if (doc.document_kind === "tabular_data") return "CSV data-only (no formulas)";
+    return null;
+  }
+  return r.summary;
+}
+
 export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) {
-  const [tab, setTab] = useState<Tab>("documents");
+  useCurrencyVersion();
+  const docManagerInitialTab = useUiStore((s) => s.docManagerInitialTab);
+  const setDocManagerInitialTab = useUiStore((s) => s.setDocManagerInitialTab);
+  const [tab, setTab] = useState<Tab>(docManagerInitialTab || "documents");
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [context, setContext] = useState<CompanyContext | null>(null);
+  const [modelValidationStatus, setModelValidationStatus] = useState<"processing" | "needs_validation" | "ready" | null>(null);
+  const [ingestionReport, setIngestionReport] = useState<IngestionReport | null>(null);
+  const [fidelityReport, setFidelityReport] = useState<FidelityReport | null>(null);
   const [model, setModel] = useState<UserModel | null>(null);
   const [building, setBuilding] = useState(false);
   const [buildError, setBuildError] = useState<string | null>(null);
+  const [validating, setValidating] = useState(false);
   const [dragOver, setDragOver] = useState(false);
   const [editingVar, setEditingVar] = useState<string | null>(null);
   const fileRef = useRef<HTMLInputElement>(null);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const { confirm, confirmDialog } = useConfirm();
+
+  useEffect(() => {
+    if (!docManagerInitialTab) return;
+    setTab(docManagerInitialTab);
+    setDocManagerInitialTab(null);
+  }, [docManagerInitialTab, setDocManagerInitialTab]);
 
   const loadDocuments = useCallback(async () => {
-    try { setDocuments(await listDocuments()); } catch { /* ignore */ }
+    try {
+      setDocuments(await listDocuments());
+      setLoadError(null);
+    } catch (e) {
+      setLoadError((e as Error).message || "Could not load documents.");
+    }
   }, []);
 
   const loadContext = useCallback(async () => {
     try {
-      const { context: ctx } = await getCompanyContext();
+      const { context: ctx, model_intelligence } = await getCompanyContext();
       setContext(ctx);
+      setModelValidationStatus(model_intelligence?.validation_status || null);
+      setIngestionReport(
+        (model_intelligence?.ingestion_report as IngestionReport | null | undefined) ||
+          (ctx?.context_data?.ingestion_report as IngestionReport | null | undefined) ||
+          null,
+      );
+      const fidelity =
+        (ctx?.context_data?.runtime_validation?.fidelity as FidelityReport | undefined) || null;
+      setFidelityReport(fidelity);
     } catch { /* ignore */ }
   }, []);
 
@@ -53,42 +105,106 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
     try {
       const { model: m } = await getActiveModel();
       setModel(m);
-    } catch { /* ignore */ }
+    } catch (e) {
+      setLoadError((e as Error).message || "Could not load the active model.");
+    }
   }, []);
 
   useEffect(() => { loadDocuments(); loadContext(); loadModel(); }, [loadDocuments, loadContext, loadModel]);
 
-  const handleUpload = async (file: File) => {
+  useEffect(() => {
+    if (!documents.some((doc) => doc.status === "queued" || doc.status === "processing")) return;
+    const timer = window.setInterval(() => void loadDocuments(), 2_000);
+    return () => window.clearInterval(timer);
+  }, [documents, loadDocuments]);
+
+  const handleUpload = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+
     setUploading(true);
     setUploadError(null);
-    try {
-      await uploadDocument(file);
-      await loadDocuments();
-    } catch (e) {
-      setUploadError((e as Error).message);
+    setUploadProgress(null);
+
+    const failures: string[] = [];
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      setUploadProgress(`Uploading ${i + 1} of ${list.length}: ${file.name}`);
+      try {
+        await uploadDocument(file);
+      } catch (e) {
+        failures.push(`${file.name}: ${(e as Error).message}`);
+      }
     }
+
+    await loadDocuments();
+    setUploadProgress(null);
     setUploading(false);
+    if (failures.length > 0) {
+      setUploadError(
+        failures.length === list.length
+          ? failures.join("\n")
+          : `${failures.length} of ${list.length} failed:\n${failures.join("\n")}`
+      );
+    }
   };
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (file) handleUpload(file);
+    if (e.dataTransfer.files.length > 0) {
+      void handleUpload(e.dataTransfer.files);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps -- handleUpload closes over latest state setters
   }, []);
 
   const handleDelete = async (docId: string) => {
+    const doc = documents.find((d) => d.document_id === docId);
+    const name = doc?.name ?? doc?.original_filename ?? "this document";
+    const ok = await confirm({
+      title: "Delete document?",
+      description: `"${name}" will be removed from this workspace. Rebuild context afterwards so the model reflects the change.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await deleteDocument(docId);
       await loadDocuments();
-    } catch { /* ignore */ }
+      toast.success(`Deleted ${name}`);
+    } catch (e) {
+      toast.error("Delete failed", { description: (e as Error).message });
+    }
   };
 
   const handleDeleteAll = async () => {
+    const total = documents.length;
+    if (total === 0) return;
+    const ok = await confirm({
+      title: `Delete all ${total} document${total > 1 ? "s" : ""}?`,
+      description:
+        "Every uploaded document in this workspace is removed permanently. The company context and model built from them are left in place but will be stale.",
+      confirmLabel: `Delete all ${total}`,
+      danger: true,
+    });
+    if (!ok) return;
+
+    const failures: string[] = [];
     for (const doc of documents) {
-      try { await deleteDocument(doc.document_id); } catch { /* ignore */ }
+      try {
+        await deleteDocument(doc.document_id);
+      } catch (e) {
+        failures.push(`${doc.name}: ${(e as Error).message}`);
+      }
     }
     await loadDocuments();
+    if (failures.length === 0) {
+      toast.success(`Deleted ${total} document${total > 1 ? "s" : ""}`);
+    } else {
+      toast.error(`${failures.length} of ${total} could not be deleted`, {
+        description: failures.slice(0, 3).join("\n"),
+      });
+    }
   };
 
   const handleBuildContext = async () => {
@@ -107,11 +223,61 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
   };
 
   const handleResetContext = async () => {
+    const ok = await confirm({
+      title: "Reset company context?",
+      description:
+        "The extracted company profile and the financial model built from it are discarded. Your uploaded documents are kept, but you will need to run Build Context again before any scenario can run.",
+      confirmLabel: "Reset context",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await deleteCompanyContext();
       setContext(null);
       setModel(null);
-    } catch { /* ignore */ }
+      toast.success("Company context reset");
+    } catch (e) {
+      toast.error("Reset failed", { description: (e as Error).message });
+    }
+  };
+
+  const handleValidateModel = async () => {
+    try {
+      setValidating(true);
+      setBuildError(null);
+      // Validation requires model_schema from context build — run it first when missing.
+      if (!context?.context_data?.model_schema) {
+        const ctx = await buildContext();
+        setContext(ctx);
+        await loadModel();
+      }
+      const latestSpreadsheet = documents.find((d) => d.document_kind === "spreadsheet_model");
+      const result = await validateModelSchema(latestSpreadsheet?.document_id);
+      if (result.fidelity) setFidelityReport(result.fidelity);
+      await loadContext();
+      await loadDocuments();
+      setTab("context");
+      onContextBuilt?.();
+    } catch (e) {
+      const err = e as Error & {
+        fidelity?: FidelityReport;
+        dataQuality?: { blocking: Array<{ sheet: string; cells: string[]; title: string }> };
+      };
+      if (err.fidelity) setFidelityReport(err.fidelity);
+      const blocking = err.dataQuality?.blocking ?? [];
+      setBuildError(
+        blocking.length > 0
+          ? `${err.message} See Data Quality below: ` +
+            blocking
+              .map((f) => `${f.title} (${f.sheet}${f.cells.length ? `!${f.cells.join(", ")}` : ""})`)
+              .join("; ")
+          : err.message,
+      );
+      await loadContext();
+      setTab("context");
+    } finally {
+      setValidating(false);
+    }
   };
 
   const handleUpdateVariable = async (varId: string, field: string, value: string) => {
@@ -145,7 +311,65 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
 
   const readyDocs = documents.filter((d) => d.status === "ready").length;
 
+  const validationPill = (status?: "processing" | "needs_validation" | "ready" | "error") => {
+    if (!status) return null;
+    if (status === "ready") return <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--success)]/15 text-[var(--success)] border border-[var(--success)]/20">Model Intelligence Ready</span>;
+    if (status === "needs_validation") return <span className="text-[10px] px-2 py-0.5 rounded-full bg-amber-500/15 text-amber-600 border border-amber-500/20">Needs Validation</span>;
+    if (status === "error") return <span className="text-[10px] px-2 py-0.5 rounded-full bg-red-500/15 text-red-600 border border-red-500/20">Validation Error</span>;
+    return <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent/10 text-accent border border-accent/20">Processing</span>;
+  };
+
+  const formatMetricValue = (m: {
+    typical_value?: number;
+    metric_type?: "currency" | "count" | "percent" | "ratio" | "volume" | "unknown";
+    unit: string;
+  }) => {
+    if (m.typical_value == null) return null;
+    const v = m.typical_value.toLocaleString();
+    const kind = m.metric_type || "unknown";
+    if (kind === "currency") return `${getCurrencySymbol()}${v}`;
+    if (kind === "percent") return `${v}%`;
+    if (kind === "ratio") return `${v}x`;
+    if (kind === "volume") return `${v} units`;
+    if (kind === "count") return v;
+    return `${v}${m.unit ? ` ${m.unit}` : ""}`;
+  };
+
+  const getExtractionQuality = () => {
+    const ms = context?.context_data?.model_schema;
+    if (!ms) return null;
+
+    const leverTotal = ms.scenarioLevers?.length || 0;
+    const leverSeeded = (ms.scenarioLevers || []).filter((l) => {
+      const base = Number((l as unknown as { scenarios?: { base?: number } }).scenarios?.base ?? 0);
+      return Number.isFinite(base) && Math.abs(base) > 0;
+    }).length;
+
+    const metricTotal = ms.outputMetrics?.length || 0;
+    const baseValues = (ms as unknown as { baseValues?: Record<string, number> }).baseValues || {};
+    const metricSeeded = (ms.outputMetrics || []).filter((m) => {
+      const v = Number(baseValues[m.id] ?? 0);
+      return Number.isFinite(v) && Math.abs(v) > 0;
+    }).length;
+
+    return { leverSeeded, leverTotal, metricSeeded, metricTotal };
+  };
+
+  const spreadsheetNeedsValidation = documents.some(
+    (doc) =>
+      doc.document_kind === "spreadsheet_model" &&
+      doc.validation_status !== "ready",
+  );
+  const contextNeedsValidation =
+    modelValidationStatus === "needs_validation" ||
+    context?.context_data?.validation_status === "needs_validation" ||
+    (modelValidationStatus != null && modelValidationStatus !== "ready") ||
+    (context?.context_data?.validation_status != null &&
+      context.context_data.validation_status !== "ready");
+  const needsValidation = spreadsheetNeedsValidation || contextNeedsValidation;
+
   return (
+    <>
     <div className="p-5 max-h-[80vh] overflow-y-auto">
       <PanelHeader
         title="Document Manager"
@@ -154,6 +378,32 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
         onMinimize={onMinimize || onClose}
         isMinimized={false}
       />
+
+      {needsValidation && (
+        <div className="mb-4 rounded-xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 space-y-2">
+          <div className="flex items-start justify-between gap-3">
+            <div>
+              <p className="text-sm font-semibold text-[var(--text-primary)]">
+                Spreadsheet model needs analyst validation
+              </p>
+              <p className="text-xs text-[var(--text-secondary)] mt-0.5">
+                Simulation is blocked until this model is marked ready. This will build context (if needed), validate against the Excel baseline, then you can re-run your scenario.
+              </p>
+            </div>
+            <button
+              type="button"
+              onClick={handleValidateModel}
+              disabled={validating}
+              className="shrink-0 text-xs px-3 py-1.5 rounded-lg bg-accent text-white font-medium hover:bg-accent/90 transition-colors disabled:opacity-50"
+            >
+              {validating ? "Validating…" : "Mark Model Validated"}
+            </button>
+          </div>
+          {buildError && (
+            <p className="text-[11px] text-[var(--danger)]">{buildError}</p>
+          )}
+        </div>
+      )}
 
       {/* Tabs */}
       <div className="flex gap-1 border-b border-[var(--border)] mb-4">
@@ -170,21 +420,69 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
             onDrop={handleDrop}
             onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
             onDragLeave={() => setDragOver(false)}
+            onClick={() => { if (!uploading) fileRef.current?.click(); }}
+            onKeyDown={(e) => {
+              if (e.key === "Enter" || e.key === " ") {
+                e.preventDefault();
+                if (!uploading) fileRef.current?.click();
+              }
+            }}
+            role="button"
+            tabIndex={uploading ? -1 : 0}
+            aria-disabled={uploading}
+            aria-label="Upload documents: drag and drop files here, or activate to browse"
             className={`rounded-xl border-2 border-dashed p-6 text-center transition-all ${
+              uploading ? "cursor-default" : "cursor-pointer"
+            } ${
               dragOver ? "border-accent bg-accent/5" : "border-[var(--border)] hover:border-accent/40"
             }`}
           >
-            <input ref={fileRef} type="file" accept=".pdf,.txt,.md,.csv,.docx" className="hidden" onChange={(e) => { const f = e.target.files?.[0]; if (f) handleUpload(f); e.target.value = ""; }} />
-            <p className="text-sm text-[var(--text-secondary)] mb-2">
-              {uploading ? "Uploading..." : "Drag & drop a file here, or click to browse"}
+            <input
+              ref={fileRef}
+              type="file"
+              multiple
+              accept=".pdf,.txt,.md,.csv,.docx,.xlsx,.xlsm"
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files?.length) void handleUpload(e.target.files);
+                e.target.value = "";
+              }}
+            />
+            <p className="text-sm text-[var(--text-secondary)] mb-2" aria-live="polite" aria-atomic="true">
+              {uploading
+                ? (uploadProgress || "Uploading...")
+                : "Drag & drop files here, or click to browse"}
             </p>
-            <button type="button" onClick={() => fileRef.current?.click()} disabled={uploading} className="text-accent text-sm font-medium hover:underline">
-              Select File
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); fileRef.current?.click(); }}
+              disabled={uploading}
+              className="text-accent text-sm font-medium hover:underline disabled:opacity-40"
+            >
+              Select Files
             </button>
-            <p className="text-xs text-[var(--text-muted)] mt-1">PDF, TXT, MD, CSV, DOCX — max 20MB</p>
+            <p className="text-xs text-[var(--text-muted)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX, XLSM — max 50MB each · multiple files supported</p>
           </div>
 
-          {uploadError && <div className="text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg">{uploadError}</div>}
+          {uploadError && (
+            <div role="alert" className="text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg whitespace-pre-line">
+              {uploadError}
+            </div>
+          )}
+
+          {/* D6 — a failed fetch must not look like "no documents yet" */}
+          {loadError && (
+            <div role="alert" className="flex items-center justify-between gap-3 text-sm text-[var(--danger)] bg-[var(--danger-bg)] px-3 py-2 rounded-lg">
+              <span>{loadError}</span>
+              <button
+                type="button"
+                onClick={() => void loadDocuments()}
+                className="shrink-0 rounded-lg border border-[var(--danger)]/30 px-2.5 py-1 text-xs font-medium hover:bg-[var(--danger-bg)]"
+              >
+                Retry
+              </button>
+            </div>
+          )}
 
           {/* Document list */}
           {documents.length > 0 && (
@@ -216,11 +514,35 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                   <div className="min-w-0">
                     <p className="text-sm font-medium text-[var(--text-primary)] truncate">{doc.original_filename}</p>
                     <p className="text-xs text-[var(--text-muted)]">
-                      {(doc.file_size_bytes / 1024).toFixed(0)} KB &middot; {doc.chunk_count} chunks &middot;{" "}
-                      <span className={doc.status === "ready" ? "text-[var(--success)]" : "text-[var(--warning)]"}>{doc.status}</span>
+                      {kindLabel(doc.document_kind)} &middot; {(doc.file_size_bytes / 1024).toFixed(0)} KB &middot; {doc.chunk_count} chunks &middot;{" "}
+                      <span className={doc.status === "ready" ? "text-[var(--success)]" : doc.status === "error" || doc.status === "rejected" ? "text-[var(--danger)]" : "text-[var(--warning)]"}>
+                        {doc.status}
+                        {(doc.status === "queued" || doc.status === "processing") && ` ${doc.progress ?? 0}%`}
+                      </span>
                     </p>
+                    {doc.processing_error && (
+                      <p className="mt-1 text-[11px] text-[var(--danger)]">{doc.processing_error}</p>
+                    )}
+                    {ingestionSummary(doc) && (
+                      <p className="text-[11px] text-[var(--text-secondary)] mt-0.5 truncate">{ingestionSummary(doc)}</p>
+                    )}
+                    {(doc.document_kind === "spreadsheet_model" || doc.document_kind === "tabular_data") && (
+                      <div className="mt-1 flex flex-wrap gap-1.5 items-center">
+                        {doc.document_kind === "spreadsheet_model" && validationPill(doc.validation_status)}
+                        {doc.document_kind === "tabular_data" && (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--panel-bg)] border border-[var(--border)] text-[var(--text-muted)]">
+                            Data-only (no formulas)
+                          </span>
+                        )}
+                        {doc.ingestion_report?.unit && (
+                          <span className="text-[10px] px-2 py-0.5 rounded-full bg-accent/10 text-accent border border-accent/20">
+                            {[doc.ingestion_report.currency, doc.ingestion_report.unit].filter(Boolean).join(" ")}
+                          </span>
+                        )}
+                      </div>
+                    )}
                   </div>
-                  <button type="button" onClick={() => handleDelete(doc.document_id)} className="ml-2 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors" title="Delete">
+                  <button type="button" onClick={() => handleDelete(doc.document_id)} className="ml-2 text-[var(--text-muted)] hover:text-[var(--danger)] transition-colors" title="Delete" aria-label={`Delete ${doc.name}`}>
                     <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path d="M3 6h18"/><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6"/><path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"/></svg>
                   </button>
                 </div>
@@ -251,11 +573,144 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                 <div>
                   <h3 className="text-lg font-semibold text-[var(--text-primary)]">{context.context_data.company_name}</h3>
                   <p className="text-sm text-[var(--text-secondary)]">{context.context_data.industry}</p>
+                  {validationPill(modelValidationStatus || context.context_data.validation_status)}
                 </div>
                 <button type="button" onClick={handleResetContext} className="text-xs px-3 py-1.5 rounded-lg border border-[var(--danger)]/30 text-[var(--danger)] hover:bg-[var(--danger-bg)] transition-colors">
                   Reset
                 </button>
               </div>
+              {((modelValidationStatus || context.context_data.validation_status) === "needs_validation") && (
+                <div className="flex justify-end">
+                  <button
+                    type="button"
+                    onClick={handleValidateModel}
+                    className="text-xs px-3 py-1.5 rounded-lg bg-accent text-white font-medium hover:bg-accent/90 transition-colors"
+                  >
+                    Mark Model Validated
+                  </button>
+                </div>
+              )}
+
+              {/*
+                Data issues come first: they are about the numbers the user just
+                uploaded, and they decide whether anything below can be trusted.
+                Structural ingestion detail sits underneath.
+              */}
+              <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">
+                  Data Quality
+                </span>
+                <DataQualityFindings onResolved={() => { void loadDocuments(); void loadContext(); }} />
+              </div>
+
+              {(ingestionReport || context.context_data.ingestion_report) && (
+                <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                  <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">Structural Ingestion</span>
+                  {(() => {
+                    const r = ingestionReport || context.context_data.ingestion_report;
+                    if (!r) return null;
+                    return (
+                      <>
+                        <p className="text-xs text-[var(--text-secondary)]">{r.summary}</p>
+                        {r.classification_evidence?.reason && (
+                          <p className="text-[11px] text-[var(--text-muted)]">{r.classification_evidence.reason}</p>
+                        )}
+                        <div className="text-[11px] text-[var(--text-muted)] flex flex-wrap gap-x-3 gap-y-1">
+                          {r.sheetCount != null && <span>Sheets: {r.sheetCount}</span>}
+                          {r.formulaCount != null && <span>Formulas: {r.formulaCount}</span>}
+                          {r.crossSheetLinkCount != null && <span>Cross-sheet links: {r.crossSheetLinkCount}</span>}
+                          {(r.currency || r.unit) && (
+                            <span>Denomination: {[r.currency, r.unit].filter(Boolean).join(" ")}</span>
+                          )}
+                          {r.executable != null && (
+                            <span>{r.executable ? "Executable cell graph" : "Not executable"}</span>
+                          )}
+                        </div>
+                        {r.warnings && r.warnings.length > 0 && (
+                          <ul className="text-[11px] text-[var(--warning)] list-disc list-inside max-h-24 overflow-auto">
+                            {r.warnings.slice(0, 8).map((w, i) => (
+                              <li key={`${w.code}-${i}`}>{w.message}{w.cell ? ` (${w.sheet}!${w.cell})` : ""}</li>
+                            ))}
+                          </ul>
+                        )}
+                      </>
+                    );
+                  })()}
+                </div>
+              )}
+
+              {(fidelityReport || context.context_data.runtime_validation?.fidelity) && (() => {
+                const f = fidelityReport || context.context_data.runtime_validation?.fidelity;
+                if (!f) return null;
+                return (
+                  <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                    <div className="flex items-center justify-between">
+                      <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">Fidelity Reconciliation</span>
+                      <span className={`text-[10px] px-2 py-0.5 rounded-full border ${
+                        f.ready
+                          ? "bg-accent/10 text-accent border-accent/20"
+                          : "bg-[var(--warning)]/10 text-[var(--warning)] border-[var(--warning)]/30"
+                      }`}>
+                        {f.ready ? "Ready" : "Blocked"} · score {(f.score * 100).toFixed(1)}%
+                      </span>
+                    </div>
+                    <div className="text-[11px] text-[var(--text-muted)] flex flex-wrap gap-x-3 gap-y-1">
+                      <span>Overall: {(f.score * 100).toFixed(1)}%</span>
+                      <span>Key outputs: {(f.key_output_score * 100).toFixed(1)}%</span>
+                      {f.compared_cells != null && <span>Compared: {f.compared_cells}</span>}
+                      {f.unsupported_cells?.length > 0 && (
+                        <span>Unsupported: {f.unsupported_cells.length}</span>
+                      )}
+                    </div>
+                    {f.divergences?.length > 0 && (
+                      <ul className="text-[11px] text-[var(--warning)] list-disc list-inside max-h-28 overflow-auto">
+                        {f.divergences.slice(0, 8).map((d, i) => (
+                          <li key={`${d.sheet}-${d.cell}-${i}`}>
+                            {d.sheet}!{d.cell}: expected {d.expected}, got {Number.isFinite(d.actual) ? d.actual : "NaN"}
+                            {d.is_key_output ? " (key output)" : ""}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {f.unsupported_cells?.length > 0 && (
+                      <ul className="text-[11px] text-[var(--text-muted)] list-disc list-inside max-h-20 overflow-auto">
+                        {f.unsupported_cells.slice(0, 5).map((u, i) => (
+                          <li key={`${u.sheet}-${u.cell}-${i}`}>
+                            Unsupported {u.sheet}!{u.cell}: {u.reason}
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                    {f.missing_expected_key_outputs && f.missing_expected_key_outputs.length > 0 && (
+                      <ul className="text-[11px] text-[var(--warning)] list-disc list-inside max-h-20 overflow-auto">
+                        {f.missing_expected_key_outputs.slice(0, 5).map((m, i) => (
+                          <li key={`${m.sheet}-${m.cell}-${i}`}>
+                            Missing Excel cached result for key output {m.sheet}!{m.cell}
+                            {m.id ? ` (${m.id})` : ""} — re-save/re-upload workbook
+                          </li>
+                        ))}
+                      </ul>
+                    )}
+                  </div>
+                );
+              })()}
+
+              {(context.context_data.tie_out_status === "variances" ||
+                (context.context_data.tie_out_variances && context.context_data.tie_out_variances.length > 0)) && (
+                <div className="bg-[var(--card-bg)] border border-[var(--warning)]/30 rounded-lg p-4 space-y-2">
+                  <div className="flex items-center justify-between">
+                    <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">P&amp;L Tie-out</span>
+                    <span className="text-[10px] px-2 py-0.5 rounded-full bg-[var(--warning)]/10 text-[var(--warning)] border border-[var(--warning)]/30">
+                      {context.context_data.usability === "needs_review" ? "Needs review" : "Variances"}
+                    </span>
+                  </div>
+                  <ul className="text-[11px] text-[var(--warning)] list-disc list-inside max-h-28 overflow-auto">
+                    {(context.context_data.tie_out_variances || []).slice(0, 8).map((v, i) => (
+                      <li key={`${v.variable_id}-${i}`}>{v.message}</li>
+                    ))}
+                  </ul>
+                </div>
+              )}
 
               <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-3">
                 <div>
@@ -312,20 +767,69 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
                     <div key={m.variable_id} className="flex items-center justify-between bg-[var(--panel-bg)] rounded-lg px-3 py-2 text-sm">
                       <div>
                         <span className="font-medium text-[var(--text-primary)]">{m.name}</span>
-                        <span className="ml-2 text-xs text-[var(--text-muted)]">{m.category} {m.is_input ? "(input)" : "(calculated)"}</span>
+                        <span className="ml-2 text-xs text-[var(--text-muted)]">
+                          {m.category} {m.is_input ? "(input)" : "(calculated)"} {m.metric_type ? `• ${m.metric_type}` : ""}
+                        </span>
                       </div>
                       {m.typical_value != null && (
-                        <span className="text-xs font-mono text-accent">{getCurrencySymbol()}{m.typical_value.toLocaleString()}</span>
+                        <span className="text-xs font-mono text-accent">{formatMetricValue(m)}</span>
                       )}
                     </div>
                   ))}
                 </div>
               </div>
 
+              {context.context_data.header_mapping_suggestions && context.context_data.header_mapping_suggestions.length > 0 && (
+                <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                  <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">Header Mapping Suggestions</span>
+                  {context.context_data.header_mapping_suggestions.map((s) => (
+                    <div key={`${s.header_pattern}-${s.inferred_metric_type}`} className="bg-[var(--panel-bg)] rounded-lg px-3 py-2">
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        <span className="font-semibold">Pattern:</span> {s.header_pattern}
+                      </p>
+                      <p className="text-xs text-[var(--text-secondary)]">
+                        <span className="font-semibold">Type:</span> {s.inferred_metric_type} &middot; <span className="font-semibold">Unit:</span> {s.expected_unit}
+                      </p>
+                      <p className="text-xs text-[var(--text-muted)] mt-1">{s.mapping_guidance}</p>
+                    </div>
+                  ))}
+                </div>
+              )}
+
               <p className="text-xs text-[var(--text-muted)]">
                 Built from {context.source_document_ids.length} document{context.source_document_ids.length !== 1 ? "s" : ""} &middot;{" "}
                 {new Date(context.updated_at).toLocaleString()}
               </p>
+
+              {context.context_data.model_schema && (
+                <div className="bg-[var(--card-bg)] border border-[var(--border)] rounded-lg p-4 space-y-2">
+                  <span className="text-xs font-medium text-[var(--text-muted)] uppercase tracking-wide">Model Schema (XLSX Structural)</span>
+                  <div className="text-xs text-[var(--text-secondary)]">
+                    <span className="font-semibold">Levers:</span> {context.context_data.model_schema.scenarioLevers?.length || 0}
+                    {" · "}
+                    <span className="font-semibold">Outputs:</span> {context.context_data.model_schema.outputMetrics?.length || 0}
+                    {" · "}
+                    <span className="font-semibold">Time:</span> {context.context_data.model_schema.timeDimension?.granularity || "unknown"}
+                  </div>
+                  {(() => {
+                    const q = getExtractionQuality();
+                    if (!q) return null;
+                    return (
+                      <div className="text-[11px] text-[var(--text-muted)] bg-[var(--panel-bg)] rounded px-2 py-1 border border-[var(--border)]">
+                        Extraction quality: <span className="font-semibold text-[var(--text-secondary)]">{q.leverSeeded}/{q.leverTotal}</span> levers seeded with non-zero base values,{" "}
+                        <span className="font-semibold text-[var(--text-secondary)]">{q.metricSeeded}/{q.metricTotal}</span> metrics seeded with non-zero base values.
+                      </div>
+                    );
+                  })()}
+                  <div className="flex flex-wrap gap-1.5">
+                    {(context.context_data.model_schema.scenarioLevers || []).slice(0, 6).map((lever) => (
+                      <span key={lever.id} className="px-2 py-0.5 bg-accent/10 text-accent text-xs rounded-full">
+                        {lever.label || lever.id}
+                      </span>
+                    ))}
+                  </div>
+                </div>
+              )}
             </>
           )}
         </div>
@@ -395,5 +899,7 @@ export function DocumentManager({ onClose, onMinimize, onContextBuilt }: Props) 
         </div>
       )}
     </div>
+      {confirmDialog}
+    </>
   );
 }

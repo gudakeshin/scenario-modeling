@@ -1,0 +1,52 @@
+<?xml version="1.0" encoding="utf-8"?>
+<edmx:Edmx Version="4.0" xmlns:edmx="http://docs.oasis-open.org/odata/ns/edmx">
+  <edmx:DataServices>
+    <Schema Namespace="sac" xmlns="http://docs.oasis-open.org/odata/ns/edm">
+      <EntityType Name="FactData">
+        <Key>
+          <PropertyRef Name="Region"/>
+          <PropertyRef Name="Account"/>
+          <PropertyRef Name="Time"/>
+          <PropertyRef Name="Version"/>
+        </Key>
+        <Property Name="Region" Type="Edm.String"/>
+        <Property Name="Account" Type="Edm.String"/>
+        <Property Name="Time" Type="Edm.String"/>
+        <Property Name="Version" Type="Edm.String"/>
+        <Property Name="SignedData" Type="Edm.Decimal"/>
+      </EntityType>
+      <EntityType Name="RegionMaster">
+        <Key><PropertyRef Name="ID"/></Key>
+        <Property Name="ID" Type="Edm.String"/>
+        <Property Name="Description" Type="Edm.String"/>
+        <Property Name="ParentId" Type="Edm.String"/>
+      </EntityType>
+      <EntityType Name="AccountMasterWithHierarchy">
+        <Key><PropertyRef Name="ID"/></Key>
+        <Property Name="ID" Type="Edm.String"/>
+        <Property Name="Description" Type="Edm.String"/>
+        <Property Name="ParentId" Type="Edm.String"/>
+        <Property Name="AccountType" Type="Edm.String"/>
+        <Property Name="OrderId" Type="Edm.Int32"/>
+      </EntityType>
+      <EntityType Name="TimeMaster">
+        <Key><PropertyRef Name="ID"/></Key>
+        <Property Name="ID" Type="Edm.String"/>
+        <Property Name="Description" Type="Edm.String"/>
+        <Property Name="ParentId" Type="Edm.String"/>
+      </EntityType>
+      <EntityType Name="VersionMaster">
+        <Key><PropertyRef Name="ID"/></Key>
+        <Property Name="ID" Type="Edm.String"/>
+        <Property Name="Description" Type="Edm.String"/>
+      </EntityType>
+      <EntityContainer Name="Container">
+        <EntitySet Name="FactData" EntityType="sac.FactData"/>
+        <EntitySet Name="RegionMaster" EntityType="sac.RegionMaster"/>
+        <EntitySet Name="AccountMasterWithHierarchy" EntityType="sac.AccountMasterWithHierarchy"/>
+        <EntitySet Name="TimeMaster" EntityType="sac.TimeMaster"/>
+        <EntitySet Name="VersionMaster" EntityType="sac.VersionMaster"/>
+      </EntityContainer>
+    </Schema>
+  </edmx:DataServices>
+</edmx:Edmx>

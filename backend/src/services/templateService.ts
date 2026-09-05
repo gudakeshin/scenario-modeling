@@ -6,7 +6,7 @@
  * and versioning / sharing.
  */
 
-import { pool, getDefaultUserId } from "../db/index.js";
+import { pool } from "../db/index.js";
 
 export interface Template {
   template_id: string;
@@ -24,14 +24,16 @@ export interface Template {
 
 // ── CRUD ──
 
-export async function listTemplates(scope?: string): Promise<Template[]> {
+export async function listTemplates(userId: string, scope?: string): Promise<Template[]> {
   let query = `SELECT * FROM scenario_templates`;
   const params: string[] = [];
   if (scope === "shared") {
     query += ` WHERE is_shared = true`;
   } else if (scope === "private") {
-    const userId = await getDefaultUserId();
     query += ` WHERE created_by = $1 AND is_shared = false`;
+    params.push(userId);
+  } else {
+    query += ` WHERE is_shared = true OR created_by = $1`;
     params.push(userId);
   }
   query += ` ORDER BY updated_at DESC`;
@@ -44,7 +46,7 @@ export async function getTemplate(templateId: string): Promise<Template | null> 
   return r.rows[0] || null;
 }
 
-export async function createTemplate(data: {
+export async function createTemplate(userId: string, data: {
   name: string;
   description?: string;
   parameter_set: { variable_id: string; value: number; label: string }[];
@@ -52,7 +54,6 @@ export async function createTemplate(data: {
   is_shared?: boolean;
   sharing_scope?: string;
 }): Promise<Template> {
-  const userId = await getDefaultUserId();
   const r = await pool.query(
     `INSERT INTO scenario_templates (name, description, parameter_set, model_version_hash, is_shared, sharing_scope, created_by)
      VALUES ($1, $2, $3, $4, $5, $6, $7)
@@ -102,18 +103,39 @@ export async function deleteTemplate(templateId: string): Promise<boolean> {
 
 // ── Clone template → new scenario ──
 
-export async function cloneTemplateToScenario(templateId: string, nlInput?: string): Promise<string> {
+export async function cloneTemplateToScenario(
+  templateId: string,
+  userId: string,
+  workspaceId: string,
+  nlInput?: string
+): Promise<string> {
   const tpl = await getTemplate(templateId);
   if (!tpl) throw new Error("Template not found");
 
-  const userId = await getDefaultUserId();
   const name = `${tpl.name} (clone)`;
   const input = nlInput || `Cloned from template: ${tpl.name}`;
 
+  // Templates are user-global but scenarios are workspace-scoped: only keep
+  // the template's pinned model if it belongs to this workspace, otherwise
+  // re-resolve to the workspace's active model so a clone never evaluates
+  // against another workspace's model.
+  let modelVersionHash = tpl.model_version_hash || "v0";
+  const UUID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+  if (UUID_RE.test(modelVersionHash)) {
+    const modelWs = await pool.query(
+      "SELECT workspace_id FROM user_models WHERE model_id = $1",
+      [modelVersionHash]
+    );
+    if (modelWs.rows[0]?.workspace_id !== workspaceId) {
+      const { getWorkspaceModelId } = await import("../models/registry.js");
+      modelVersionHash = (await getWorkspaceModelId(workspaceId)) || "v0";
+    }
+  }
+
   const sRes = await pool.query(
-    `INSERT INTO scenarios (name, nl_input, status, creator_id, model_version_hash)
-     VALUES ($1, $2, 'draft', $3, $4) RETURNING scenario_id`,
-    [name, input, userId, tpl.model_version_hash || "v0"]
+    `INSERT INTO scenarios (name, nl_input, status, creator_id, workspace_id, model_version_hash)
+     VALUES ($1, $2, 'draft', $3, $4, $5) RETURNING scenario_id`,
+    [name, input, userId, workspaceId, modelVersionHash]
   );
   const scenarioId = sRes.rows[0].scenario_id;
 
@@ -133,6 +155,7 @@ export async function cloneTemplateToScenario(templateId: string, nlInput?: stri
 
 export async function saveScenarioAsTemplate(
   scenarioId: string,
+  userId: string,
   name: string,
   description?: string,
   isShared = false
@@ -151,7 +174,7 @@ export async function saveScenarioAsTemplate(
     label: r.extracted_name,
   }));
 
-  return createTemplate({
+  return createTemplate(userId, {
     name,
     description,
     parameter_set: paramSet,

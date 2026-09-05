@@ -3,7 +3,7 @@
 import { useEffect, useState, useMemo, useCallback } from "react";
 import { PanelHeader } from "./PanelHeader";
 import { compareScenarios as compareApi, listScenarios, type ComparisonResult } from "@/lib/api";
-import { METRIC_LABELS, fmtCurrency, fmtCurrencySigned } from "@/lib/metrics";
+import { METRIC_LABELS, fmtMetric, fmtMetricSigned, useCurrencyVersion } from "@/lib/metrics";
 
 interface ComparisonViewProps {
   currentScenarioId: string;
@@ -42,37 +42,55 @@ function formatDate(dateStr: string): string {
 }
 
 export function ComparisonView({ currentScenarioId, onClose, onMinimize }: ComparisonViewProps) {
+  useCurrencyVersion();
   const [comparison, setComparison] = useState<ComparisonResult | null>(null);
   const [allScenarios, setAllScenarios] = useState<ScenarioListItem[]>([]);
-  const [selectedIds, setSelectedIds] = useState<string[]>([currentScenarioId]);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [currentNotRun, setCurrentNotRun] = useState(false);
 
   const [sortKey, setSortKey] = useState<SortKey>("metric");
   const [sortDir, setSortDir] = useState<SortDir>("asc");
   const [filterMode, setFilterMode] = useState<FilterMode>("all");
 
-  useEffect(() => {
-    listScenarios().then((s) => setAllScenarios(s.filter((x) => x.status === "completed"))).catch(() => {});
-  }, []);
-
-  const handleCompare = useCallback(async () => {
-    if (selectedIds.length === 0) return;
+  const runCompare = useCallback(async (ids: string[]) => {
+    if (ids.length === 0) {
+      setComparison(null);
+      return;
+    }
     setLoading(true);
     setError(null);
     try {
-      const r = await compareApi(selectedIds);
+      const r = await compareApi(ids);
       setComparison(r);
     } catch (e) {
       setError((e as Error).message);
     }
     setLoading(false);
-  }, [selectedIds]);
+  }, []);
+
+  const handleCompare = useCallback(() => runCompare(selectedIds), [runCompare, selectedIds]);
 
   useEffect(() => {
-    if (selectedIds.length > 0) handleCompare();
+    listScenarios()
+      .then((s) => {
+        setAllScenarios(s.filter((x) => x.status === "completed"));
+        const current = s.find((x) => x.scenario_id === currentScenarioId);
+        // A draft/never-run scenario has no P&L to compare — seeding it here
+        // produced a comparison where every metric read "0 (-100%)" against
+        // whatever else was selected, which reads as a total P&L collapse
+        // rather than "this scenario hasn't been simulated yet".
+        if (current && current.status === "completed") {
+          setSelectedIds([currentScenarioId]);
+          void runCompare([currentScenarioId]);
+        } else {
+          setCurrentNotRun(true);
+        }
+      })
+      .catch(() => {});
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [currentScenarioId]);
 
   const toggleScenario = (id: string) => {
     setSelectedIds((prev) =>
@@ -143,6 +161,12 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
         onMinimize={onMinimize || onClose}
         isMinimized={false}
       />
+
+      {currentNotRun && !comparison && (
+        <p className="text-xs text-[var(--text-muted)] mb-3 bg-[var(--panel-bg)] px-3 py-2 rounded-lg">
+          This scenario hasn&apos;t been run yet, so there&apos;s no P&amp;L to compare. Select completed scenarios below instead.
+        </p>
+      )}
 
       {/* Scenario selector */}
       {allScenarios.length > 0 && (
@@ -216,9 +240,9 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
             {comparison.key_callouts.map((c) => (
               <div key={c.label} className="rounded-xl border border-[var(--card-border)] bg-[var(--panel-bg)] p-3 text-center shadow-card hover:shadow-card-hover transition-shadow">
                 <p className="text-[10px] text-[var(--text-faint)] uppercase font-medium tracking-wider">{METRIC_LABELS[c.label] || c.label}</p>
-                <p className="text-lg font-semibold text-[var(--text-primary)] mt-1">{fmtCurrency(c.scenario)}</p>
+                <p className="text-lg font-semibold text-[var(--text-primary)] mt-1">{fmtMetric(c.label, c.scenario)}</p>
                 <p className={`text-xs font-medium mt-0.5 ${c.delta >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
-                  {fmtCurrencySigned(c.delta)} {c.delta_pct != null && `(${c.delta >= 0 ? "+" : ""}${c.delta_pct}%)`}
+                  {fmtMetricSigned(c.label, c.delta)} {c.delta_pct != null && `(${c.delta >= 0 ? "+" : ""}${c.delta_pct}%)`}
                 </p>
               </div>
             ))}
@@ -287,12 +311,14 @@ export function ComparisonView({ currentScenarioId, onClose, onMinimize }: Compa
                 {sortedMetrics.map((row) => (
                   <tr key={row.metric} className="border-b border-[var(--border-light)] hover:bg-[var(--panel-bg)] transition-colors">
                     <td className="py-2 px-3 font-medium text-[var(--text-primary)]">{METRIC_LABELS[row.metric] || row.metric}</td>
-                    <td className="text-right py-2 px-2 text-[var(--text-secondary)]">{fmtCurrency(row.base)}</td>
+                    <td className="text-right py-2 px-2 text-[var(--text-secondary)]">{fmtMetric(row.metric, row.base)}</td>
                     {row.scenarios.map((s) => [
-                      <td key={s.scenario_id + "-v"} className="text-right py-2 px-2 text-[var(--text-primary)]">{fmtCurrency(s.value)}</td>,
-                      <td key={s.scenario_id + "-d"} className={`text-right py-2 px-2 font-medium ${s.delta >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
-                        {fmtCurrencySigned(s.delta)}
-                        {s.delta_pct != null && (
+                      <td key={s.scenario_id + "-v"} className="text-right py-2 px-2 text-[var(--text-primary)]">
+                        {s.not_run ? <span className="text-[var(--text-faint)] italic">Not run</span> : fmtMetric(row.metric, s.value)}
+                      </td>,
+                      <td key={s.scenario_id + "-d"} className={s.not_run ? "text-right py-2 px-2 text-[var(--text-faint)]" : `text-right py-2 px-2 font-medium ${s.delta >= 0 ? "text-[var(--success)]" : "text-[var(--danger)]"}`}>
+                        {s.not_run ? "—" : fmtMetricSigned(row.metric, s.delta)}
+                        {!s.not_run && s.delta_pct != null && (
                           <span className="text-[10px] ml-0.5 opacity-60">({s.delta >= 0 ? "+" : ""}{s.delta_pct}%)</span>
                         )}
                       </td>,

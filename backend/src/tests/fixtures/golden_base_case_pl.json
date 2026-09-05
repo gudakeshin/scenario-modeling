@@ -1,0 +1,40 @@
+{
+  "description": "Golden base-case P&L for the deterministic E2E formula model (showcase release gate). Intentional corrections only — do not drift without updating Wave 0–2 regression expectations.",
+  "model_version": "e2e-formula-golden",
+  "denomination": {
+    "currency": "USD",
+    "unit": "absolute"
+  },
+  "time_horizon": {
+    "start": "2024-01",
+    "end": "2024-12",
+    "granularity": "monthly"
+  },
+  "base_case": {
+    "revenue": 100000,
+    "raw_materials": 30000,
+    "opex": 20000,
+    "gross_profit": 70000,
+    "ebit": 50000,
+    "tax": 12500,
+    "net_income": 37500
+  },
+  "scenario_revenue_plus_8pct": {
+    "revenue": 108000,
+    "raw_materials": 30000,
+    "opex": 20000,
+    "gross_profit": 78000,
+    "ebit": 58000,
+    "tax": 14500,
+    "net_income": 43500
+  },
+  "deltas_revenue_plus_8pct": {
+    "revenue": 8000,
+    "raw_materials": 0,
+    "opex": 0,
+    "gross_profit": 8000,
+    "ebit": 8000,
+    "tax": 2000,
+    "net_income": 6000
+  }
+}

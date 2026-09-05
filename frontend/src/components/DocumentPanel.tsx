@@ -12,6 +12,9 @@ import {
   type RAGSource,
 } from "@/lib/api";
 import { PanelHeader } from "./PanelHeader";
+import { useConfirm } from "@/hooks/useConfirm";
+import { toast } from "sonner";
+import { MarkdownContent } from "./MarkdownContent";
 
 interface DocumentPanelProps {
   onClose: () => void;
@@ -29,6 +32,7 @@ interface ChatMessage {
 export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   const [documents, setDocuments] = useState<DocumentRecord[]>([]);
   const [uploading, setUploading] = useState(false);
+  const [uploadProgress, setUploadProgress] = useState<string | null>(null);
   const [uploadError, setUploadError] = useState<string | null>(null);
   const [selectedDocId, setSelectedDocId] = useState<string | null>(null);
   const [chatMessages, setChatMessages] = useState<ChatMessage[]>([]);
@@ -36,71 +40,119 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   const [asking, setAsking] = useState(false);
   const [showSources, setShowSources] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const { confirm, confirmDialog } = useConfirm();
+  const [conversationId, setConversationId] = useState<string | null>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
   const chatEndRef = useRef<HTMLDivElement>(null);
-
-  // Load documents on mount
-  useEffect(() => {
-    loadDocuments();
-  }, []);
 
   // Scroll to bottom on new messages
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [chatMessages]);
 
-  const loadDocuments = async () => {
+  const loadDocuments = useCallback(async () => {
     try {
       const docs = await listDocuments();
       setDocuments(docs);
-    } catch {
-      // Silently fail if API not ready
+      setLoadError(null);
+    } catch (e) {
+      setLoadError((e as Error).message || "Could not load documents.");
     }
-  };
+  }, []);
 
-  const handleUpload = async (file: File) => {
+  // Load documents on mount and poll while queued/processing.
+  useEffect(() => {
+    void loadDocuments();
+  }, [loadDocuments]);
+  useEffect(() => {
+    if (!documents.some((doc) => doc.status === "queued" || doc.status === "processing")) return;
+    const timer = window.setInterval(() => void loadDocuments(), 2_000);
+    return () => window.clearInterval(timer);
+  }, [documents, loadDocuments]);
+
+  const handleUpload = async (files: FileList | File[]) => {
+    const list = Array.from(files);
+    if (list.length === 0) return;
+
     setUploading(true);
     setUploadError(null);
-    try {
-      const doc = await uploadDocument(file);
-      setDocuments((prev) => [doc, ...prev]);
-      setSelectedDocId(doc.document_id);
+    setUploadProgress(null);
+
+    const failures: string[] = [];
+    let lastDoc: DocumentRecord | null = null;
+
+    for (let i = 0; i < list.length; i++) {
+      const file = list[i];
+      setUploadProgress(`Uploading ${i + 1} of ${list.length}: ${file.name}`);
+      try {
+        const doc = await uploadDocument(file);
+        lastDoc = doc;
+        setDocuments((prev) => [doc, ...prev.filter((d) => d.document_id !== doc.document_id)]);
+      } catch (e) {
+        failures.push(`${file.name}: ${(e as Error).message}`);
+      }
+    }
+
+    if (lastDoc) {
+      setSelectedDocId(lastDoc.document_id);
+      const okCount = list.length - failures.length;
       setChatMessages((prev) => [
         ...prev,
         {
           id: `sys-${Date.now()}`,
           role: "assistant",
-          content: `Document **"${doc.name}"** uploaded and processed successfully! It has been split into ${doc.chunk_count} chunks and vectorized. You can now ask questions about it.`,
+          content:
+            okCount === 1
+              ? lastDoc.status === "queued"
+                ? `Document **"${lastDoc.name}"** was queued for ingestion. Progress will update automatically.`
+                : `Document **"${lastDoc.name}"** uploaded and processed successfully! It has been split into ${lastDoc.chunk_count} searchable chunks (keyword search by default; hybrid vector search when embeddings are configured). You can now ask questions about it.`
+              : `Uploaded **${okCount}** documents successfully. You can now ask questions about them.`,
           timestamp: new Date(),
         },
       ]);
-    } catch (e) {
-      setUploadError((e as Error).message);
     }
+
+    setUploadProgress(null);
     setUploading(false);
+    if (failures.length > 0) {
+      setUploadError(
+        failures.length === list.length
+          ? failures.join("\n")
+          : `${failures.length} of ${list.length} failed:\n${failures.join("\n")}`
+      );
+    }
   };
 
   const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (file) handleUpload(file);
+    if (e.target.files?.length) void handleUpload(e.target.files);
     if (e.target) e.target.value = "";
   };
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     setDragOver(false);
-    const file = e.dataTransfer.files[0];
-    if (file) handleUpload(file);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    if (e.dataTransfer.files.length > 0) {
+      void handleUpload(e.dataTransfer.files);
+    }
   }, []);
 
   const handleDelete = async (docId: string) => {
+    const name = documents.find((d) => d.document_id === docId)?.name ?? "this document";
+    const ok = await confirm({
+      title: "Delete document?",
+      description: `"${name}" will be removed from this workspace and can no longer be queried.`,
+      confirmLabel: "Delete",
+      danger: true,
+    });
+    if (!ok) return;
     try {
       await deleteDocument(docId);
       setDocuments((prev) => prev.filter((d) => d.document_id !== docId));
       if (selectedDocId === docId) setSelectedDocId(null);
-    } catch {
-      // ignore
+      toast.success(`Deleted ${name}`);
+    } catch (e) {
+      toast.error("Delete failed", { description: (e as Error).message });
     }
   };
 
@@ -120,10 +172,12 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
     try {
       let result: RAGResponse;
       if (selectedDocId) {
-        result = await queryDocument(selectedDocId, userMsg.content);
+        result = await queryDocument(selectedDocId, userMsg.content, conversationId ?? undefined);
       } else {
-        result = await queryAllDocuments(userMsg.content);
+        result = await queryAllDocuments(userMsg.content, conversationId ?? undefined);
       }
+
+      if (result.conversation_id) setConversationId(result.conversation_id);
 
       const assistantMsg: ChatMessage = {
         id: `asst-${Date.now()}`,
@@ -150,6 +204,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
   const selectedDoc = documents.find((d) => d.document_id === selectedDocId);
 
   return (
+    <>
     <div className="p-5">
       <PanelHeader
         title="Talk to Documents"
@@ -177,22 +232,33 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
         onDragOver={(e) => { e.preventDefault(); setDragOver(true); }}
         onDragLeave={() => setDragOver(false)}
         onDrop={handleDrop}
-        onClick={() => fileInputRef.current?.click()}
+        onClick={() => { if (!uploading) fileInputRef.current?.click(); }}
+        onKeyDown={(e) => {
+          if (e.key === "Enter" || e.key === " ") {
+            e.preventDefault();
+            if (!uploading) fileInputRef.current?.click();
+          }
+        }}
+        role="button"
+        tabIndex={uploading ? -1 : 0}
+        aria-disabled={uploading}
+        aria-label="Upload documents: drag and drop files here, or activate to browse"
       >
         <input
           ref={fileInputRef}
           type="file"
-          accept=".pdf,.txt,.md,.csv"
+          multiple
+          accept=".pdf,.txt,.md,.csv,.docx,.xlsx,.xlsm"
           onChange={handleFileSelect}
           className="hidden"
         />
         {uploading ? (
-          <div className="flex items-center justify-center gap-2 text-sm text-accent">
+          <div className="flex items-center justify-center gap-2 text-sm text-accent" aria-live="polite" aria-atomic="true">
             <svg className="animate-spin h-5 w-5" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24">
               <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
               <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
             </svg>
-            Processing document...
+            {uploadProgress || "Processing documents..."}
           </div>
         ) : (
           <div>
@@ -200,19 +266,32 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
               <path strokeLinecap="round" strokeLinejoin="round" d="M3 16.5v2.25A2.25 2.25 0 005.25 21h13.5A2.25 2.25 0 0021 18.75V16.5m-13.5-9L12 3m0 0l4.5 4.5M12 3v13.5" />
             </svg>
             <p className="text-sm text-[var(--text-secondary)]">
-              Drop a file here or <span className="text-accent font-medium">browse</span>
+              Drop files here or <span className="text-accent font-medium">browse</span>
             </p>
-            <p className="text-xs text-[var(--text-faint)] mt-1">Supports PDF, TXT, MD, CSV (max 20MB)</p>
+            <p className="text-xs text-[var(--text-faint)] mt-1">PDF, TXT, MD, CSV, DOCX, XLSX, XLSM — max 50MB each · multiple files supported</p>
           </div>
         )}
       </div>
       {uploadError && (
-        <div className="mb-3 p-2 rounded-lg bg-[var(--danger-bg)] text-[var(--danger)] text-xs">
+        <div className="mb-3 p-2 rounded-lg bg-[var(--danger-bg)] text-[var(--danger)] text-xs whitespace-pre-line">
           {uploadError}
         </div>
       )}
 
       {/* ── Document List ── */}
+      {loadError && (
+        <div role="alert" className="mb-3 flex items-center justify-between gap-3 rounded-lg bg-[var(--danger-bg)] px-3 py-2 text-sm text-[var(--danger)]">
+          <span>{loadError}</span>
+          <button
+            type="button"
+            onClick={() => void loadDocuments()}
+            className="shrink-0 rounded-lg border border-[var(--danger)]/30 px-2.5 py-1 text-xs font-medium hover:bg-[var(--danger-bg)]"
+          >
+            Retry
+          </button>
+        </div>
+      )}
+
       {documents.length > 0 && (
         <div className="mb-4">
           <div className="flex items-center justify-between mb-2">
@@ -260,8 +339,9 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
                 <button
                   type="button"
                   onClick={(e) => { e.stopPropagation(); handleDelete(doc.document_id); }}
-                  className="opacity-0 group-hover:opacity-100 w-6 h-6 rounded flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--danger-bg)] transition-all"
+                  className="opacity-0 group-hover:opacity-100 group-focus-within:opacity-100 focus-visible:opacity-100 w-6 h-6 rounded flex items-center justify-center text-[var(--text-faint)] hover:text-[var(--danger)] hover:bg-[var(--danger-bg)] transition-all"
                   title="Delete document"
+                  aria-label={`Delete ${doc.name}`}
                 >
                   <svg width="12" height="12" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round">
                     <line x1="18" y1="6" x2="6" y2="18" /><line x1="6" y1="6" x2="18" y2="18" />
@@ -304,7 +384,11 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
                     : "bg-[var(--panel-bg)] border border-[var(--border)] text-[var(--text-primary)]"
                 }`}
               >
-                <div className="whitespace-pre-wrap">{msg.content}</div>
+                {msg.role === "user" ? (
+                  <div className="whitespace-pre-wrap">{msg.content}</div>
+                ) : (
+                  <MarkdownContent content={msg.content} />
+                )}
                 {msg.sources && msg.sources.length > 0 && (
                   <div className="mt-2 pt-2 border-t border-[var(--border)]/30">
                     <button
@@ -394,5 +478,7 @@ export function DocumentPanel({ onClose, onMinimize }: DocumentPanelProps) {
         </div>
       </div>
     </div>
+    {confirmDialog}
+    </>
   );
 }

@@ -1,17 +1,21 @@
 "use client";
 
 import { useRef, useState, useCallback } from "react";
+import { ChatAssistantModeToggle } from "./ChatAssistant";
 
 interface ChatComposerProps {
   onSend: (text: string) => void;
   disabled?: boolean;
   placeholder?: string;
+  /** Show Scenario / Documents mode toggle above the input. */
+  showModeToggle?: boolean;
 }
 
 export function ChatComposer({
   onSend,
   disabled = false,
   placeholder = "Describe your scenario in plain English\u2026",
+  showModeToggle = true,
 }: ChatComposerProps) {
   const [value, setValue] = useState("");
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -41,7 +45,15 @@ export function ChatComposer({
   };
 
   return (
-    <div className="border-t border-[var(--border)] bg-background px-4 py-3">
+    <div className="border-t border-[var(--border)] bg-background px-4 py-3 shrink-0">
+      {showModeToggle && (
+        <div className="mx-auto max-w-3xl mb-2 flex items-center justify-between gap-2">
+          <ChatAssistantModeToggle disabled={disabled} />
+          <p className="text-[11px] text-[var(--text-faint)] hidden sm:block">
+            Documents answers from uploads · Scenarios still require Approve &amp; Run
+          </p>
+        </div>
+      )}
       <div className="mx-auto max-w-3xl flex gap-2 items-end rounded-2xl bg-[var(--input-bg)] border border-[var(--input-border)] focus-within:ring-2 focus-within:ring-accent/20 focus-within:border-[var(--input-focus-border)] transition-all shadow-card">
         <textarea
           ref={textareaRef}
