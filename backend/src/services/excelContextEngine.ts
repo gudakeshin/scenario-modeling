@@ -524,16 +524,36 @@ function fallbackModelSchema(graph: WorkbookGraph, docName: string): ModelSchema
 function toModelDefinition(schema: ModelSchema): ModelDefinition {
   // Catalog/summary only — NOT an executable formula DAG for XLSX models.
   // Simulation must use HyperFormula via workbook_snapshot (xlsx_cell_graph).
+  // A lever and an output metric commonly share a raw label (e.g. a segment
+  // name that appears both as a raw input row and as its own P&L line), which
+  // collapses to the same toId() — dedupe ids here so callers keyed by
+  // variable id (React lists, lookups) never see two entries with one id.
+  const seenIds = new Set<string>();
+  const uniqueId = (id: string): string => {
+    if (!seenIds.has(id)) {
+      seenIds.add(id);
+      return id;
+    }
+    let candidate = `${id}_2`;
+    let n = 2;
+    while (seenIds.has(candidate)) {
+      n += 1;
+      candidate = `${id}_${n}`;
+    }
+    seenIds.add(candidate);
+    return candidate;
+  };
+
   const variables = [
     ...schema.scenarioLevers.map((lever) => ({
-      id: lever.id,
+      id: uniqueId(lever.id),
       name: lever.label,
       formula: String(lever.scenarios?.base ?? 0),
       dependencies: [] as string[],
       tags: ["input", "percent_delta", "xlsx_catalog_only", ...(lever.cell ? [`cell:${lever.sheet}!${lever.cell}`] : [])],
     })),
     ...schema.outputMetrics.map((m) => ({
-      id: m.id,
+      id: uniqueId(m.id),
       name: m.label,
       formula: String(schema.baseValues[m.id] ?? 0),
       dependencies: [] as string[],

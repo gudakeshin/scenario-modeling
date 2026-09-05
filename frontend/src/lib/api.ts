@@ -320,12 +320,15 @@ export interface ScenarioRef {
   name: string | null;
   nl_input: string;
   created_at: string;
+  /** False when the scenario has never been simulated — its value/delta in
+   *  this comparison are placeholders, not a real (fabricated 100%) swing. */
+  has_output?: boolean;
 }
 
 export interface ComparisonRow {
   metric: string;
   base: number;
-  scenarios: (ScenarioRef & { value: number; delta: number; delta_pct: number | null })[];
+  scenarios: (ScenarioRef & { value: number; delta: number; delta_pct: number | null; not_run?: boolean })[];
 }
 
 export interface ComparisonResult {

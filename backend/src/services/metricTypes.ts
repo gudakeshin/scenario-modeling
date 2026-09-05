@@ -14,7 +14,11 @@ export type VariableProvenance = "extracted" | "assumed" | "derived";
 export function inferMetricTypeFromId(id: string, name?: string): MetricType {
   const text = `${id} ${name ?? ""}`.toLowerCase();
   if (/margin|rate|growth|pct|percent/.test(text)) return "percent";
-  if (/ratio|turnover/.test(text)) return "ratio";
+  // "ratio"/"turnover" must sit on a token boundary (snake_case ids join
+  // words with "_", so \b alone doesn't help — "_" is a word character). A
+  // bare substring test mistook "revenue_from_operations" for a ratio,
+  // since "operations" contains "ratio" (ope-RATIO-ns).
+  if (/(^|[^a-z])(ratio|turnover)([^a-z]|$)/i.test(text)) return "ratio";
   if (/headcount|fte|stores/.test(text)) return "count";
   if (/volume|units/.test(text)) return "volume";
   return "currency";

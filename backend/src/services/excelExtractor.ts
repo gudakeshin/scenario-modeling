@@ -647,6 +647,9 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
       isFormula: boolean;
       blockLabel?: string;
       activeCell?: string;
+      /** Every numeric cell on the row, by column — lets the post-scan pass
+       *  below re-target a row bound to the wrong period column. */
+      numericByCol?: Map<number, { value: number; cell: string; isFormula: boolean }>;
     }> = [];
     const sparseCells: SparseCell[] = [];
     /** Most recent section header — disambiguates repeated row labels. */
@@ -680,6 +683,8 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
       const rowTextByCol = new Map<number, string>();
       /** Cell address by column index, for resolving the Active cell. */
       const rowAddressByCol = new Map<number, string>();
+      /** Every numeric cell on this row, by column. */
+      const numericByCol = new Map<number, { value: number; cell: string; isFormula: boolean }>();
 
       row.eachCell({ includeEmpty: false }, (cell, colNumber) => {
         const raw = cell.value;
@@ -770,6 +775,7 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
         const numericLike = parseNumericLike(raw);
         if (numericLike != null) {
           numericCells++;
+          numericByCol.set(colIdx, { value: numericLike, cell: cell.address, isFormula: Boolean(formula) });
           if (firstNumValue == null) {
             firstNumValue = numericLike;
             firstNumCell = cell.address;
@@ -925,6 +931,7 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
           isFormula: firstNumIsFormula,
           ...(currentBlockLabel ? { blockLabel: currentBlockLabel } : {}),
           ...(activeCell && activeCell !== firstNumCell ? { activeCell } : {}),
+          numericByCol,
         });
       }
     });
@@ -982,6 +989,46 @@ export async function extractWorkbookArtifact(buffer: Buffer): Promise<WorkbookA
       const usable = texts.filter((t) => t.length <= MAX_COLUMN_HEADER_CHARS);
       if (usable.some((t) => /\b(total|cumulative|ytd)\b/i.test(t))) continue;
       if (usable.some((t) => isPeriodColumnHeader(t))) periodColumnIndices.push(colIdx);
+    }
+
+    // A row-level candidate is normally bound to the first numeric cell
+    // scanned left to right — right for a sheet that puts the current period
+    // beside the label. A calc-flow sheet (base -> growth% -> forex% ->
+    // result, e.g. FY24 anchor | driver | driver | FY25 total) puts the
+    // current-year result *after* those driver columns, so "first numeric
+    // cell" silently lands on the prior year. Re-target only rows whose
+    // selected cell is itself a formula (a computed result, never a literal
+    // input lever) to whichever recognised period column carries the higher
+    // fiscal year — this is what stopped Cipla's "Total revenue" row from
+    // reading its FY24 column while every other output on the same workbook
+    // read FY25, which had manufactured a revenue figure that silently
+    // disagreed with the rest of the P&L.
+    if (periodColumnIndices.length >= 2) {
+      const colFiscalYear = (colIdx: number): number | null => {
+        for (const text of headerTextsByCol.get(colIdx) ?? []) {
+          const match = text.match(FY_REGEX);
+          const digits = match?.[0].match(/\d+/)?.[0];
+          if (digits) return digits.length === 2 ? 2000 + Number(digits) : Number(digits);
+        }
+        return null;
+      };
+      const yearByCol = new Map<number, number>();
+      for (const colIdx of periodColumnIndices) {
+        const year = colFiscalYear(colIdx);
+        if (year != null) yearByCol.set(colIdx, year);
+      }
+      if (yearByCol.size >= 2) {
+        const currentColIdx = [...yearByCol.entries()].sort((a, b) => b[1] - a[1])[0][0];
+        for (const pair of rowPairs) {
+          if (!pair.isFormula) continue;
+          const current = pair.numericByCol?.get(currentColIdx);
+          if (current && current.cell !== pair.numericCell) {
+            pair.numericValue = current.value;
+            pair.numericCell = current.cell;
+            pair.isFormula = current.isFormula;
+          }
+        }
+      }
     }
 
     sheets[sheet.name] = {

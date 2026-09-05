@@ -7,12 +7,16 @@ export interface ScenarioRef {
   name: string | null;
   nl_input: string;
   created_at: string;
+  /** False when the scenario has never been simulated — its "value" is a
+   *  placeholder 0, not a real result, and callers must not read a delta
+   *  off it as though the P&L actually collapsed to zero. */
+  has_output?: boolean;
 }
 
 export interface ComparisonRow {
   metric: string;
   base: number;
-  scenarios: (ScenarioRef & { value: number; delta: number; delta_pct: number | null })[];
+  scenarios: (ScenarioRef & { value: number; delta: number; delta_pct: number | null; not_run?: boolean })[];
 }
 
 export interface ComparisonResult {
@@ -43,11 +47,13 @@ export function compareFromOutputs(
 ): ComparisonResult {
   void _model;
   void _params;
+  const hasOutput = new Map(scenarioData.map((s) => [s.id, Object.keys(s.pl).length > 0]));
   const scenarioRefs: ScenarioRef[] = scenarioData.map((s) => ({
     scenario_id: s.id,
     name: s.name,
     nl_input: s.nl_input,
     created_at: s.created_at,
+    has_output: hasOutput.get(s.id),
   }));
   const metrics: ComparisonRow[] = metricKeys.map((metric) => {
     const baseVal = baseCtx[metric] ?? 0;
@@ -55,8 +61,9 @@ export function compareFromOutputs(
       metric,
       base: Math.round(baseVal * 100) / 100,
       scenarios: scenarioData.map((s) => {
-        const val = s.pl[metric] ?? 0;
-        const delta = val - baseVal;
+        const notRun = !hasOutput.get(s.id);
+        const val = notRun ? 0 : s.pl[metric] ?? 0;
+        const delta = notRun ? 0 : val - baseVal;
         return {
           scenario_id: s.id,
           name: s.name,
@@ -64,7 +71,8 @@ export function compareFromOutputs(
           created_at: s.created_at,
           value: val,
           delta: Math.round(delta * 100) / 100,
-          delta_pct: baseVal !== 0 ? Math.round((delta / baseVal) * 10000) / 100 : null,
+          delta_pct: notRun ? null : baseVal !== 0 ? Math.round((delta / baseVal) * 10000) / 100 : null,
+          not_run: notRun,
         };
       }),
     };
@@ -110,6 +118,10 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
       created_at: row?.created_at ?? "",
       pl,
       rawOutput,
+      // A draft/never-simulated scenario has no scenario_outputs row at all —
+      // distinct from one that ran and genuinely produced a zero. Comparing
+      // against it must not read "every metric collapsed to 0 (-100%)".
+      hasOutput: outputByScenarioId.has(id),
     };
   });
 
@@ -117,10 +129,28 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
   const modelHash = scenarioRowById.get(scenarioIds[0])?.model_version_hash;
   const model = await getModelDefinition(modelHash);
 
-  // Prefer persisted base_pl (needed for XLSX where model is null)
-  let baseCtx = await resolveBasePl(scenarioData[0]?.rawOutput, model, scenarioIds[0]);
+  // A spreadsheet workspace still gets a ModelDefinition row in user_models —
+  // a catalog snapshot for onboarding/labeling, never the thing that actually
+  // ran. Its ids go through the same collision-disambiguation as the XLSX
+  // runtime's variable list, but independently, so "india_branded_formulations"
+  // there becomes "..._2" while the real simulation output keeps the bare id.
+  // Trusting this catalog for metric keys on an XLSX scenario compares against
+  // ids the real pl/base_pl never had, reading as "0 (-100%)" everywhere.
+  const isXlsxComparison = scenarioData.some(
+    (s) => (s.rawOutput as { simulation_mode?: string })?.simulation_mode === "xlsx_cell_graph",
+  );
+
+  // Prefer persisted base_pl (needed for XLSX where model is null) — read it
+  // off a scenario that actually ran. scenarioData[0] may be a draft with no
+  // output at all, which would otherwise fall through to the catalog model.
+  const baseSource = scenarioData.find((s) => s.hasOutput) ?? scenarioData[0];
+  let baseCtx = await resolveBasePl(
+    baseSource?.rawOutput,
+    isXlsxComparison ? null : model,
+    baseSource?.id,
+  );
   let metricKeys: string[];
-  if (model) {
+  if (model && !isXlsxComparison) {
     metricKeys = getPLMetrics(model);
     if (Object.keys(baseCtx).length === 0) baseCtx = await computeBaseCase(model);
   } else {
@@ -145,6 +175,7 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
     name: s.name,
     nl_input: s.nl_input,
     created_at: s.created_at,
+    has_output: s.hasOutput,
   }));
 
   const metrics: ComparisonRow[] = metricKeys.map((metric) => {
@@ -153,8 +184,9 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
       metric,
       base: Math.round(baseVal * 100) / 100,
       scenarios: scenarioData.map((s) => {
-        const val = s.pl[metric] ?? 0;
-        const delta = val - baseVal;
+        const notRun = !s.hasOutput;
+        const val = notRun ? 0 : s.pl[metric] ?? 0;
+        const delta = notRun ? 0 : val - baseVal;
         return {
           scenario_id: s.id,
           name: s.name,
@@ -162,7 +194,8 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
           created_at: s.created_at,
           value: val,
           delta: Math.round(delta * 100) / 100,
-          delta_pct: baseVal !== 0 ? Math.round((delta / baseVal) * 10000) / 100 : null,
+          delta_pct: notRun ? null : baseVal !== 0 ? Math.round((delta / baseVal) * 10000) / 100 : null,
+          not_run: notRun,
         };
       }),
     };
@@ -197,9 +230,13 @@ export async function compareScenarios(scenarioIds: string[]): Promise<Compariso
     });
   }
 
-  // Key callouts (top metrics by absolute delta of first scenario)
-  const first = scenarioData[0];
-  const key_callouts = metricKeys
+  // Key callouts (top metrics by absolute delta of first scenario that has
+  // actually been simulated — a draft scenario picked here would render
+  // every callout as a fabricated 100% collapse).
+  const first = scenarioData.find((s) => s.hasOutput) ?? scenarioData[0];
+  const key_callouts = !first?.hasOutput
+    ? []
+    : metricKeys
     .map((m) => {
       const baseVal = baseCtx[m] ?? 0;
       const scenVal = first?.pl[m] ?? 0;

@@ -926,10 +926,20 @@ export class XlsxModelRuntime implements EvaluableModel {
    * Evaluate outputs for each time-axis period column when available.
    * Lever cells are set once; outputs are read from the same row at each period col.
    * Falls back to a single FY slice from evaluate() when no time axis is present.
+   *
+   * A single detected period column is also routed through evaluate() rather
+   * than the column-substitution path below: with one period there is nothing
+   * to slice, and reading every output at that one global column index — instead
+   * of the output's own bound column — silently misreads any output whose sheet
+   * orders its columns differently. On a Cipla P&L (FY25 at column C) alongside
+   * a Cost_Build sheet (FY25 at column B, FY24 at column C), this pulled the
+   * prior-year Cost_Build revenue while correctly reading the current-year P&L
+   * revenue, producing two "revenue" figures that silently disagreed.
    */
   evaluatePeriods(absoluteOverrides: Record<string, number>): PeriodSlice[] {
-    if (this.periodColumns.length === 0) {
-      return [{ period: "FY", values: this.evaluate(absoluteOverrides) }];
+    if (this.periodColumns.length <= 1) {
+      const period = this.periodColumns[0]?.period ?? "FY";
+      return [{ period, values: this.evaluate(absoluteOverrides) }];
     }
 
     this.lastEvaluationErrors.length = 0;
